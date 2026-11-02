@@ -219,7 +219,9 @@ function discoverMethods(actorClass: ActorClass, actorName: string): string[] {
         if (name === "connect" || name === "broadcast" || name === "db" || name === "alarm")
             throw new ActorDefinitionError(`actor class ${actorName} cannot define reserved method ${name}`)
         if (!(descriptor.value instanceof asyncFunction))
-            throw new ActorDefinitionError(`actor method ${actorName}.${name} must be async`)
+            throw new ActorDefinitionError(
+                `actor method ${actorName}.${name} must be async. For a sync helper, use a \`#private\` method or a module-level function.`
+            )
         if (name === "onAlarm" && descriptor.value.length !== 0)
             throw new ActorDefinitionError(`actor lifecycle hook ${actorName}.onAlarm must take no arguments`)
         if (lifecycleMethods.has(name)) return []
