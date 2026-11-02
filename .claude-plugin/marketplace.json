@@ -1,0 +1,17 @@
+{
+    "name": "durable-actors",
+    "owner": {
+        "name": "Terse AI",
+        "email": "support@useterse.ai"
+    },
+    "metadata": {
+        "description": "Official agent skills for Durable Actors"
+    },
+    "plugins": [
+        {
+            "name": "durable-actors",
+            "source": "./",
+            "description": "Skills for building, testing, and deploying Durable Actors."
+        }
+    ]
+}

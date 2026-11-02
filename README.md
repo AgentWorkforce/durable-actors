@@ -163,6 +163,22 @@ Durable Agents provides built-in observability features:
 
 For complete sample applications, see [AI Chat](examples/ai-chat), [Collaborative Documents](examples/documents), and [Chatroom](examples/chat).
 
+## Build with a coding agent
+
+In Claude Code, install the plugin:
+
+```
+/plugin install durable-actors --marketplace TerseAI/durable-actors
+```
+
+For Cursor, Codex, and other agents, install the skill with [skills.sh](https://skills.sh):
+
+```sh
+npx skills add TerseAI/durable-actors
+```
+
+Then describe what you want to build, or run `/durable-actors:durable-actors-quickstart` in Claude Code.
+
 ## Community
 
 Bug reports, feature requests, documentation fixes, and code contributions are welcome. See the [contributing guide](CONTRIBUTING.md) for repository setup and checks, and follow our [code of conduct](CODE_OF_CONDUCT.md).
