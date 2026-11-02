@@ -144,6 +144,7 @@ pub async fn serve_local(
         stop.clone(),
     )
     .await?;
+    reload.deploy_initial(watcher.is_some()).await?;
     let server = LocalServer::start(listener, routes, provider, stop);
     let ready = notify_launcher(
         &origin,
@@ -168,10 +169,7 @@ pub async fn serve_local(
             if let Some(watcher) = watcher {
                 watcher
                     .watch(|| async {
-                        reload
-                            .service
-                            .deploy_source(&reload.admin, &reload.spec, None)
-                            .await?;
+                        reload.deploy().await?;
                         anstream::println!("Updated local actors.");
                         Ok(())
                     })
@@ -392,7 +390,6 @@ async fn local_routes(
     service.start_access_reconciliation(stop.clone());
     service.start_alarm_scheduler(super::alarms::DEFAULT_POLL_INTERVAL, stop);
     let admin = AdminService::new(options.api_key.clone(), registry, issuer)?;
-    service.deploy_source(&admin, &spec, None).await?;
     let inventory = Arc::new(super::socket_inventory::GatewayInventoryReader::new(
         Arc::new(service.lifecycle.clone()),
         service.gateway.as_ref().unwrap().connections.clone(),
@@ -420,6 +417,26 @@ struct LocalReload {
     service: ControlPlaneService,
     admin: AdminService,
     spec: HostLaunchSpec,
+}
+
+impl LocalReload {
+    /// While watching, a failed first build waits for the next source change instead of exiting.
+    async fn deploy_initial(&self, watching: bool) -> Result<()> {
+        match self.deploy().await {
+            Err(error) if watching => {
+                anstream::eprintln!("Actor build failed: {error:#}");
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    async fn deploy(&self) -> Result<()> {
+        self.service
+            .deploy_source(&self.admin, &self.spec, None)
+            .await?;
+        Ok(())
+    }
 }
 
 fn local_issuer() -> Result<ActorJwtIssuer> {
