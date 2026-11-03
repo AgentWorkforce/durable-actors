@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -7,6 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -270,6 +272,134 @@ impl AlarmStore for PostgresAlarmStore {
             )
             .await?;
         Ok(())
+    }
+}
+
+pub(super) struct SqliteAlarmStore(Arc<Mutex<Connection>>);
+
+impl SqliteAlarmStore {
+    pub(super) async fn open(path: PathBuf) -> Result<Self> {
+        let connection = tokio::task::spawn_blocking(move || {
+            let connection = Connection::open(path).context("open local alarms")?;
+            // The local data-directory lock excludes other runtimes; earlier claims are stale.
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS alarms (
+                    project_id TEXT NOT NULL, actor_name TEXT NOT NULL, actor_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, timestamp_ms INTEGER, queued_at_ms INTEGER,
+                    PRIMARY KEY (project_id, actor_name, actor_id)
+                );
+                UPDATE alarms SET queued_at_ms = NULL;",
+            )?;
+            anyhow::Ok(connection)
+        })
+        .await??;
+        Ok(Self(Arc::new(Mutex::new(connection))))
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let connection = self.0.clone();
+        tokio::task::spawn_blocking(move || operation(&connection.lock().unwrap())).await?
+    }
+}
+
+#[async_trait]
+impl AlarmStore for SqliteAlarmStore {
+    async fn get(&self, actor: &ActorKey) -> Result<Option<i64>> {
+        let actor = actor.clone();
+        self.run(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT timestamp_ms FROM alarms
+                     WHERE project_id = ?1 AND actor_name = ?2 AND actor_id = ?3",
+                    params![actor.project_id, actor.actor_name, actor.actor_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten())
+        })
+        .await
+    }
+
+    async fn update(&self, actor: &ActorKey, timestamp_ms: Option<i64>) -> Result<()> {
+        let actor = actor.clone();
+        self.run(move |connection| {
+            connection.execute(
+                "INSERT INTO alarms (project_id, actor_name, actor_id, revision, timestamp_ms)
+                 VALUES (?1, ?2, ?3, 1, ?4)
+                 ON CONFLICT (project_id, actor_name, actor_id) DO UPDATE SET
+                    revision = revision + 1,
+                    timestamp_ms = excluded.timestamp_ms,
+                    queued_at_ms = NULL",
+                params![
+                    actor.project_id,
+                    actor.actor_name,
+                    actor.actor_id,
+                    timestamp_ms
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn claim_due(
+        &self,
+        now_ms: i64,
+        expired_before_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ClaimedAlarm>> {
+        let limit = i64::try_from(limit).context("alarm batch size overflow")?;
+        self.run(move |connection| {
+            connection
+                .prepare(
+                    "UPDATE alarms SET queued_at_ms = ?1
+                     WHERE rowid IN (
+                        SELECT rowid FROM alarms
+                        WHERE timestamp_ms <= ?1
+                          AND (queued_at_ms IS NULL OR queued_at_ms <= ?2)
+                        ORDER BY timestamp_ms
+                        LIMIT ?3
+                     )
+                     RETURNING project_id, actor_name, actor_id, revision",
+                )?
+                .query_map(params![now_ms, expired_before_ms, limit], |row| {
+                    Ok((
+                        ActorKey {
+                            project_id: row.get(0)?,
+                            actor_name: row.get(1)?,
+                            actor_id: row.get(2)?,
+                        },
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (actor, revision) = row?;
+                    Ok(ClaimedAlarm {
+                        actor,
+                        revision: u64::try_from(revision).context("negative alarm revision")?,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    async fn finish(&self, alarm: &ClaimedAlarm) -> Result<()> {
+        let revision = i64::try_from(alarm.revision).context("alarm revision overflow")?;
+        let actor = alarm.actor.clone();
+        self.run(move |connection| {
+            connection.execute(
+                "UPDATE alarms SET timestamp_ms = NULL, queued_at_ms = NULL
+                 WHERE project_id = ?1 AND actor_name = ?2 AND actor_id = ?3
+                   AND revision = ?4",
+                params![actor.project_id, actor.actor_name, actor.actor_id, revision],
+            )?;
+            Ok(())
+        })
+        .await
     }
 }
 

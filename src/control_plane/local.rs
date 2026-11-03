@@ -375,6 +375,9 @@ async fn local_routes(
         Arc::new(provisioner),
     )
     .with_runtime_access(storage.access.clone())
+    .with_alarm_store(Arc::new(
+        super::alarms::SqliteAlarmStore::open(directory.join("alarms.sqlite3")).await?,
+    ))
     .with_local_builds(Arc::new(super::local_build::LocalBuilds::new(
         project.to_owned(),
         directory.canonicalize()?.join("code"),
@@ -388,7 +391,6 @@ async fn local_routes(
     }
     service.gateway = Some(gateway);
     service.start_access_reconciliation(stop.clone());
-    service.start_alarm_scheduler(super::alarms::DEFAULT_POLL_INTERVAL, stop);
     let admin = AdminService::new(options.api_key.clone(), registry, issuer)?;
     let inventory = Arc::new(super::socket_inventory::GatewayInventoryReader::new(
         Arc::new(service.lifecycle.clone()),
@@ -404,6 +406,8 @@ async fn local_routes(
         service: service.clone(),
         admin: admin.clone(),
         spec,
+        stop,
+        alarms: std::sync::Once::new(),
     };
     let public = public_api::router(service.clone(), admin.clone())
         .merge(super::inspection::local_router(inspector, admin));
@@ -417,6 +421,8 @@ struct LocalReload {
     service: ControlPlaneService,
     admin: AdminService,
     spec: HostLaunchSpec,
+    stop: CancellationToken,
+    alarms: std::sync::Once,
 }
 
 impl LocalReload {
@@ -435,6 +441,11 @@ impl LocalReload {
         self.service
             .deploy_source(&self.admin, &self.spec, None)
             .await?;
+        // Restored alarms would exhaust their retries and be dropped before the code is deployed.
+        self.alarms.call_once(|| {
+            self.service
+                .start_alarm_scheduler(super::alarms::DEFAULT_POLL_INTERVAL, self.stop.clone())
+        });
         Ok(())
     }
 }

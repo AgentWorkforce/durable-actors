@@ -16,6 +16,7 @@ fn claimed(actor: ActorKey, revision: u64) -> ClaimedAlarm {
 
 async fn with_each_store(test: impl AsyncFn(&dyn AlarmStore) -> Result<()>) -> Result<()> {
     test(&MemoryAlarmStore::default()).await?;
+    test(&SqliteAlarmStore::open(":memory:".into()).await?).await?;
     crate::postgres::testing::with_postgres(async |database| {
         test(&PostgresAlarmStore::new(PostgresDatabase::lazy(
             &database.url,
@@ -104,6 +105,25 @@ async fn an_alarm_replaced_during_delivery_survives_finish_and_is_claimable() ->
         Ok(())
     })
     .await
+}
+
+#[tokio::test]
+async fn sqlite_alarms_survive_a_restart_and_release_interrupted_claims() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("alarms.sqlite3");
+    let store = SqliteAlarmStore::open(path.clone()).await?;
+    store.update(&actor(), Some(100)).await?;
+    store.claim_due(100, 0, 100).await?;
+    drop(store);
+
+    let store = SqliteAlarmStore::open(path).await?;
+
+    assert_eq!(store.get(&actor()).await?, Some(100));
+    assert_eq!(
+        store.claim_due(100, 0, 100).await?,
+        vec![claimed(actor(), 1)]
+    );
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
