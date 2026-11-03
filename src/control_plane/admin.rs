@@ -195,6 +195,7 @@ pub(crate) trait DeploymentUpdate: Send {
 #[derive(Clone)]
 pub(crate) struct AdminService {
     api_key: Option<String>,
+    invoke_api_key: Option<String>,
     registry: std::sync::Arc<dyn AdminRegistry>,
     issuer: ActorJwtIssuer,
     sessions: super::session::SessionVerifier,
@@ -215,10 +216,26 @@ impl AdminService {
         let sessions = issuer.session_verifier()?;
         Ok(Self {
             api_key,
+            invoke_api_key: None,
             registry,
             issuer,
             sessions,
         })
+    }
+
+    pub(crate) fn with_invoke_api_key(mut self, invoke_api_key: Option<String>) -> Result<Self> {
+        if let Some(invoke_api_key) = &invoke_api_key {
+            ensure!(
+                !invoke_api_key.is_empty() && invoke_api_key.trim() == invoke_api_key,
+                "invoke API key is invalid"
+            );
+            ensure!(
+                self.api_key.as_ref() != Some(invoke_api_key),
+                "invoke API key must differ from the admin API key"
+            );
+        }
+        self.invoke_api_key = invoke_api_key;
+        Ok(self)
     }
 
     pub(super) fn authorize_session_issuance(&self, authorization: &str) -> Result<()> {
@@ -247,7 +264,17 @@ impl AdminService {
         if self.authenticate(authorization).is_ok() {
             return Ok(None);
         }
+        if self.authenticate_invoke_key(authorization).is_ok() {
+            return Ok(Some(self.issuer.invoke_key_session(project_id.to_owned())?));
+        }
         Ok(Some(self.sessions.authenticate(authorization, project_id)?))
+    }
+
+    pub(super) fn authorize_socket_discovery(&self, authorization: &str) -> Result<()> {
+        if self.authenticate(authorization).is_ok() {
+            return Ok(());
+        }
+        self.authenticate_invoke_key(authorization)
     }
 
     pub(super) fn issue_socket(
@@ -287,6 +314,23 @@ impl AdminService {
                 && token.trim() == token
                 && bool::from(token.as_bytes().ct_eq(api_key.as_bytes())),
             "admin credential is invalid"
+        );
+        Ok(())
+    }
+
+    fn authenticate_invoke_key(&self, authorization: &str) -> Result<()> {
+        let invoke_api_key = self
+            .invoke_api_key
+            .as_ref()
+            .context("invoke API key is not configured")?;
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .context("invoke credential must use Bearer authentication")?;
+        ensure!(
+            !token.is_empty()
+                && token.trim() == token
+                && bool::from(token.as_bytes().ct_eq(invoke_api_key.as_bytes())),
+            "invoke credential is invalid"
         );
         Ok(())
     }

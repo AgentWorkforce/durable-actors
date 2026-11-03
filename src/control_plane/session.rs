@@ -11,6 +11,7 @@ use super::{
 use crate::actor::ActorKey;
 
 pub(super) const MAX_SESSION_LIFETIME_SECONDS: i64 = 300;
+pub(super) const INVOKE_KEY_SUBJECT: &str = "invoke-api-key";
 
 #[derive(Clone)]
 pub(crate) struct SessionVerifier {

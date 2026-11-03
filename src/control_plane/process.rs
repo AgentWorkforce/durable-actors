@@ -34,6 +34,7 @@ pub struct ControlPlaneProcessConfig {
     pub invocation_audience: String,
     pub jwt_max_lifetime: Duration,
     pub api_key: Option<String>,
+    pub invoke_api_key: Option<String>,
     pub storage: ControlPlaneStorageConfig,
     pub sandbox_provider: SandboxProviderConfig,
     pub socket_event_sink: Option<SocketEventSinkConfig>,
@@ -316,7 +317,8 @@ async fn control_plane_routes(
         Arc::new(service.lifecycle.clone()),
         service.gateway.as_ref().unwrap().connections.clone(),
     ));
-    let admin = super::admin::AdminService::new(config.api_key, registry, issuer)?;
+    let admin = super::admin::AdminService::new(config.api_key, registry, issuer)?
+        .with_invoke_api_key(config.invoke_api_key)?;
     let inspector =
         super::inspection::ActorInspector::new(inventory, storage.clone(), service.changes.clone())
             .with_traces(service.traces.clone());
@@ -519,6 +521,21 @@ impl ControlPlaneProcessConfig {
                 "DURABLE_ACTORS_SECRET has surrounding whitespace"
             );
         }
+        let invoke_api_key = get("DURABLE_ACTORS_INVOKE_API_KEY");
+        if let Some(invoke_api_key) = &invoke_api_key {
+            ensure!(
+                !invoke_api_key.is_empty(),
+                "DURABLE_ACTORS_INVOKE_API_KEY must not be empty"
+            );
+            ensure!(
+                invoke_api_key.trim() == invoke_api_key,
+                "DURABLE_ACTORS_INVOKE_API_KEY has surrounding whitespace"
+            );
+            ensure!(
+                api_key.as_ref() != Some(invoke_api_key),
+                "DURABLE_ACTORS_INVOKE_API_KEY must differ from DURABLE_ACTORS_SECRET"
+            );
+        }
         let bucket = required(&mut get, "DURABLE_ACTORS_BUCKET")?;
         crate::storage::validate_bucket(&bucket)?;
         let persistence = persistence_config(&mut get)?;
@@ -567,6 +584,7 @@ impl ControlPlaneProcessConfig {
             invocation_audience,
             jwt_max_lifetime,
             api_key,
+            invoke_api_key,
             storage,
             sandbox_provider,
             socket_event_sink,

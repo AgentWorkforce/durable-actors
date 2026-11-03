@@ -120,6 +120,66 @@ async fn session_issuance_requires_configured_administrative_authentication() ->
     Ok(())
 }
 
+#[tokio::test]
+async fn invoke_api_key_is_distinct_from_the_administrative_secret() -> Result<()> {
+    let (_, admin, _, _) = fixture(Some("admin-secret")).await?;
+    for invalid in ["", " ", " key", "key ", "admin-secret"] {
+        assert!(
+            admin
+                .clone()
+                .with_invoke_api_key(Some(invalid.into()))
+                .is_err(),
+            "{invalid:?}"
+        );
+    }
+    let admin = admin.with_invoke_api_key(Some("invoke-secret".into()))?;
+    for accepted in ["Bearer admin-secret", "Bearer invoke-secret"] {
+        assert!(admin.authorize_socket_discovery(accepted).is_ok());
+    }
+    for rejected in [
+        "",
+        "Bearer",
+        "Bearer ",
+        "Bearer other",
+        "Basic invoke-secret",
+        "Bearer invoke-secret ",
+    ] {
+        assert!(admin.authenticate(rejected).is_err(), "{rejected:?}");
+        assert!(admin.authorize_socket_discovery(rejected).is_err(), "{rejected:?}");
+        assert!(admin.authorize_discovery(rejected, "default").is_err(), "{rejected:?}");
+    }
+    assert!(admin.authenticate("Bearer invoke-secret").is_err());
+    assert!(
+        admin
+            .authorize_session_issuance("Bearer invoke-secret")
+            .is_err()
+    );
+    assert!(
+        admin
+            .authorize_discovery("Bearer admin-secret", "default")?
+            .is_none()
+    );
+    let session = admin
+        .authorize_discovery("Bearer invoke-secret", "default")?
+        .expect("invoke key grants a session");
+    assert_eq!(session.subject, "invoke-api-key");
+    assert_eq!(session.project_id, "default");
+    assert!(
+        session.expires_at - session.iat
+            <= crate::control_plane::session::MAX_SESSION_LIFETIME_SECONDS
+    );
+
+    let (_, anyone, _, _) = fixture(None).await?;
+    let anyone = anyone.with_invoke_api_key(Some("invoke-secret".into()))?;
+    assert!(
+        anyone
+            .authorize_discovery("Bearer anything", "default")?
+            .is_none()
+    );
+    assert!(anyone.authorize_socket_discovery("").is_ok());
+    Ok(())
+}
+
 async fn fixture(
     api_key: Option<&str>,
 ) -> Result<(ControlPlaneService, AdminService, i64, ActorJwtVerifier)> {

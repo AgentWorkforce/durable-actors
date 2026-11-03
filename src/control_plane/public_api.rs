@@ -189,7 +189,7 @@ async fn find_websocket(
     headers: HeaderMap,
     request: Result<Json<FindWebSocketRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    authorized_admin(&state.admin, &headers)?;
+    authorized_socket_discovery(&state.admin, &headers)?;
     let Json(request) = request.map_err(ApiError::json)?;
     state
         .invocations
@@ -544,6 +544,17 @@ pub(super) fn authorized_admin(admin: &AdminService, headers: &HeaderMap) -> Res
     admin
         .authenticate(authorization)
         .map_err(|_| ApiError::unauthorized("admin credential was rejected"))?;
+    Ok(())
+}
+
+fn authorized_socket_discovery(admin: &AdminService, headers: &HeaderMap) -> Result<(), ApiError> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    admin
+        .authorize_socket_discovery(authorization)
+        .map_err(|_| ApiError::unauthorized("socket discovery credential was rejected"))?;
     Ok(())
 }
 
