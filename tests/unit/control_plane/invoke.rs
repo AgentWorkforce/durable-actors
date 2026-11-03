@@ -204,7 +204,12 @@ async fn invoke_api_key_reaches_only_actor_rpc_and_socket_routes() -> Result<()>
         json!({"type":"completed", "result":7}),
     )])
     .await?;
-    let request = json!({"requestId":"call-1", "method":"sendMessage", "args":[]});
+    let request = json!({
+        "requestId": "call-1",
+        "method": "sendMessage",
+        "args": [],
+        "homeRegion": "north-america-east"
+    });
     let response = fixture.call("invoke-key", request).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let requests = fixture.host.requests.lock().unwrap();
