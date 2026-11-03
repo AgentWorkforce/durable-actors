@@ -145,8 +145,14 @@ async fn invoke_api_key_is_distinct_from_the_administrative_secret() -> Result<(
         "Bearer invoke-secret ",
     ] {
         assert!(admin.authenticate(rejected).is_err(), "{rejected:?}");
-        assert!(admin.authorize_socket_discovery(rejected).is_err(), "{rejected:?}");
-        assert!(admin.authorize_discovery(rejected, "default").is_err(), "{rejected:?}");
+        assert!(
+            admin.authorize_socket_discovery(rejected).is_err(),
+            "{rejected:?}"
+        );
+        assert!(
+            admin.authorize_discovery(rejected, "default").is_err(),
+            "{rejected:?}"
+        );
     }
     assert!(admin.authenticate("Bearer invoke-secret").is_err());
     assert!(

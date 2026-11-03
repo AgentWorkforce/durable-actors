@@ -52,12 +52,18 @@ fn invoke_key_sessions_are_bounded_like_a_maximal_session() -> Result<()> {
     };
     for (issuer, lifetime) in [(socket_issuer()?, 300), (short_lived_issuer()?, 60)] {
         let session = issuer.invoke_key_session("default".into())?;
-        assert_eq!(session.subject, crate::control_plane::session::INVOKE_KEY_SUBJECT);
+        assert_eq!(
+            session.subject,
+            crate::control_plane::session::INVOKE_KEY_SUBJECT
+        );
         assert_eq!(session.project_id, "default");
         assert_eq!(session.expires_at - session.iat, lifetime);
         session.validate(session.iat)?;
         let grant = session.clone().invocation(&actor, vec!["read".into()])?;
-        assert_eq!(grant.subject, crate::control_plane::session::INVOKE_KEY_SUBJECT);
+        assert_eq!(
+            grant.subject,
+            crate::control_plane::session::INVOKE_KEY_SUBJECT
+        );
         assert_eq!(grant.grant_id, session.jti);
         assert_eq!(grant.expires_at, session.expires_at);
         assert!(session.invocation(&actor, vec![]).is_err());
