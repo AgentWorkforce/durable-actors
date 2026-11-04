@@ -35,6 +35,11 @@ pub(crate) enum BucketLocation {
         bucket: String,
         artifact_bucket: String,
     },
+    S3 {
+        bucket: String,
+        artifact_bucket: String,
+        s3: super::S3Endpoint,
+    },
     File {
         directory: PathBuf,
     },
@@ -45,6 +50,17 @@ pub(crate) enum BucketLocation {
 pub(crate) struct StorageToken {
     pub access_token: String,
     pub expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsSessionCredentials>,
+}
+
+/// Temporary STS credentials; on S3 they replace the GCS bearer `access_token`, which is empty.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AwsSessionCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
 }
 
 /// One boundary spanning all of an actor's storage exceeds reqsign's 2,048-character limit once
@@ -78,6 +94,7 @@ impl RuntimeAccess {
         Ok(Self {
             token_source: match &location {
                 BucketLocation::Gcs { .. } => Some(Box::new(ClientSideTokens::from_environment()?)),
+                BucketLocation::S3 { .. } => None,
                 BucketLocation::File { .. } => None,
             },
             location,
@@ -85,12 +102,37 @@ impl RuntimeAccess {
         })
     }
 
+    /// S3 storage whose per-actor credentials come from `sts:AssumeRole` on `role_arn`.
+    pub async fn s3(
+        location: BucketLocation,
+        persistence: super::SnapshotStoreConfig,
+        role_arn: &str,
+    ) -> Result<Self> {
+        let BucketLocation::S3 { s3, .. } = &location else {
+            anyhow::bail!("S3 credentials require an S3 bucket location");
+        };
+        ensure!(
+            persistence.rapid_settings().is_none(),
+            "Rapid persistence requires GCS"
+        );
+        Ok(Self {
+            token_source: Some(Box::new(
+                super::s3_access::AssumeRoleTokens::from_environment(s3, role_arn).await?,
+            )),
+            location,
+            persistence,
+        })
+    }
+
     pub(crate) fn validate_code(&self, code: &crate::bundle::ActorBundle) -> Result<()> {
-        let BucketLocation::Gcs {
+        let (BucketLocation::Gcs {
             artifact_bucket, ..
-        } = &self.location
+        }
+        | BucketLocation::S3 {
+            artifact_bucket, ..
+        }) = &self.location
         else {
-            anyhow::bail!("compiled GCS bundles require GCS storage");
+            anyhow::bail!("compiled bundles require object storage");
         };
         ensure!(
             code.bucket == *artifact_bucket,
@@ -119,10 +161,15 @@ impl RuntimeAccess {
         actor: &crate::actor::ActorKey,
         code_snapshot: Option<&str>,
     ) -> Result<Option<StorageTokens>> {
-        let BucketLocation::Gcs {
+        let (BucketLocation::Gcs {
             bucket,
             artifact_bucket,
-        } = &self.location
+        }
+        | BucketLocation::S3 {
+            bucket,
+            artifact_bucket,
+            ..
+        }) = &self.location
         else {
             return Ok(None);
         };
@@ -147,7 +194,7 @@ impl RuntimeAccess {
 }
 
 #[async_trait]
-trait StorageTokenSource: Send + Sync {
+pub(super) trait StorageTokenSource: Send + Sync {
     async fn issue(&self, rules: &[Rule]) -> Result<StorageToken>;
 }
 
@@ -232,6 +279,7 @@ fn throttled_delay(kind: ErrorKind, delay: Option<Duration>) -> Option<Duration>
 fn storage_token(token: reqsign_google::Token) -> Result<StorageToken> {
     let expires_at = token.expires_at.context("GCS credential has no expiry")?;
     Ok(StorageToken {
+        aws: None,
         access_token: token.access_token,
         expires_at_ms: expires_at
             .as_system_time()
@@ -258,10 +306,10 @@ fn grant(rules: &[Rule]) -> Result<CredentialAccessBoundaryGrant> {
 /// Grants `permissions` on the objects in `bucket` whose names start with `prefix`, including
 /// listing them.
 #[derive(Debug, Clone, PartialEq)]
-struct Rule {
-    bucket: String,
-    prefix: String,
-    permissions: Permissions,
+pub(super) struct Rule {
+    pub bucket: String,
+    pub prefix: String,
+    pub permissions: Permissions,
 }
 
 /// The rules behind each of [`StorageTokens`].

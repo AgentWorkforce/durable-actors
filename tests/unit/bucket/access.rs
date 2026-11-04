@@ -135,6 +135,7 @@ async fn every_request_mints_its_own_token() -> Result<()> {
             Ok(StorageToken {
                 access_token: format!("token-{n}"),
                 expires_at_ms: 0,
+                aws: None,
             })
         }
     }

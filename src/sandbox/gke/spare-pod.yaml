@@ -1,6 +1,6 @@
 # A spare actor sandbox. spare_pod in kubernetes.rs sets what varies per request: the name, the
 # pool label, both images, the zones, CPU and memory, and the spare's token and endpoints. It also
-# replaces the runtime class when the control plane is configured with another.
+# replaces the runtime class, node selector and tolerations when the control plane names others.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -40,6 +40,8 @@ spec:
     runAsUser: 10000
     runAsGroup: 10000
     fsGroup: 10000
+    seccompProfile:
+      type: RuntimeDefault
   # Under gVisor a file in the image is cached whole in the sandbox's own memory, while a file on a
   # volume is mapped lazily from the node's page cache, so the runtime binaries run from a copy.
   initContainers:
