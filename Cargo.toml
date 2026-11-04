@@ -1,6 +1,6 @@
 [package]
 name = "durable-actors"
-version = "0.14.6"
+version = "0.14.7"
 edition = "2024"
 rust-version = "1.91"
 default-run = "durable-actors"
