@@ -111,7 +111,7 @@ test("observer opens the browser only after authentication and local serving suc
             const response = await fetch(url)
             assert.match(response.headers.get("content-type")!, /^text\/html(?:;|$)/u)
             assert.match(await response.text(), /src="\.\/app.js"/u)
-            assert.match(await (await fetch(`${url}/app.js`)).text(), /No actors yet/u)
+            assert.match(await (await fetch(`${url}/app.js`)).text(), /No actor types deployed yet/u)
             assert.match((await fetch(`${url}/app.css`)).headers.get("content-type")!, /text\/css/u)
             opened = url
         },

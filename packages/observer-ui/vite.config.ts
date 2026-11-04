@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => ({
             ? {
                   outDir: "dist",
                   emptyOutDir: true,
-                  lib: { entry: { index: "src/index.ts", styles: "src/styles.css", theme: "src/theme.css" }, formats: ["es"], fileName: (_format, name) => `${name}.js` },
+                  lib: { entry: { index: "src/index.ts", theme: "src/theme.css" }, formats: ["es"], fileName: (_format, name) => `${name}.js` },
                   cssCodeSplit: true,
                   rolldownOptions: {
                       external: id => Object.keys({ ...packageJson.dependencies, ...packageJson.peerDependencies }).some(name => id === name || id.startsWith(`${name}/`)),

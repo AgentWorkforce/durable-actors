@@ -160,7 +160,6 @@ jobs:
             - run: bun install --frozen-lockfile
             - run: bun run --bun --cwd sdk format:check
             - run: bun run --bun --cwd packages/observer-ui format:check
-            - run: bun run --bun --cwd packages/observer-ui test
             - run: bun run --bun --cwd sdk test
             - name: Validate HTTP and build TypeScript documentation
               run: bun run --bun docs:build

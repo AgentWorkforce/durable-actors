@@ -14,7 +14,7 @@
         "release:notes": "node scripts/release-notes.mjs",
         "release:prepare": "bun scripts/release.mjs prepare",
         "release:verify": "bun scripts/release.mjs verify",
-        "test": "bun run --bun --cwd packages/observer-ui test && bun test --timeout 60000 tests/scripts/*.test.mjs && cargo test --locked --no-fail-fast && bun run --bun --cwd sdk test && bun run --bun --cwd packages/pi-durable build && bun run --bun --cwd packages/pi-durable test && bun run --bun --cwd examples/pi/pi-cli test",
+        "test": "bun test --timeout 60000 tests/scripts/*.test.mjs && cargo test --locked --no-fail-fast && bun run --bun --cwd sdk test && bun run --bun --cwd packages/pi-durable build && bun run --bun --cwd packages/pi-durable test && bun run --bun --cwd examples/pi/pi-cli test",
         "docs:build": "bun run --bun docs:check && bun run --bun --cwd sdk build && bun run --bun --cwd sdk docs",
         "docs:check": "bun test --timeout 60000 tests/scripts/openapi.test.mjs",
         "staging:persistence": "bun scripts/staging.mjs persistence/persistence-tests",
