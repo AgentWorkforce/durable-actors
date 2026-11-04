@@ -919,7 +919,9 @@ fn s3_storage_with_aws_placement_and_runc_actor_nodes() -> Result<()> {
                 endpoint: None,
                 force_path_style: false,
             },
-            actor_role_arn: "arn:aws:iam::123456789012:role/actor-storage".into(),
+            actor_credentials: crate::bucket::S3ActorCredentials::AssumeRole {
+                role_arn: "arn:aws:iam::123456789012:role/actor-storage".into()
+            },
         }
     );
     assert_eq!(config.region.as_deref(), Some("north-america-west"));
@@ -978,6 +980,24 @@ fn s3_configuration_is_validated() {
 
     let mut values = aws_environment();
     values.insert("DURABLE_ACTORS_STORAGE_PROVIDER", "azure");
+    assert!(parse(&values).is_err());
+
+    let mut values = aws_environment();
+    values.insert("DURABLE_ACTORS_S3_ACTOR_CREDENTIALS", "control-plane");
+    assert!(
+        parse(&values).is_err(),
+        "a role ARN with control-plane credentials"
+    );
+    values.remove("DURABLE_ACTORS_S3_ACTOR_ROLE_ARN");
+    let config = parse(&values).unwrap();
+    assert!(matches!(
+        config.storage.provider,
+        StorageProvider::S3 {
+            actor_credentials: crate::bucket::S3ActorCredentials::ControlPlane,
+            ..
+        }
+    ));
+    values.insert("DURABLE_ACTORS_S3_ACTOR_CREDENTIALS", "shared");
     assert!(parse(&values).is_err());
 }
 

@@ -11,6 +11,93 @@ const SESSION_SECONDS: i32 = 900;
 /// STS limits the packed inline session policy; this is the plain-text bound we enforce.
 pub(super) const MAX_POLICY_BYTES: usize = 2048;
 
+/// How actor hosts get S3 credentials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum S3ActorCredentials {
+    /// Per-actor `sts:AssumeRole` credentials narrowed by an inline session policy (default).
+    AssumeRole { role_arn: String },
+    /// The control plane's own short-lived credentials, for accounts where the control plane may
+    /// not call STS. Hosts can then reach every actor's objects the control-plane role can.
+    ControlPlane,
+}
+
+impl S3ActorCredentials {
+    pub(super) async fn source(
+        &self,
+        endpoint: &super::S3Endpoint,
+    ) -> Result<Box<dyn StorageTokenSource>> {
+        Ok(match self {
+            Self::AssumeRole { role_arn } => {
+                Box::new(AssumeRoleTokens::from_environment(endpoint, role_arn).await?)
+            }
+            Self::ControlPlane => {
+                tracing::warn!(
+                    "actor hosts receive the control plane's S3 credentials; actors are isolated by bucket prefix, not per actor"
+                );
+                Box::new(ControlPlaneTokens::from_environment(endpoint).await?)
+            }
+        })
+    }
+}
+
+/// Hands hosts the control plane's current credentials (EKS Pod Identity, IRSA), which expire and
+/// are refreshed through the same RPC as scoped credentials.
+pub(super) struct ControlPlaneTokens {
+    provider: aws_credential_types::provider::SharedCredentialsProvider,
+}
+
+impl ControlPlaneTokens {
+    async fn from_environment(endpoint: &super::S3Endpoint) -> Result<Self> {
+        let shared = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(endpoint.region.clone()))
+            .load()
+            .await;
+        Ok(Self {
+            provider: shared
+                .credentials_provider()
+                .context("no AWS credentials for the control plane")?,
+        })
+    }
+}
+
+#[async_trait]
+impl StorageTokenSource for ControlPlaneTokens {
+    async fn issue(&self, _: &[Rule]) -> Result<StorageToken> {
+        use aws_credential_types::provider::ProvideCredentials;
+        let credentials = self.provider.provide_credentials().await?;
+        token(
+            credentials.access_key_id(),
+            credentials.secret_access_key(),
+            credentials.session_token().unwrap_or_default(),
+            credentials.expiry(),
+        )
+    }
+}
+
+/// Static keys never expire; hosts still refresh them on this cadence.
+const STATIC_REFRESH: std::time::Duration = std::time::Duration::from_secs(900);
+
+fn token(
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    expiry: Option<std::time::SystemTime>,
+) -> Result<StorageToken> {
+    let expires_at = expiry.unwrap_or_else(|| std::time::SystemTime::now() + STATIC_REFRESH);
+    Ok(StorageToken {
+        access_token: String::new(),
+        expires_at_ms: expires_at
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?,
+        aws: Some(AwsSessionCredentials {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            session_token: session_token.into(),
+        }),
+    })
+}
+
 /// Mints each actor's credentials with `sts:AssumeRole`, narrowing `role_arn` (which may reach every
 /// actor's objects) to the actor's prefixes with an inline session policy, the S3 counterpart of
 /// a GCS Credential Access Boundary.
@@ -66,18 +153,12 @@ impl StorageTokenSource for AssumeRoleTokens {
             .context("STS returned no credentials")?;
         let expires_at = std::time::SystemTime::try_from(*credentials.expiration())
             .context("invalid STS expiry")?;
-        Ok(StorageToken {
-            access_token: String::new(),
-            expires_at_ms: expires_at
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis()
-                .try_into()?,
-            aws: Some(AwsSessionCredentials {
-                access_key_id: credentials.access_key_id().into(),
-                secret_access_key: credentials.secret_access_key().into(),
-                session_token: credentials.session_token().into(),
-            }),
-        })
+        token(
+            credentials.access_key_id(),
+            credentials.secret_access_key(),
+            credentials.session_token(),
+            Some(expires_at),
+        )
     }
 }
 
