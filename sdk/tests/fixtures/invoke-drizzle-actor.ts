@@ -13,8 +13,12 @@ const supervisor: Supervisor = new ActorWorkerSupervisor({ actorEntrypointUrl: p
 const database = new HostDatabase()
 try {
     assert.deepEqual(await supervisor.ready(), ["Library"])
-    supervisor.assign({ project_id: "local", actor_name: "Library", actor_id: "library-1" }, async call =>
-        database.call(call)
+    supervisor.assign(
+        { project_id: "local", actor_name: "Library", actor_id: "library-1" },
+        async call => database.call(call),
+        async () => {
+            throw new Error("unexpected actor call")
+        }
     )
     const invoke = async (method: string, ...args: JsonValue[]) => {
         const reply = await supervisor.handle(

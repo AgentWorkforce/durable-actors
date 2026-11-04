@@ -16,6 +16,7 @@ from .build import load_artifact
 from .client import component
 from .contract import Document
 from .executor_wire import Channel, serialize
+from .host_transport import route_through_host
 from .runtime import ActorRuntime
 from .sqlite import DatabaseProxy
 
@@ -29,11 +30,13 @@ class Session(Channel):
         self.tasks: set[asyncio.Task[None]] = set()
         self.residency: asyncio.Task[None] | None = None
         self.database_calls = asyncio.Lock()
+        self.actor_calls: dict[int, asyncio.Future[Document]] = {}
+        self.next_actor_call = 0
 
     async def run(self, entrypoint: str | None, generic: bool) -> None:
         try:
             if generic:
-                await self.send({"type": "warm", "protocol": 30})
+                await self.send({"type": "warm", "protocol": 31})
                 assignment = await self.read()
                 if (
                     assignment.get("type") != "load"
@@ -48,10 +51,11 @@ class Session(Channel):
                 while not path.is_file():
                     await asyncio.sleep(0.01)
             actors = {actor.__name__: actor for actor in load_artifact(path)}
-            await self.send({"type": "attach", "protocol": 30, "actor_names": sorted(actors)})
+            await self.send({"type": "attach", "protocol": 31, "actor_names": sorted(actors)})
             identity = attached_actor(await self.read(), actors)
             database = DatabaseProxy(self.call_database, asyncio.get_running_loop())
             runtime = ActorRuntime(actors[identity["actor_name"]], identity, self, database)
+            route_through_host(self.call_actor, asyncio.get_running_loop())
             self.residency = asyncio.create_task(self.report_residency(runtime))
             while True:
                 message = await self.read()
@@ -60,6 +64,10 @@ class Session(Channel):
                     task = asyncio.create_task(self.execute(runtime, message))
                     self.tasks.add(task)
                     task.add_done_callback(self.completed)
+                elif message["type"] == "actor_result":
+                    call = self.actor_calls.pop(message["call_id"], None)
+                    if call is not None and not call.done():
+                        call.set_result(message["outcome"])
                 elif message["type"] in {"socket_connections", "database_result"}:
                     pending = self.pending.pop((message["type"], reply_id(message)))
                     if pending.cancelled():
@@ -101,6 +109,17 @@ class Session(Channel):
                 ),
             )
 
+    async def call_actor(self, call: Document) -> Document:
+        self.next_actor_call += 1
+        call_id = self.next_actor_call
+        future: asyncio.Future[Document] = asyncio.get_running_loop().create_future()
+        self.actor_calls[call_id] = future
+        try:
+            await self.send({"type": "actor_call", "call_id": call_id, "call": call})
+            return await future
+        finally:
+            self.actor_calls.pop(call_id, None)
+
     def publish(self, effects: list[Document]) -> None:
         message = {"type": "socket_effects", "message_id": message_id.get(), "effects": effects}
         self.writer.write(serialize(message))
@@ -141,7 +160,7 @@ class Session(Channel):
     async def close(self) -> None:
         if self.residency:
             self.residency.cancel()
-        for future in self.pending.values():
+        for future in [*self.pending.values(), *self.actor_calls.values()]:
             if not future.done():
                 future.cancel()
         tasks = list(self.tasks)
@@ -157,7 +176,7 @@ def reply_id(message: Document) -> int:
 
 
 def attached_actor(message: Document, actor_names: Collection[str]) -> Document:
-    if message.get("type") != "attached" or message.get("protocol") != 30:
+    if message.get("type") != "attached" or message.get("protocol") != 31:
         raise ValueError("unsupported executor protocol")
     actor = cast(Document, message["actor"])
     for field, size in (("project_id", 64), ("actor_name", 255), ("actor_id", 128)):

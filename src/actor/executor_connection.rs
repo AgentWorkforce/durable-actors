@@ -23,11 +23,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    ActorDatabase, ActorInvocationFailure, ActorKey, ActorSocketSource, DatabaseCall,
+    ActorCall, ActorDatabase, ActorInvocationFailure, ActorKey, ActorSocketSource, DatabaseCall,
     DatabaseResult,
 };
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 30;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 31;
 
 #[derive(Debug, Serialize)]
 pub struct ActorMethodInvocation {
@@ -207,6 +207,12 @@ pub(crate) trait ActorSocketPublisher: Send + Sync {
     async fn publish(&self, effects: Vec<ActorSocketEffect>) -> Result<()>;
 }
 
+#[async_trait]
+pub(crate) trait ActorCaller: Send + Sync {
+    /// Returns the invocation outcome, reporting transport failures as failed outcomes.
+    async fn call(&self, call: ActorCall) -> Value;
+}
+
 pub(crate) struct ActorExecutorListener {
     listener: UnixListener,
     socket_path: PathBuf,
@@ -329,9 +335,10 @@ impl ActorExecutorConnection {
         publisher: Option<Arc<dyn ActorSocketPublisher>>,
         sockets: Option<Arc<dyn ActorSocketSource>>,
         database: Option<Arc<dyn ActorDatabase>>,
+        calls: Option<Arc<dyn ActorCaller>>,
     ) -> Result<()> {
         self.executor
-            .mark_ready(actor, publisher, sockets, database)
+            .mark_ready(actor, publisher, sockets, database, calls)
             .await?;
         info!(
             actor_names = ?self.executor.actor_names,
@@ -525,6 +532,7 @@ impl JsActorExecutor {
         publisher: Option<Arc<dyn ActorSocketPublisher>>,
         sockets: Option<Arc<dyn ActorSocketSource>>,
         database: Option<Arc<dyn ActorDatabase>>,
+        calls: Option<Arc<dyn ActorCaller>>,
     ) -> Result<()> {
         let (reply, ready) = oneshot::channel();
         self.commands
@@ -534,6 +542,7 @@ impl JsActorExecutor {
                 publisher,
                 sockets,
                 database,
+                calls,
             })
             .context("actor executor stopped")?;
         ready
@@ -581,10 +590,12 @@ async fn run_executor_connection(
         publisher: None,
         sockets: None,
         database: None,
+        calls: None,
         loading_connections: JoinSet::new(),
         connection_lookup_ids: HashSet::new(),
         database_calls: JoinSet::new(),
         database_ids: HashSet::new(),
+        actor_calls: JoinSet::new(),
     };
     tokio::try_join!(
         driver.run(commands, replies),
@@ -604,10 +615,12 @@ struct ExecutorDriver {
     publisher: Option<Arc<dyn ActorSocketPublisher>>,
     sockets: Option<Arc<dyn ActorSocketSource>>,
     database: Option<Arc<dyn ActorDatabase>>,
+    calls: Option<Arc<dyn ActorCaller>>,
     loading_connections: JoinSet<(u64, Result<super::SocketLookup>)>,
     connection_lookup_ids: HashSet<u64>,
     database_calls: JoinSet<(u64, Option<u64>, Result<DatabaseResult>)>,
     database_ids: HashSet<u64>,
+    actor_calls: JoinSet<(u64, Value)>,
 }
 
 impl ExecutorDriver {
@@ -632,12 +645,17 @@ impl ExecutorDriver {
                         ActorExecutorClientMessage::SocketEffects { message_id, effects } => self.publish(message_id, effects)?,
                         ActorExecutorClientMessage::DatabaseCall { call_id, message_id, call } => self.call_database(call_id, message_id, call)?,
                         ActorExecutorClientMessage::GetConnections { message_id, query } => self.load_connections(message_id, query)?,
+                        ActorExecutorClientMessage::ActorCall { call_id, call } => self.call_actor(call_id, call),
                         ActorExecutorClientMessage::Warm { .. } | ActorExecutorClientMessage::Attach { .. } => anyhow::bail!("customer actor executor attached more than once"),
                     }
                 }
                 called = self.database_calls.join_next(), if !self.database_calls.is_empty() => {
                     let (call_id, message_id, result) = called.context("actor database call stopped")??;
                     self.database_called(call_id, message_id, result)?;
+                }
+                called = self.actor_calls.join_next(), if !self.actor_calls.is_empty() => {
+                    let (call_id, outcome) = called.context("actor call stopped")??;
+                    self.write(encode_server_message(&ActorExecutorServerMessage::ActorResult { call_id, outcome })?)?;
                 }
                 loaded = self.loading_connections.join_next(), if !self.loading_connections.is_empty() => {
                     let (message_id, result) = loaded.context("connection lookup stopped")??;
@@ -667,10 +685,12 @@ impl ExecutorDriver {
                 publisher,
                 sockets,
                 database,
+                calls,
             } => {
                 self.publisher = publisher;
                 self.sockets = sockets;
                 self.database = database;
+                self.calls = calls;
                 self.outbound
                     .send(ExecutorWrite {
                         bytes: encode_server_message(&ActorExecutorServerMessage::Attached {
@@ -752,6 +772,19 @@ impl ExecutorDriver {
                 error,
             },
         )?)
+    }
+
+    fn call_actor(&mut self, call_id: u64, call: ActorCall) {
+        let calls = self.calls.clone();
+        self.actor_calls.spawn(async move {
+            let outcome = match calls {
+                Some(calls) => calls.call(call).await,
+                None => serde_json::json!({
+                    "type": "failed", "code": "unavailable", "message": "actor calls are unavailable"
+                }),
+            };
+            (call_id, outcome)
+        });
     }
 
     fn load_connections(&mut self, message_id: u64, query: super::SocketQuery) -> Result<()> {
@@ -914,6 +947,7 @@ enum ExecutorRequest {
         publisher: Option<Arc<dyn ActorSocketPublisher>>,
         sockets: Option<Arc<dyn ActorSocketSource>>,
         database: Option<Arc<dyn ActorDatabase>>,
+        calls: Option<Arc<dyn ActorCaller>>,
     },
 }
 
@@ -992,6 +1026,10 @@ enum ActorExecutorServerMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    ActorResult {
+        call_id: u64,
+        outcome: Value,
+    },
     SocketConnections {
         message_id: u64,
         connections: super::SocketLookup,
@@ -1016,6 +1054,10 @@ enum ActorExecutorClientMessage {
         #[serde(default)]
         message_id: Option<u64>,
         call: DatabaseCall,
+    },
+    ActorCall {
+        call_id: u64,
+        call: ActorCall,
     },
     Warm {
         protocol: u32,

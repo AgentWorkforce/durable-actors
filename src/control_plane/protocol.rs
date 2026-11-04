@@ -22,6 +22,9 @@ pub(crate) enum ControlPlaneCommand {
         traces: Vec<crate::request_traces::RequestTrace>,
         dropped: u64,
     },
+    InvokeActor {
+        call: crate::actor::ActorCall,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +39,9 @@ pub(crate) enum ControlPlaneCommandReply {
     },
     Alarm {
         timestamp_ms: Option<i64>,
+    },
+    Invocation {
+        outcome: serde_json::Value,
     },
     Unit,
 }

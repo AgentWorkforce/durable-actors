@@ -32,17 +32,7 @@ pub(super) fn router(invocations: ControlPlaneService, admin: AdminService) -> R
         .clone()
         .map(|gateway| gateway.router(invocations.clone()))
         .unwrap_or_default();
-    let hosts = invocations
-        .gateway
-        .as_ref()
-        .map(|gateway| gateway.connections.http.clone())
-        .unwrap_or_else(|| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("actor invocation HTTP client")
-        });
+    let hosts = invocations.host_client();
     Router::new()
         .route("/openapi.yaml", get(openapi))
         .route("/healthz", get(health))
@@ -673,6 +663,10 @@ impl ApiError {
             "internal",
             error.to_string(),
         )
+    }
+
+    pub(super) fn into_outcome(self) -> Value {
+        serde_json::json!({"type": "failed", "code": self.code, "message": self.message})
     }
 
     pub(super) fn new(

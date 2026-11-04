@@ -6,10 +6,11 @@ import { z } from "zod"
 
 import type { SocketEffect, SocketLookup, SocketQuery } from "../actor/socketProtocol.js"
 import { ActorConfigurationError, ActorProtocolError, ActorSessionError } from "../errors.js"
+import type { JsonValue } from "../json.js"
 
 import type { DatabaseCall, DatabaseResult } from "./database.js"
 import { parseActorSessionServerMessage } from "./protocol.js"
-import type { ActorExecutorReply, ActorSessionClientMessage } from "./protocol.js"
+import type { ActorCallRequest, ActorExecutorReply, ActorSessionClientMessage } from "./protocol.js"
 import type { ActorHostSettings, ActorSessionSupervisor, ActorWorkerSupervisorFactory } from "./types.js"
 import { ActorWorkerSupervisor } from "./worker-supervisor.js"
 
@@ -95,6 +96,11 @@ class ActorSessionConnection {
         { resolve: (result: DatabaseResult) => void; reject: (error: Error) => void }
     >()
     private nextDatabaseCallId = 0
+    private readonly actorCalls = new Map<
+        number,
+        { resolve: (outcome: JsonValue) => void; reject: (error: Error) => void }
+    >()
+    private nextActorCallId = 0
     private readonly loadingConnections = new Map<
         number,
         { resolve: (connections: SocketLookup) => void; reject: (error: Error) => void }
@@ -113,7 +119,7 @@ class ActorSessionConnection {
         const connection = new ActorSessionConnection(socket, supervisor)
         connection.send({
             type: "attach",
-            protocol: 30,
+            protocol: 31,
             actor_names: actorNames
         })
         await connection.waitUntilAttached(timeoutMs)
@@ -181,7 +187,11 @@ class ActorSessionConnection {
             const message = parseActorSessionServerMessage(rawMessage)
             switch (message.type) {
                 case "attached":
-                    this.supervisor.assign(message.actor, call => this.callDatabase(call))
+                    this.supervisor.assign(
+                        message.actor,
+                        call => this.callDatabase(call),
+                        call => this.callActor(call)
+                    )
                     this.reportResidency()
                     this.attachedResolve?.()
                     this.attachedResolve = undefined
@@ -206,6 +216,13 @@ class ActorSessionConnection {
                     this.databaseCalls.delete(message.call_id)
                     if (message.result === undefined) pending.reject(new ActorSessionError(message.error!))
                     else pending.resolve(message.result)
+                    break
+                }
+                case "actor_result": {
+                    const pending = this.actorCalls.get(message.call_id)
+                    if (pending === undefined) throw new ActorProtocolError("Rust host replied to unknown actor call")
+                    this.actorCalls.delete(message.call_id)
+                    pending.resolve(message.outcome)
                     break
                 }
                 case "socket_connections": {
@@ -254,6 +271,20 @@ class ActorSessionConnection {
         })
     }
 
+    private callActor(call: ActorCallRequest): Promise<JsonValue> {
+        return new Promise((resolve, reject) => {
+            if (this.socket.destroyed) throw new ActorSessionError("Rust host disconnected before the actor call")
+            const callId = ++this.nextActorCallId
+            this.actorCalls.set(callId, { resolve, reject })
+            try {
+                this.send({ type: "actor_call", call_id: callId, call })
+            } catch (error) {
+                this.actorCalls.delete(callId)
+                reject(sessionError(error))
+            }
+        })
+    }
+
     private publish(messageId: number, effects: readonly SocketEffect[]): void {
         this.send({ type: "socket_effects", message_id: messageId, effects })
     }
@@ -294,6 +325,9 @@ class ActorSessionConnection {
         for (const pending of this.databaseCalls.values())
             pending.reject(new ActorSessionError("Rust host disconnected during a database call"))
         this.databaseCalls.clear()
+        for (const pending of this.actorCalls.values())
+            pending.reject(new ActorSessionError("Rust host disconnected during an actor call"))
+        this.actorCalls.clear()
         for (const pending of this.loadingConnections.values())
             pending.reject(new ActorSessionError("Rust host disconnected while loading connections"))
         this.loadingConnections.clear()

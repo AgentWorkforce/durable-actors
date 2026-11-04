@@ -1,4 +1,8 @@
-use crate::{request_tracking::HostState, sockets::operations::SocketOperation};
+use crate::{
+    request_tracking::HostState,
+    sandbox::assignment::{InitialOperation, InitialRequest},
+    sockets::operations::SocketOperation,
+};
 use anyhow::Context;
 use axum::{
     Json,
@@ -8,6 +12,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::future::Future;
+use tokio::time::Instant;
 
 use super::public_api::{
     ActorPath, ApiError, FindActorRequest, PublicApiState, resolve_actor_target,
@@ -20,7 +26,7 @@ pub(super) async fn invoke_alarm(
     client: &reqwest::Client,
     alarm: &super::alarms::ClaimedAlarm,
 ) -> anyhow::Result<()> {
-    let started = tokio::time::Instant::now();
+    let started = Instant::now();
     let target = service
         .resolve_actor_route(&alarm.actor, None, None, None, None)
         .await
@@ -70,17 +76,54 @@ pub(super) async fn invoke(
         .into_response())
 }
 
+pub(super) async fn invoke_from_host(
+    service: &super::ControlPlaneService,
+    invocation: &ActorInvocation,
+) -> Value {
+    resolve_and_dispatch_from_host(service, invocation)
+        .await
+        .unwrap_or_else(ApiError::into_outcome)
+}
+
+async fn resolve_and_dispatch_from_host(
+    service: &super::ControlPlaneService,
+    invocation: &ActorInvocation,
+) -> Result<Value, ApiError> {
+    invocation.validate().map_err(ApiError::bad_request)?;
+    let started = Instant::now();
+    let deadline = started + super::CONTROL_PLANE_REQUEST_TIMEOUT;
+    let resolve = || async {
+        let operation = InitialOperation {
+            request: InitialRequest::Invoke {
+                invocation: invocation.clone(),
+                grant: None,
+            },
+            routing_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+        service
+            .resolve_actor_route(&invocation.actor, None, None, None, Some(&operation))
+            .await
+            .map_err(ApiError::routing)
+    };
+    settle(
+        service,
+        &service.host_client(),
+        invocation,
+        deadline,
+        resolve,
+    )
+    .await
+}
+
 async fn resolve_and_dispatch(
     state: &PublicApiState,
     headers: &HeaderMap,
     home_region: Option<String>,
     invocation: &ActorInvocation,
 ) -> Result<Value, ApiError> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + super::CONTROL_PLANE_REQUEST_TIMEOUT;
-    let mut host_state = HostState::Warm;
-    loop {
-        let mut target = resolve_actor_target(
+    let deadline = Instant::now() + super::CONTROL_PLANE_REQUEST_TIMEOUT;
+    let resolve = || {
+        resolve_actor_target(
             state,
             &invocation.actor,
             headers,
@@ -89,7 +132,33 @@ async fn resolve_and_dispatch(
             })),
             Some(invocation),
         )
-        .await?;
+    };
+    settle(
+        &state.invocations,
+        &state.hosts,
+        invocation,
+        deadline,
+        resolve,
+    )
+    .await
+}
+
+/// Dispatches until the invocation runs or the deadline passes, re-resolving after refusals.
+async fn settle<Resolve, Resolving>(
+    service: &super::ControlPlaneService,
+    hosts: &reqwest::Client,
+    invocation: &ActorInvocation,
+    deadline: Instant,
+    resolve: Resolve,
+) -> Result<Value, ApiError>
+where
+    Resolve: Fn() -> Resolving,
+    Resolving: Future<Output = Result<ActorTarget, ApiError>>,
+{
+    let started = Instant::now();
+    let mut host_state = HostState::Warm;
+    loop {
+        let mut target = resolve().await?;
         if target.host_state == HostState::Cold {
             host_state = HostState::Cold;
         }
@@ -100,8 +169,7 @@ async fn resolve_and_dispatch(
                     .as_ref()
                     .map_or(true, |reply| reply["type"] == "not_executed")
                 {
-                    state
-                        .invocations
+                    service
                         .routes
                         .remove(&invocation.actor, &target.identity)
                         .await;
@@ -110,8 +178,8 @@ async fn resolve_and_dispatch(
             }
             None => {
                 dispatch(
-                    &state.invocations,
-                    &state.hosts,
+                    service,
+                    hosts,
                     &target,
                     invocation,
                     host_state,
@@ -123,7 +191,7 @@ async fn resolve_and_dispatch(
         if !matches!(
             outcome["type"].as_str(),
             Some("not_executed" | "unauthenticated")
-        ) || tokio::time::Instant::now() >= deadline
+        ) || Instant::now() >= deadline
         {
             return Ok(outcome);
         }

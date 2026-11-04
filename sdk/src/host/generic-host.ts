@@ -13,7 +13,7 @@ async function runGenericHost(): Promise<never> {
         const settings = parseHostSettings(process.env)
         const socket = await connectSocket(settings.socketPath)
         const assignment = readAssignment(socket)
-        socket.write(`${JSON.stringify({ type: "warm", protocol: 30 })}\n`)
+        socket.write(`${JSON.stringify({ type: "warm", protocol: 31 })}\n`)
         const { entrypoint, environment } = await assignment
         await access(entrypoint)
         let available = true
@@ -22,11 +22,11 @@ async function runGenericHost(): Promise<never> {
             options =>
                 new ActorWorkerSupervisor({
                     ...options,
-                    createWorker: (data, onStateChange, database) => {
+                    createWorker: (data, onStateChange, database, calls) => {
                         const assigned = { ...data, environment }
-                        if (!available) return new ActorWorker(assigned, onStateChange, database)
+                        if (!available) return new ActorWorker(assigned, onStateChange, database, calls)
                         available = false
-                        worker.load(assigned, onStateChange, database)
+                        worker.load(assigned, onStateChange, database, calls)
                         return worker
                     }
                 }),

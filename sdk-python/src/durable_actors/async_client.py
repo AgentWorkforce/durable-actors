@@ -254,6 +254,14 @@ class _DefaultTransport:
             await client.broadcast(actor_name, actor_id, message)
 
 
+_default_transport: AsyncActorTransport | None = None
+
+
 def default_async_client() -> AsyncActorTransport:
     """Use a request-scoped transport; inject AsyncClient to reuse a connection pool."""
-    return _DefaultTransport()
+    return _default_transport if _default_transport is not None else _DefaultTransport()
+
+
+def set_default_async_client(transport: AsyncActorTransport) -> None:
+    global _default_transport
+    _default_transport = transport

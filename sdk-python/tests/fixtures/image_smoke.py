@@ -57,7 +57,7 @@ class Counter(Actor):
                                     }
                                 )
 
-                        assert receive() == {"type": "warm", "protocol": 30}
+                        assert receive() == {"type": "warm", "protocol": 31}
                         send(
                             {
                                 "type": "load",
@@ -67,11 +67,11 @@ class Counter(Actor):
                         )
                         assert receive() == {
                             "type": "attach",
-                            "protocol": 30,
+                            "protocol": 31,
                             "actor_names": ["Counter"],
                         }
                         actor = {"project_id": "local", "actor_name": "Counter", "actor_id": "one"}
-                        send({"type": "attached", "protocol": 30, "actor": actor})
+                        send({"type": "attached", "protocol": 31, "actor": actor})
                         send(
                             {
                                 "type": "command",

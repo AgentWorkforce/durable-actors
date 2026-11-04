@@ -14,8 +14,10 @@ const scopedClients = new AsyncLocalStorage<ActorClientTransport>()
 let defaultClient: Promise<ActorClientTransport> | undefined
 
 async function actorClient(): Promise<ActorClientTransport> {
-    const scopedClient = scopedClients.getStore()
-    if (scopedClient !== undefined) return scopedClient
+    return scopedClients.getStore() ?? remoteActorClient()
+}
+
+function remoteActorClient(): Promise<ActorClientTransport> {
     defaultClient ??= import("./remoteClient.js")
         .then(({ RemoteActorClient }) => new RemoteActorClient())
         .catch(error => {
@@ -29,5 +31,5 @@ function runWithActorClient<T>(client: ActorClientTransport, operation: () => T)
     return scopedClients.run(client, operation)
 }
 
-export { actorClient, runWithActorClient }
+export { actorClient, remoteActorClient, runWithActorClient }
 export type { ActorClientTransport }

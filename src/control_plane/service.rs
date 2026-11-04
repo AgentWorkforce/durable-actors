@@ -54,6 +54,7 @@ pub struct ControlPlaneService {
     alarms: Arc<dyn super::alarms::AlarmStore>,
     socket_events: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
     local_builds: Option<Arc<super::local_build::LocalBuilds>>,
+    hosts: reqwest::Client,
 }
 
 impl ControlPlaneService {
@@ -96,7 +97,19 @@ impl ControlPlaneService {
             alarms: Arc::new(super::alarms::MemoryAlarmStore::default()),
             socket_events: None,
             local_builds: None,
+            hosts: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("actor invocation HTTP client"),
         }
+    }
+
+    pub(super) fn host_client(&self) -> reqwest::Client {
+        self.gateway.as_ref().map_or_else(
+            || self.hosts.clone(),
+            |gateway| gateway.connections.http.clone(),
+        )
     }
 
     pub(super) fn with_alarm_store(mut self, alarms: Arc<dyn super::alarms::AlarmStore>) -> Self {
@@ -550,6 +563,11 @@ impl ControlPlaneService {
             ControlPlaneCommand::UpdateAlarm { timestamp_ms } => {
                 self.alarms.update(&principal.actor, timestamp_ms).await?;
                 Ok(ControlPlaneCommandReply::Unit)
+            }
+            ControlPlaneCommand::InvokeActor { call } => {
+                let invocation = call.in_project(&principal.actor.project_id);
+                let outcome = super::invocation::invoke_from_host(self, &invocation).await;
+                Ok(ControlPlaneCommandReply::Invocation { outcome })
             }
             ControlPlaneCommand::RefreshStorageAccess => {
                 self.require_active_host(principal).await?;

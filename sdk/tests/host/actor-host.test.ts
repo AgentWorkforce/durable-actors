@@ -36,7 +36,7 @@ test("loads a prepared JavaScript artifact only inside the first execution Worke
         const lines = createInterface({ input: socket })
         lines.once("line", line => {
             assert.deepEqual(JSON.parse(line).actor_names, ["SessionCounter"])
-            socket.write(`${JSON.stringify({ type: "attached", protocol: 30, actor: actorIdentity() })}\n`)
+            socket.write(`${JSON.stringify({ type: "attached", protocol: 31, actor: actorIdentity() })}\n`)
             socket.end()
         })
     })
@@ -115,7 +115,7 @@ test("database calls outside a command carry only their call ID", { timeout: 5_0
         const customerSocket = await customerSocketPromise
         const iterator = createInterface({ input: customerSocket, crlfDelay: Infinity })[Symbol.asyncIterator]()
         await readMessage(iterator)
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 30, actor: actorIdentity() })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 31, actor: actorIdentity() })}\n`)
         await startup
         const result = activationDatabase({ op: "fields" })
         let message: unknown
@@ -168,10 +168,10 @@ test("the actor session carries only owned execution commands", async t => {
 
         assert.deepEqual(await readMessage(iterator), {
             type: "attach",
-            protocol: 30,
+            protocol: 31,
             actor_names: ["SessionCounter"]
         })
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 30, actor: actorIdentity() })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 31, actor: actorIdentity() })}\n`)
         await startup
 
         const database = new HostDatabase()
@@ -331,7 +331,7 @@ test("assigns the attached actor and reports whether it is resident", { timeout:
         lines.on("line", line => {
             const message = JSON.parse(line)
             if (message.type === "attach")
-                socket.write(`${JSON.stringify({ type: "attached", protocol: 30, actor })}\n`)
+                socket.write(`${JSON.stringify({ type: "attached", protocol: 31, actor })}\n`)
             else if (message.type === "residency") {
                 received = message
                 socket.end()
@@ -400,7 +400,7 @@ for (const outcome of ["success", "rejection", "disconnect", "atomic", "method_f
                 void (async () => {
                     const message = JSON.parse(line)
                     if (message.type === "attach") {
-                        send({ type: "attached", protocol: 30, actor: actorIdentity() })
+                        send({ type: "attached", protocol: 31, actor: actorIdentity() })
                         send({
                             type: "command",
                             message_id: 17,

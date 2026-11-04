@@ -79,7 +79,12 @@ const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
             error: z.string().optional()
         })
         .refine(message => (message.result === undefined) !== (message.error === undefined)),
-    z.object({ type: z.literal("attached"), protocol: z.literal(30), actor: actorIdentitySchema }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(31), actor: actorIdentitySchema }),
+    z.object({
+        type: z.literal("actor_result"),
+        call_id: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        outcome: jsonValueSchema
+    }),
     z.object({
         type: z.literal("socket_connections"),
         message_id: z.number().int().nonnegative(),
@@ -108,6 +113,7 @@ type ActorSessionClientMessage =
           readonly message_id?: number
           readonly call: DatabaseCall
       }
+    | { readonly type: "actor_call"; readonly call_id: number; readonly call: ActorCallRequest }
     | { readonly type: "residency"; readonly resident: boolean }
     | AttachMessage
     | { readonly type: "ready_for_invocation"; readonly message_id: number }
@@ -117,8 +123,16 @@ type ActorSessionClientMessage =
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 30
+    readonly protocol: 31
     readonly actor_names: readonly string[]
+}
+
+interface ActorCallRequest {
+    readonly request_id: string
+    readonly actor_name: string
+    readonly actor_id: string
+    readonly method: string
+    readonly args: readonly JsonValue[]
 }
 
 interface AssignedActor {
@@ -172,6 +186,7 @@ type ActorWorkerRequest =
           readonly connections: SocketLookup
           readonly error?: string
       }
+    | { readonly type: "actor_result"; readonly callId: number; readonly outcome: JsonValue }
 type ActorWorkerMessage =
     | {
           readonly type: "database_call"
@@ -179,6 +194,7 @@ type ActorWorkerMessage =
           readonly call: DatabaseCall
           readonly request: DatabaseRequest
       }
+    | { readonly type: "actor_call"; readonly callId: number; readonly call: ActorCallRequest }
     | { readonly type: "warm" }
     | {
           readonly type: "ready"
@@ -193,6 +209,7 @@ type ActorWorkerMessage =
 type WebSocketEventCommand = z.infer<typeof websocketEventCommandSchema> & AssignedActor
 export { failedReply, parseActorSessionServerMessage }
 export type {
+    ActorCallRequest,
     ActorExecutionCommand,
     ActorExecutorCommand,
     ActorExecutorReply,

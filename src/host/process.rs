@@ -98,8 +98,14 @@ pub(super) async fn serve_assigned_host(
     );
     let mut started = false;
     let initialized = async {
-        let owner_epoch =
-            initialize_executor(&executor_connection, &host, &sockets, &database).await?;
+        let owner_epoch = initialize_executor(
+            &executor_connection,
+            &host,
+            &sockets,
+            &database,
+            &control_plane,
+        )
+        .await?;
         let mut ready = HostReadiness {
             initial_reply: None,
             host_id: host_id.clone(),
@@ -218,6 +224,7 @@ async fn initialize_executor(
     host: &Arc<ActorHost>,
     sockets: &Arc<super::sockets::HostSockets>,
     database: &Arc<super::HostDatabase>,
+    control_plane: &Arc<ControlPlaneClient>,
 ) -> Result<u64> {
     connection
         .mark_ready(
@@ -225,6 +232,7 @@ async fn initialize_executor(
             Some(sockets.clone()),
             Some(sockets.clone()),
             Some(database.background(host.actor().clone())),
+            Some(control_plane.clone()),
         )
         .await?;
     Ok(host.activate().await?.owner_epoch)

@@ -10,10 +10,12 @@ pub use self::{
         ActorSocketConnection, ActorSocketEffect, ActorSocketEvent, ActorSocketInvocation,
         ActorSocketMessage, ActorSocketOutcome, ActorSocketTagMatch,
     },
-    protocol::{ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey},
+    protocol::{
+        ActorCall, ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey,
+    },
 };
 pub(crate) use executor_connection::{
-    ActorExecutorConnection, ActorExecutorListener, ActorSocketPublisher, WarmExecutor,
+    ActorCaller, ActorExecutorConnection, ActorExecutorListener, ActorSocketPublisher, WarmExecutor,
 };
 pub(crate) use socket::{ActorSocketSource, validate_socket_effects, validate_socket_metadata};
 

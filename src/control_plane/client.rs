@@ -82,6 +82,16 @@ impl ControlPlaneClient {
         }
     }
 
+    async fn invoke_actor(&self, call: crate::actor::ActorCall) -> Result<serde_json::Value> {
+        match self
+            .execute(ControlPlaneCommand::InvokeActor { call })
+            .await?
+        {
+            ControlPlaneCommandReply::Invocation { outcome } => Ok(outcome),
+            _ => anyhow::bail!("unexpected actor invocation reply"),
+        }
+    }
+
     pub(crate) fn token_expires_at_ms(&self) -> Result<u64> {
         use base64::Engine;
         let authorization = self
@@ -253,6 +263,15 @@ mod lease_fence_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/control_plane/client_refresh_tests.rs"]
 mod refresh_tests;
+
+#[async_trait::async_trait]
+impl crate::actor::ActorCaller for ControlPlaneClient {
+    async fn call(&self, call: crate::actor::ActorCall) -> serde_json::Value {
+        self.invoke_actor(call).await.unwrap_or_else(|error| {
+            serde_json::json!({"type": "failed", "code": "outcome_unknown", "message": format!("{error:#}")})
+        })
+    }
+}
 
 #[async_trait::async_trait]
 impl crate::sockets::operations::SocketOperations for ControlPlaneClient {

@@ -38,6 +38,8 @@ class Supervisor(Channel):
         self.worker: Worker | None = None
         self.pump: asyncio.Task[None] | None = None
         self.pending: dict[int, Pending] = {}
+        self.actor_calls: dict[int, tuple[Worker, int]] = {}
+        self.next_actor_call = 0
         self.attached: Document = {}
         self.entrypoint = ""
         self.environment: Environment = {}
@@ -50,7 +52,7 @@ class Supervisor(Channel):
 
         try:
             if generic:
-                await self.send({"type": "warm", "protocol": 30})
+                await self.send({"type": "warm", "protocol": 31})
                 load = await self.read()
                 if load.get("type") != "load":
                     raise ValueError("expected actor code assignment")
@@ -63,7 +65,7 @@ class Supervisor(Channel):
             self.entrypoint = entrypoint
             self.worker = await self.create_worker(entrypoint, self.environment)
             self.actor_names = self.worker.actor_names
-            await self.send({"type": "attach", "protocol": 30, "actor_names": self.actor_names})
+            await self.send({"type": "attach", "protocol": 31, "actor_names": self.actor_names})
             self.attached = await self.read()
             attached_actor(self.attached, self.actor_names)
             await self.start_pump()
@@ -76,6 +78,9 @@ class Supervisor(Channel):
                 await self.writer.wait_closed()
 
     async def accept(self, message: Document) -> None:
+        if message["type"] == "actor_result":
+            await self.deliver_actor_result(message)
+            return
         if message["type"] != "command":
             await self.acknowledge(message)
             return
@@ -124,6 +129,9 @@ class Supervisor(Channel):
                 if message["type"] == "residency":
                     await self.send(message)
                     continue
+                if message["type"] == "actor_call":
+                    await self.forward_actor_call(worker, message)
+                    continue
                 identifier = message["message_id"]
                 pending = self.pending[identifier]
                 kind = message["type"]
@@ -147,6 +155,17 @@ class Supervisor(Channel):
             if self.worker is worker:
                 self.worker = None
                 await self.fail_pending("actor_worker_failed", str(error))
+
+    async def forward_actor_call(self, worker: Worker, message: Document) -> None:
+        # Worker processes number calls from 1, so a replacement must not receive earlier results.
+        self.next_actor_call += 1
+        self.actor_calls[self.next_actor_call] = (worker, message["call_id"])
+        await self.send({**message, "call_id": self.next_actor_call})
+
+    async def deliver_actor_result(self, message: Document) -> None:
+        worker, call_id = self.actor_calls.pop(message["call_id"])
+        if worker is self.worker:
+            await worker.send({**message, "call_id": call_id})
 
     async def fail_pending(self, code: str, message: str) -> None:
         for identifier in list(self.pending):
@@ -208,7 +227,7 @@ class Worker(Channel):
             worker = cls(reader, writer, process)
             async with asyncio.timeout(60):
                 attach = await worker.read()
-            if attach.get("type") != "attach" or attach.get("protocol") != 30:
+            if attach.get("type") != "attach" or attach.get("protocol") != 31:
                 raise ValueError("worker did not attach")
             worker.actor_names = attach["actor_names"]
             return worker

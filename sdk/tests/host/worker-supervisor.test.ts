@@ -184,9 +184,14 @@ test("a generic Bun worker is warm before customer code is assigned", async () =
         )
         try {
             const moduleUrl = await buildConsumer(root)
-            worker.load({ moduleUrl, environment: { TEST_WARM_SECRET: "warm-secret" } }, () => {}, noDatabase)
+            worker.load(
+                { moduleUrl, environment: { TEST_WARM_SECRET: "warm-secret" } },
+                () => {},
+                noDatabase,
+                noActorCalls
+            )
             assert.deepEqual(await worker.ready(), ["WarmCounter"])
-            assert.throws(() => worker.load({ moduleUrl }, () => {}, noDatabase), /already assigned/)
+            assert.throws(() => worker.load({ moduleUrl }, () => {}, noDatabase, noActorCalls), /already assigned/)
             const actor = identity("WarmCounter")
             seed(worker, { count: 41 })
             assert.deepEqual(await execute(worker, { type: "hydrate", actor }, () => {}), {
@@ -216,7 +221,10 @@ test("rejects an assigned actor that the entrypoint does not export", async () =
     })
     try {
         await supervisor.ready()
-        assert.throws(() => supervisor.assign(identity("OtherCounter"), noDatabase), /OtherCounter is not loaded/)
+        assert.throws(
+            () => supervisor.assign(identity("OtherCounter"), noDatabase, noActorCalls),
+            /OtherCounter is not loaded/
+        )
     } finally {
         supervisor.close()
     }
@@ -527,7 +535,7 @@ async function exerciseActiveActors(entrypoint: string): Promise<void> {
         actorEntrypointUrl: entrypoint
     })
     assert.deepEqual(await runtime.ready(), ["SessionCounter"])
-    runtime.assign(actorIdentity, noDatabase)
+    runtime.assign(actorIdentity, noDatabase, noActorCalls)
 
     assertReply(
         await handle(
@@ -695,11 +703,15 @@ export class ${actorName} extends Actor<{ userId: string }, { text: string }> {
 
 async function assign(supervisor: ActorWorkerSupervisor, actor = actorIdentity): Promise<void> {
     await supervisor.ready()
-    supervisor.assign(actor, noDatabase)
+    supervisor.assign(actor, noDatabase, noActorCalls)
 }
 
 async function noDatabase(): Promise<never> {
     throw new Error("unexpected activation database call")
+}
+
+async function noActorCalls(): Promise<never> {
+    throw new Error("unexpected actor call")
 }
 
 function identity(actorName: string) {

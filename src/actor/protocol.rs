@@ -56,6 +56,32 @@ impl ActorInvocation {
     }
 }
 
+/// An invocation an actor makes of another actor in its own project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorCall {
+    pub request_id: String,
+    pub actor_name: String,
+    pub actor_id: String,
+    pub method: String,
+    pub args: Vec<Value>,
+}
+
+impl ActorCall {
+    pub fn in_project(self, project_id: &str) -> ActorInvocation {
+        ActorInvocation {
+            request_id: self.request_id,
+            actor: ActorKey {
+                project_id: project_id.to_owned(),
+                actor_name: self.actor_name,
+                actor_id: self.actor_id,
+            },
+            method: self.method,
+            args: self.args,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorInvocationFailure {
     pub code: String,

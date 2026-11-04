@@ -378,9 +378,19 @@ class Client(ClientConfiguration):
 
 _shared_client: Client | None = None
 _shared_client_lock = Lock()
+_default_transport: ActorTransport | None = None
 
 
-def default_client() -> Client:
+def default_client() -> ActorTransport:
+    return _default_transport if _default_transport is not None else shared_client()
+
+
+def set_default_client(transport: ActorTransport) -> None:
+    global _default_transport
+    _default_transport = transport
+
+
+def shared_client() -> Client:
     global _shared_client
     with _shared_client_lock:
         if _shared_client is None:

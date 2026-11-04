@@ -12,9 +12,15 @@ const { ActorWorkerSupervisor } = await import(pathToFileURL(path.join(sdk!, "di
 const supervisor: Supervisor = new ActorWorkerSupervisor({ actorEntrypointUrl: pathToFileURL(artifact!).href })
 try {
     assert.deepEqual(await supervisor.ready(), ["Counter"])
-    supervisor.assign({ project_id: "local", actor_name: "Counter", actor_id: "counter-1" }, async () => {
-        throw new Error("unexpected activation database call")
-    })
+    supervisor.assign(
+        { project_id: "local", actor_name: "Counter", actor_id: "counter-1" },
+        async () => {
+            throw new Error("unexpected activation database call")
+        },
+        async () => {
+            throw new Error("unexpected actor call")
+        }
+    )
     const effects: SocketEffect[] = []
     const database = new HostDatabase()
     const reply = await supervisor.handle(
