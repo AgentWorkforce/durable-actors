@@ -61,6 +61,7 @@ class ActorRuntime {
             }
             return await this.handleSocketEvent(command)
         } catch (error) {
+            reportFailure(this.definition.actorName, command.type, error)
             this.reset()
             const failure = failedReply("invalid_actor_state", errorMessage(error))
             if (this.interleaved) this.fatal = failure
@@ -139,6 +140,7 @@ class ActorRuntime {
                 ...(effects.length === 0 ? {} : { effects })
             }
         } catch (error) {
+            reportFailure(this.definition.actorName, command.method, error)
             if (error instanceof DatabaseCommitError) {
                 this.fatal = failedReply("actor_database_failed", errorMessage(error))
                 return this.fatal
@@ -194,6 +196,7 @@ class ActorRuntime {
                 effects: socketEffects(command, state, effects, this.definition.state)
             }
         } catch (error) {
+            reportFailure(this.definition.actorName, methodName, error)
             if (error instanceof DatabaseCommitError) {
                 this.fatal = failedReply("actor_database_failed", errorMessage(error))
                 return this.fatal
@@ -296,6 +299,10 @@ function emittableFields(schema: ActorSchema) {
 
 function connectionWasRejected(connectionId: string, effects: readonly SocketEffect[]): boolean {
     return effects.some(effect => effect.type === "reject" && effect.connection_id === connectionId)
+}
+
+function reportFailure(actorName: string, operation: string, error: unknown): void {
+    console.error(`${actorName}.${operation} failed:`, error)
 }
 
 async function ignoreAlarm(): Promise<void> {}

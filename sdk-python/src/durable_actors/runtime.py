@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import traceback
 from collections import OrderedDict
 from collections.abc import Callable
 from functools import partial
@@ -50,6 +51,7 @@ class ActorRuntime:
                 return self.fatal
             return await self.execute(command, admit)
         except Exception as error:
+            traceback.print_exc()
             self.instance = None
             failure = failed("invalid_actor_state", str(error))
             if self.definition.reentrant_methods:
@@ -66,6 +68,7 @@ class ActorRuntime:
             try:
                 self.restore(await self.database.fields())
             except Exception as error:
+                traceback.print_exc()
                 return failed("invalid_actor_state", str(error))
         if command["type"] == "hydrate":
             return {"type": "hydrated"}
@@ -129,6 +132,7 @@ class ActorRuntime:
                     await self.database.replace_fields(state)
                     await self.database.commit()
                 except DatabaseCommitError as error:
+                    traceback.print_exc()
                     self.fatal = failed("actor_database_failed", str(error))
                     return self.fatal
                 except BaseException:
@@ -150,6 +154,7 @@ class ActorRuntime:
                 await self.database.rollback()
             raise
         except Exception as error:
+            traceback.print_exc()
             if not self.definition.reentrant_methods:
                 await self.database.rollback()
                 self.restore(before)
