@@ -1,0 +1,76 @@
+name: Publish images (AgentWorkforce GHCR)
+
+# AgentWorkforce fork only: publishes the control-plane and TypeScript actor-host images to
+# ghcr.io/agentworkforce. Runs only for main or an `awf-v*` tag, never for pull requests.
+on:
+    push:
+        branches: [main]
+        tags: ["awf-v*"]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ghcr-${{ github.ref }}
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        if: github.repository_owner == 'AgentWorkforce' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/awf-v'))
+        name: ${{ matrix.image }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+        permissions:
+            contents: read
+            packages: write
+            id-token: write
+            attestations: write
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - image: durable-actors-control-plane
+                      target: control-plane
+                    - image: durable-actors-typescript
+                      target: typescript
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+            - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+            - id: meta
+              uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+              with:
+                  images: ghcr.io/agentworkforce/${{ matrix.image }}
+                  tags: |
+                      type=sha,prefix=sha-
+                      type=ref,event=tag
+                  labels: |
+                      org.opencontainers.image.source=https://github.com/AgentWorkforce/durable-actors
+                      org.opencontainers.image.licenses=MIT
+            - id: build
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+              with:
+                  context: .
+                  target: ${{ matrix.target }}
+                  platforms: linux/amd64
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  sbom: true
+                  provenance: mode=max
+                  cache-from: type=gha,scope=${{ matrix.target }}
+                  cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+            # Attestations are unavailable for private repositories on this plan; the push above
+            # must still succeed there, so only a private repository tolerates this step failing.
+            - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+              continue-on-error: ${{ github.event.repository.private }}
+              with:
+                  subject-name: ghcr.io/agentworkforce/${{ matrix.image }}
+                  subject-digest: ${{ steps.build.outputs.digest }}
+                  push-to-registry: true
+            - run: echo "ghcr.io/agentworkforce/${{ matrix.image }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
