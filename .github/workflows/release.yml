@@ -200,7 +200,7 @@ jobs:
                   ref: ${{ needs.preflight.outputs.modal-revision }}
                   persist-credentials: false
             - name: Install Rust toolchain
-              run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt && rustup default 1.91.0
+              run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt && rustup default 1.94.1
             - name: Validate the pinned crate
               env:
                   MODAL_VERSION: ${{ needs.preflight.outputs.modal-version }}
@@ -277,7 +277,7 @@ jobs:
                   ref: ${{ github.sha }}
 
             - name: Install Rust toolchain
-              run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt && rustup default 1.91.0
+              run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt && rustup default 1.94.1
 
             - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
               with:
@@ -688,7 +688,7 @@ jobs:
                   ref: ${{ github.sha }}
 
             - name: Install Rust toolchain
-              run: rustup toolchain install 1.91.0 --profile minimal && rustup default 1.91.0
+              run: rustup toolchain install 1.94.1 --profile minimal && rustup default 1.94.1
 
             - name: Publish to crates.io
               env:
