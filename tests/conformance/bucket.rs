@@ -58,15 +58,52 @@ async fn backends() -> Result<Vec<Backend>> {
     if let Ok(bucket) = std::env::var("DURABLE_ACTORS_TEST_GCS_BUCKET") {
         backends.push(Backend {
             name: "gcs",
-            clients: [
-                Arc::new(GcsBucket::new(&bucket).await?),
-                Arc::new(GcsBucket::new(&bucket).await?),
-            ],
+            clients: [gcs(&bucket).await?, gcs(&bucket).await?],
             prefix,
             _directory: None,
         });
     }
     Ok(backends)
+}
+
+/// Application Default Credentials, or a short-lived token from `DURABLE_ACTORS_TEST_GCS_TOKEN_FILE`
+/// (for example `gcloud auth print-access-token`), so runs need no long-lived key.
+async fn gcs(bucket: &str) -> Result<Arc<dyn Bucket>> {
+    Ok(match std::env::var("DURABLE_ACTORS_TEST_GCS_TOKEN_FILE") {
+        Ok(path) => {
+            let token = std::fs::read_to_string(path)?.trim().to_owned();
+            Arc::new(GcsBucket::with_credentials(bucket, BearerToken(token).into()).await?)
+        }
+        Err(_) => Arc::new(GcsBucket::new(bucket).await?),
+    })
+}
+
+#[derive(Debug)]
+struct BearerToken(String);
+
+impl google_cloud_auth::credentials::CredentialsProvider for BearerToken {
+    async fn headers(
+        &self,
+        _: axum::http::Extensions,
+    ) -> std::result::Result<
+        google_cloud_auth::credentials::CacheableResource<axum::http::HeaderMap>,
+        google_cloud_auth::errors::CredentialsError,
+    > {
+        let mut value: axum::http::HeaderValue = format!("Bearer {}", self.0).parse().map_err(|_| {
+            google_cloud_auth::errors::CredentialsError::from_msg(false, "invalid test token")
+        })?;
+        value.set_sensitive(true);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, value);
+        Ok(google_cloud_auth::credentials::CacheableResource::New {
+            entity_tag: google_cloud_auth::credentials::EntityTag::new(),
+            data: headers,
+        })
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        Some("googleapis.com".into())
+    }
 }
 
 fn unique(label: &str) -> Bytes {
