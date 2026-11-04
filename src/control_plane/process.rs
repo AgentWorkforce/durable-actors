@@ -53,6 +53,17 @@ pub struct ControlPlaneStorageConfig {
     pub bucket: String,
     pub persistence: crate::bucket::SnapshotStoreConfig,
     pub artifact_bucket: String,
+    pub provider: StorageProvider,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum StorageProvider {
+    #[default]
+    Gcs,
+    S3 {
+        endpoint: crate::bucket::S3Endpoint,
+        actor_role_arn: String,
+    },
 }
 
 #[derive(Default)]
@@ -225,27 +236,20 @@ async fn control_plane_routes(
             ),
         ));
     }
-    let authority = Arc::new(GcsBucket::new(&config.storage.bucket).await?);
     let registry = Arc::new(super::PostgresAdminRegistry::from_database(
         database.clone(),
     ));
-    let snapshots =
-        snapshot_store(authority.clone(), &config.storage.persistence, stop.clone()).await?;
+    let (authority, snapshots) = object_storage(&config.storage, stop.clone()).await?;
     let storage = Arc::new(
         RuntimeStorageReader::new(
             authority,
             Arc::new(crate::clock::SystemClock),
             Arc::new(crate::litestream::EmbeddedRestore),
         )?
-        .with_persistence(config.storage.persistence, snapshots)?,
+        .with_persistence(config.storage.persistence.clone(), snapshots)?,
     );
-    let runtime_access = Arc::new(crate::bucket::access::RuntimeAccess::new(
-        crate::bucket::access::BucketLocation::Gcs {
-            artifact_bucket: config.storage.artifact_bucket.clone(),
-            bucket: config.storage.bucket.clone(),
-        },
-        storage.persistence.clone(),
-    )?);
+    let runtime_access =
+        Arc::new(runtime_access(&config.storage, storage.persistence.clone()).await?);
     let placements = storage.clone();
     let connections = crate::sandbox::connections::HostConnections::new()?;
     let socket_bus = match &redis {
@@ -326,6 +330,66 @@ async fn control_plane_routes(
         .merge(super::inspection::router(inspector, admin));
     let internal_api = service.into_internal_service();
     Ok(tonic::service::Routes::from(public_api).add_service(internal_api))
+}
+
+async fn object_storage(
+    config: &ControlPlaneStorageConfig,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<(
+    Arc<dyn crate::bucket::Bucket>,
+    Arc<dyn crate::bucket::SnapshotStore>,
+)> {
+    match &config.provider {
+        StorageProvider::Gcs => {
+            let authority = Arc::new(GcsBucket::new(&config.bucket).await?);
+            let snapshots = snapshot_store(authority.clone(), &config.persistence, stop).await?;
+            Ok((authority, snapshots))
+        }
+        StorageProvider::S3 { endpoint, .. } => {
+            ensure!(
+                config.persistence.rapid_settings().is_none(),
+                "Rapid persistence requires GCS"
+            );
+            let authority: Arc<dyn crate::bucket::Bucket> = Arc::new(
+                crate::bucket::S3Bucket::from_environment(&config.bucket, endpoint).await?,
+            );
+            Ok((
+                authority.clone(),
+                Arc::new(crate::bucket::BucketSnapshots(authority)),
+            ))
+        }
+    }
+}
+
+async fn runtime_access(
+    config: &ControlPlaneStorageConfig,
+    persistence: crate::bucket::SnapshotStoreConfig,
+) -> Result<crate::bucket::access::RuntimeAccess> {
+    use crate::bucket::access::{BucketLocation, RuntimeAccess};
+    match &config.provider {
+        StorageProvider::Gcs => RuntimeAccess::new(
+            BucketLocation::Gcs {
+                artifact_bucket: config.artifact_bucket.clone(),
+                bucket: config.bucket.clone(),
+            },
+            persistence,
+        ),
+        StorageProvider::S3 {
+            endpoint,
+            actor_role_arn,
+        } => {
+            RuntimeAccess::s3(
+                BucketLocation::S3 {
+                    artifact_bucket: config.artifact_bucket.clone(),
+                    bucket: config.bucket.clone(),
+                    s3: endpoint.clone(),
+                },
+                persistence,
+                actor_role_arn,
+            )
+            .await
+        }
+    }
 }
 
 async fn snapshot_store(
@@ -549,7 +613,13 @@ impl ControlPlaneProcessConfig {
         if let Some(region) = &region {
             crate::placement::validate_region(region)?;
         }
+        let provider = storage_provider(&mut get)?;
+        ensure!(
+            provider == StorageProvider::Gcs || persistence.rapid_settings().is_none(),
+            "DURABLE_ACTORS_PERSISTENCE=rapid requires DURABLE_ACTORS_STORAGE_PROVIDER=gcs"
+        );
         let storage = ControlPlaneStorageConfig {
+            provider,
             persistence,
             artifact_bucket,
             postgres_url: required(&mut get, "DURABLE_ACTORS_POSTGRES_URL")?,
@@ -594,6 +664,57 @@ impl ControlPlaneProcessConfig {
             redis: redis_config(&mut get)?,
             organization_limits: super::OrganizationLimits::from_lookup(&mut get, true)?,
         })
+    }
+}
+
+fn storage_provider(get: &mut impl FnMut(&str) -> Option<String>) -> Result<StorageProvider> {
+    const S3_ONLY: [&str; 4] = [
+        "DURABLE_ACTORS_S3_REGION",
+        "DURABLE_ACTORS_S3_ENDPOINT",
+        "DURABLE_ACTORS_S3_FORCE_PATH_STYLE",
+        "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN",
+    ];
+    match get("DURABLE_ACTORS_STORAGE_PROVIDER")
+        .as_deref()
+        .unwrap_or("gcs")
+    {
+        "gcs" => {
+            for name in S3_ONLY {
+                ensure!(
+                    get(name).is_none(),
+                    "{name} requires DURABLE_ACTORS_STORAGE_PROVIDER=s3"
+                );
+            }
+            Ok(StorageProvider::Gcs)
+        }
+        "s3" => {
+            let region = get("DURABLE_ACTORS_S3_REGION")
+                .or_else(|| get("AWS_REGION"))
+                .context("DURABLE_ACTORS_STORAGE_PROVIDER=s3 requires DURABLE_ACTORS_S3_REGION")?;
+            let endpoint = get("DURABLE_ACTORS_S3_ENDPOINT").filter(|value| !value.is_empty());
+            if let Some(endpoint) = &endpoint {
+                let url = reqwest::Url::parse(endpoint)
+                    .context("DURABLE_ACTORS_S3_ENDPOINT must be a URL")?;
+                ensure!(
+                    matches!(url.scheme(), "http" | "https"),
+                    "DURABLE_ACTORS_S3_ENDPOINT must be an HTTP(S) URL"
+                );
+            }
+            let force_path_style = get("DURABLE_ACTORS_S3_FORCE_PATH_STYLE")
+                .map(|value| value.parse())
+                .transpose()
+                .context("DURABLE_ACTORS_S3_FORCE_PATH_STYLE must be boolean")?
+                .unwrap_or(false);
+            Ok(StorageProvider::S3 {
+                endpoint: crate::bucket::S3Endpoint {
+                    region,
+                    endpoint,
+                    force_path_style,
+                },
+                actor_role_arn: required(get, "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN")?,
+            })
+        }
+        provider => anyhow::bail!("unsupported DURABLE_ACTORS_STORAGE_PROVIDER {provider:?}"),
     }
 }
 
@@ -849,7 +970,7 @@ fn sandbox_backend(
         .as_deref()
         .unwrap_or("gke")
     {
-        "gke" => {
+        "gke" | "kubernetes" => {
             let zones = placement_zones(get)?;
             let regions = zones.keys().cloned().collect();
             Ok((
@@ -864,6 +985,7 @@ fn sandbox_backend(
                         1,
                         1024,
                     )? as usize,
+                    scheduling: pod_scheduling(get)?,
                 }),
                 regions,
             ))
@@ -913,6 +1035,52 @@ fn sandbox_backend(
     }
 }
 
+fn pod_scheduling(
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<crate::sandbox::gke::PodScheduling> {
+    let defaults = crate::sandbox::gke::PodScheduling::default();
+    let runtime_class = match get("DURABLE_ACTORS_SANDBOX_RUNTIME_CLASS") {
+        None => defaults.runtime_class,
+        Some(class) if class.is_empty() => None,
+        Some(class) => {
+            ensure!(
+                is_dns_label(&class, 253),
+                "DURABLE_ACTORS_SANDBOX_RUNTIME_CLASS must be a Kubernetes object name"
+            );
+            Some(class)
+        }
+    };
+    let node_selector = match get("DURABLE_ACTORS_SANDBOX_NODE_SELECTOR") {
+        None => defaults.node_selector,
+        Some(value) => serde_json::from_str(&value)
+            .context("DURABLE_ACTORS_SANDBOX_NODE_SELECTOR must be a JSON object of strings")?,
+    };
+    let tolerations: Vec<serde_json::Value> = match get("DURABLE_ACTORS_SANDBOX_TOLERATIONS") {
+        None => defaults.tolerations,
+        Some(value) => serde_json::from_str(&value)
+            .context("DURABLE_ACTORS_SANDBOX_TOLERATIONS must be a JSON array")?,
+    };
+    for toleration in &tolerations {
+        serde_json::from_value::<k8s_openapi::api::core::v1::Toleration>(toleration.clone())
+            .context("DURABLE_ACTORS_SANDBOX_TOLERATIONS has an invalid toleration")?;
+    }
+    Ok(crate::sandbox::gke::PodScheduling {
+        runtime_class,
+        node_selector,
+        tolerations,
+    })
+}
+
+fn is_dns_label(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-.".contains(&byte))
+        && value.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && value.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
 fn modal_region(region: &str) -> Option<&'static str> {
     match region {
         "ca" => Some("canada"),
@@ -929,10 +1097,20 @@ fn modal_region(region: &str) -> Option<&'static str> {
 fn placement_zones(
     get: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    if let Some(zone) = get("DURABLE_ACTORS_GKE_ZONE") {
+    let zone = setting(
+        get,
+        "DURABLE_ACTORS_PLACEMENT_ZONE",
+        "DURABLE_ACTORS_GKE_ZONE",
+    )?;
+    let zones = setting(
+        get,
+        "DURABLE_ACTORS_PLACEMENT_ZONES",
+        "DURABLE_ACTORS_GKE_ZONES",
+    )?;
+    if let Some(zone) = zone {
         ensure!(
-            get("DURABLE_ACTORS_GKE_ZONES").is_none(),
-            "configure GKE_ZONE or GKE_ZONES, not both"
+            zones.is_none(),
+            "configure PLACEMENT_ZONE or PLACEMENT_ZONES, not both"
         );
         let region = super::regions::storage_region(&zone)?.to_owned();
         return compute_zones(&serde_json::to_string(&BTreeMap::from([(
@@ -940,7 +1118,21 @@ fn placement_zones(
             vec![zone],
         )]))?);
     }
-    compute_zones(&required(get, "DURABLE_ACTORS_GKE_ZONES")?)
+    compute_zones(&zones.context("DURABLE_ACTORS_PLACEMENT_ZONES is required")?)
+}
+
+/// A setting under its provider-neutral name or its older GKE name, not both.
+fn setting(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    legacy: &str,
+) -> Result<Option<String>> {
+    let (current, previous) = (get(name), get(legacy));
+    ensure!(
+        current.is_none() || previous.is_none() || current == previous,
+        "{name} and {legacy} disagree"
+    );
+    Ok(current.or(previous).filter(|value| !value.is_empty()))
 }
 
 fn compute_zones(value: &str) -> Result<BTreeMap<String, Vec<String>>> {
@@ -963,10 +1155,7 @@ fn compute_zones(value: &str) -> Result<BTreeMap<String, Vec<String>>> {
             )
         })
         .collect();
-    ensure!(
-        !zones.is_empty(),
-        "at least one GKE placement zone is required"
-    );
+    ensure!(!zones.is_empty(), "at least one placement zone is required");
     for (region, placements) in &zones {
         ensure!(
             !placements.is_empty(),
@@ -983,7 +1172,7 @@ fn compute_zones(value: &str) -> Result<BTreeMap<String, Vec<String>>> {
         for zone in placements {
             ensure!(
                 super::regions::storage_region(zone)? == region,
-                "GKE zone does not match canonical region {region}"
+                "placement zone does not match canonical region {region}"
             );
         }
     }

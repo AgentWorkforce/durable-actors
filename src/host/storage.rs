@@ -17,7 +17,8 @@ use super::{
 use crate::{
     actor::ActorKey,
     bucket::{
-        BucketSnapshots, GcsBucket, RapidSnapshots, RuntimeStorage, SnapshotStore, WarmStorage,
+        BucketSnapshots, GcsBucket, RapidSnapshots, RuntimeStorage, S3Bucket, SnapshotStore,
+        WarmStorage,
         access::{HostStorageConfig, StorageToken, StorageTokens},
     },
     clock::{Clock, SystemClock},
@@ -28,7 +29,7 @@ use crate::{
 
 pub(crate) struct HostStorage {
     pub runtime: Arc<RuntimeStorage>,
-    objects: Option<google_cloud_storage::client::Storage>,
+    objects: Option<CodeObjects>,
     pub(super) stop: CancellationToken,
     observer: Arc<ControlPlaneClient>,
     host: HostId,
@@ -67,6 +68,23 @@ impl HostStorage {
                 )
                 .await?
             }
+            crate::bucket::access::BucketLocation::S3 {
+                bucket,
+                artifact_bucket,
+                s3,
+            } => {
+                ensure!(
+                    config.persistence.rapid_settings().is_none(),
+                    "Rapid persistence requires GCS"
+                );
+                Self::open_s3(
+                    &bucket,
+                    &artifact_bucket,
+                    &s3,
+                    config.persistence,
+                    credentials,
+                )?
+            }
             crate::bucket::access::BucketLocation::File { directory } => {
                 ensure!(
                     config.persistence.rapid_settings().is_none(),
@@ -102,10 +120,7 @@ impl HostStorage {
         warm: Option<WarmStorage>,
         stop: &CancellationToken,
         actor: &ActorKey,
-    ) -> Result<(
-        RuntimeStorage,
-        Option<google_cloud_storage::client::Storage>,
-    )> {
+    ) -> Result<(RuntimeStorage, Option<CodeObjects>)> {
         let ownership = credentials.scoped(|tokens| &tokens.ownership);
         let state = credentials.scoped(|tokens| &tokens.state);
         let (authority, state) = match warm {
@@ -130,18 +145,43 @@ impl HostStorage {
         let objects = authority.clients().storage;
         let runtime = RuntimeStorage::new(Arc::new(authority), Arc::new(SystemClock))?
             .with_persistence(persistence, snapshots)?;
-        Ok((runtime, Some(objects)))
+        Ok((runtime, Some(CodeObjects::Gcs(Box::new(objects)))))
+    }
+
+    fn open_s3(
+        bucket: &str,
+        artifact_bucket: &str,
+        endpoint: &crate::bucket::S3Endpoint,
+        persistence: crate::bucket::SnapshotStoreConfig,
+        credentials: HostCredentials,
+    ) -> Result<(RuntimeStorage, Option<CodeObjects>)> {
+        let ownership = credentials.aws_scoped(|tokens| &tokens.ownership);
+        let state = credentials.aws_scoped(|tokens| &tokens.state);
+        let authority = Arc::new(S3Bucket::with_credentials(
+            bucket,
+            endpoint,
+            ownership.clone(),
+        )?);
+        let state: Arc<dyn crate::bucket::Bucket> =
+            Arc::new(S3Bucket::with_credentials(bucket, endpoint, state)?);
+        let code = Arc::new(S3Bucket::with_credentials(
+            artifact_bucket,
+            endpoint,
+            ownership,
+        )?);
+        let runtime = RuntimeStorage::new(authority, Arc::new(SystemClock))?
+            .with_persistence(persistence, Arc::new(BucketSnapshots(state)))?;
+        Ok((runtime, Some(CodeObjects::Bucket(code))))
     }
 
     pub(crate) async fn install_code(&self, artifact: &crate::bundle::ActorBundle) -> Result<()> {
-        artifact
-            .install(
-                std::path::Path::new("/customer"),
-                self.objects
-                    .as_ref()
-                    .context("GCS artifact client missing")?,
-            )
-            .await
+        let root = std::path::Path::new("/customer");
+        match self.objects.as_ref().context("artifact client missing")? {
+            CodeObjects::Gcs(storage) => artifact.install(root, storage).await,
+            CodeObjects::Bucket(bucket) => {
+                artifact.install_from_bucket(root, bucket.as_ref()).await
+            }
+        }
     }
 
     pub(crate) fn with_activation(
@@ -372,6 +412,12 @@ impl HostLeaseRegistry for HostStorage {
     }
 }
 
+/// Where a host downloads its compiled code from.
+enum CodeObjects {
+    Gcs(Box<google_cloud_storage::client::Storage>),
+    Bucket(Arc<S3Bucket>),
+}
+
 #[derive(Clone)]
 struct HostCredentials {
     tokens: Arc<std::sync::RwLock<Option<StorageTokens>>>,
@@ -427,6 +473,36 @@ impl HostCredentials {
         credentials
     }
 
+    fn aws_scoped(
+        &self,
+        scope: fn(&StorageTokens) -> &StorageToken,
+    ) -> aws_credential_types::provider::SharedCredentialsProvider {
+        aws_credential_types::provider::SharedCredentialsProvider::new(Self {
+            tokens: self.tokens.clone(),
+            scope,
+        })
+    }
+
+    fn aws_credentials(&self) -> aws_credential_types::provider::Result {
+        use aws_credential_types::provider::error::CredentialsError;
+        let stored = self.tokens.read().unwrap();
+        let token = stored
+            .as_ref()
+            .map(self.scope)
+            .ok_or_else(|| CredentialsError::not_loaded("S3 credentials missing"))?;
+        let aws = token
+            .aws
+            .as_ref()
+            .ok_or_else(|| CredentialsError::not_loaded("storage credential is not for S3"))?;
+        Ok(aws_credential_types::Credentials::new(
+            aws.access_key_id.clone(),
+            aws.secret_access_key.clone(),
+            Some(aws.session_token.clone()),
+            Some(std::time::UNIX_EPOCH + Duration::from_millis(token.expires_at_ms)),
+            "durable-actors-host",
+        ))
+    }
+
     fn scoped(&self, scope: fn(&StorageTokens) -> &StorageToken) -> Credentials {
         Self {
             tokens: self.tokens.clone(),
@@ -435,6 +511,17 @@ impl HostCredentials {
         .into()
     }
 }
+impl aws_credential_types::provider::ProvideCredentials for HostCredentials {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::ready(self.aws_credentials())
+    }
+}
+
 impl CredentialsProvider for HostCredentials {
     async fn headers(
         &self,

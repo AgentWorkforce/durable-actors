@@ -300,6 +300,7 @@ async fn local_storage(options: &DevOptions, directory: &Path) -> Result<LocalSt
     let bucket: Arc<dyn Bucket> = match &location {
         BucketLocation::File { directory } => Arc::new(FileBucket::new(directory.clone())?),
         BucketLocation::Gcs { bucket, .. } => Arc::new(GcsBucket::new(bucket).await?),
+        BucketLocation::S3 { .. } => anyhow::bail!("durable-actors dev does not support S3"),
     };
     let runtime = Arc::new(RuntimeStorage::new(bucket, Arc::new(SystemClock))?);
     let bootstrap = Arc::new(RuntimeAccess::new(location, runtime.persistence.clone())?);

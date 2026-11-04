@@ -90,6 +90,34 @@ impl ActorBundle {
             .await
     }
 
+    /// Installs from a [`crate::bucket::Bucket`], pinning each file to its recorded generation.
+    pub async fn install_from_bucket(
+        &self,
+        root: &Path,
+        bucket: &dyn crate::bucket::Bucket,
+    ) -> Result<()> {
+        self.validate()?;
+        futures_util::stream::iter(self.files.iter().map(Ok))
+            .try_for_each_concurrent(MAX_CONCURRENT_DOWNLOADS, |file| async {
+                let object = bucket
+                    .get(&file.object)
+                    .await?
+                    .with_context(|| format!("artifact {} is missing", file.path))?;
+                ensure!(
+                    object.generation == file.generation,
+                    "artifact {} changed after deployment",
+                    file.path
+                );
+                install_file(
+                    root,
+                    file,
+                    futures_util::stream::once(async { anyhow::Ok(object.bytes) }),
+                )
+                .await
+            })
+            .await
+    }
+
     pub fn entrypoint(&self) -> Result<&str> {
         let names: Vec<_> = self
             .files

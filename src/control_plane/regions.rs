@@ -35,7 +35,7 @@ pub(super) fn storage_region(region: &str) -> Result<&str> {
         {
             base
         }
-        _ => region,
+        _ => aws_zone_region(region).unwrap_or(region),
     };
     match location {
         "canada"
@@ -46,6 +46,7 @@ pub(super) fn storage_region(region: &str) -> Result<&str> {
         | "europe-west"
         | "asia-southeast" => Ok(region),
         "northamerica-northeast1" | "northamerica-northeast2" => Ok("canada"),
+        "ca-central-1" | "ca-west-1" => Ok("canada"),
         "us-east-1" | "us-east-2" | "us-east1" | "us-east4" | "us-east5" | "us-ashburn-1"
         | "eastus" | "eastus2" => Ok("north-america-east"),
         "us-central1" | "us-chicago-1" | "centralus" | "northcentralus" => {
@@ -63,3 +64,17 @@ pub(super) fn storage_region(region: &str) -> Result<&str> {
         _ => bail!("workflow region {region:?} has no storage-region mapping"),
     }
 }
+
+/// The region of an AWS availability-zone name such as `us-west-2a`.
+fn aws_zone_region(zone: &str) -> Option<&str> {
+    let (region, letter) = zone.split_at_checked(zone.len().checked_sub(1)?)?;
+    let digit = region.bytes().last()?;
+    (letter.bytes().all(|byte| byte.is_ascii_lowercase())
+        && digit.is_ascii_digit()
+        && region.matches('-').count() == 2)
+        .then_some(region)
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/control_plane/regions.rs"]
+mod tests;

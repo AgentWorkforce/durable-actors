@@ -66,6 +66,10 @@ reqsign-core = "3.3.2"
 reqsign-http-send-reqwest = "4.0.7"
 reqsign-file-read-tokio = "3.0.7"
 reqsign-google = { version = "3.2.0", features = ["credential-access-boundary-client-side"] }
+aws-config = { version = "1.8.14", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
+aws-credential-types = { version = "1.2.13", features = ["hardcoded-credentials"] }
+aws-sdk-s3 = { version = "1.124.0", default-features = false, features = ["rt-tokio", "default-https-client", "http-1x"] }
+aws-sdk-sts = { version = "1.99.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

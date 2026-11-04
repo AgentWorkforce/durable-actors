@@ -721,3 +721,151 @@ fn modal_configuration_does_not_require_kubernetes() -> Result<()> {
     }
     Ok(())
 }
+
+fn aws_environment() -> HashMap<&'static str, &'static str> {
+    let mut values = process_environment();
+    for name in [
+        "DURABLE_ACTORS_PERSISTENCE",
+        "DURABLE_ACTORS_ARCHIVE_BUCKET",
+        "DURABLE_ACTORS_RAPID_BUCKETS",
+        "DURABLE_ACTORS_GKE_ZONES",
+    ] {
+        values.remove(name);
+    }
+    values.extend([
+        ("DURABLE_ACTORS_STORAGE_PROVIDER", "s3"),
+        ("DURABLE_ACTORS_S3_REGION", "us-west-2"),
+        (
+            "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/actor-storage",
+        ),
+        ("DURABLE_ACTORS_PLACEMENT_ZONE", "us-west-2a"),
+        ("DURABLE_ACTORS_SANDBOX_PROVIDER", "kubernetes"),
+        ("DURABLE_ACTORS_SANDBOX_RUNTIME_CLASS", ""),
+        (
+            "DURABLE_ACTORS_SANDBOX_NODE_SELECTOR",
+            r#"{"durable-actors/role":"actor-host"}"#,
+        ),
+        (
+            "DURABLE_ACTORS_SANDBOX_TOLERATIONS",
+            r#"[{"key":"durable-actors/actor-host","operator":"Exists","effect":"NoSchedule"}]"#,
+        ),
+    ]);
+    values
+}
+
+#[test]
+fn s3_storage_with_aws_placement_and_runc_actor_nodes() -> Result<()> {
+    let values = aws_environment();
+    let config =
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))?;
+    assert_eq!(
+        config.storage.provider,
+        StorageProvider::S3 {
+            endpoint: crate::bucket::S3Endpoint {
+                region: "us-west-2".into(),
+                endpoint: None,
+                force_path_style: false,
+            },
+            actor_role_arn: "arn:aws:iam::123456789012:role/actor-storage".into(),
+        }
+    );
+    assert_eq!(config.region.as_deref(), Some("north-america-west"));
+    let gke = gke(&config);
+    assert_eq!(gke.zones["north-america-west"], ["us-west-2a"]);
+    assert_eq!(gke.scheduling.runtime_class, None);
+    assert_eq!(
+        gke.scheduling.node_selector["durable-actors/role"],
+        "actor-host"
+    );
+    assert_eq!(gke.scheduling.tolerations.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn gke_defaults_are_unchanged_without_aws_settings() -> Result<()> {
+    let values = process_environment();
+    let config =
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))?;
+    assert_eq!(config.storage.provider, StorageProvider::Gcs);
+    assert_eq!(
+        gke(&config).scheduling,
+        crate::sandbox::gke::PodScheduling::default()
+    );
+    Ok(())
+}
+
+#[test]
+fn s3_configuration_is_validated() {
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))
+    };
+    let mut values = aws_environment();
+    values.remove("DURABLE_ACTORS_S3_ACTOR_ROLE_ARN");
+    assert!(parse(&values).is_err(), "role ARN is required");
+
+    let mut values = aws_environment();
+    values.insert("DURABLE_ACTORS_PERSISTENCE", "rapid");
+    values.insert("DURABLE_ACTORS_ARCHIVE_BUCKET", "actor-archive");
+    values.insert(
+        "DURABLE_ACTORS_RAPID_BUCKETS",
+        r#"[{"bucket":"rapid-test-a","zone":"us-west4-a"}]"#,
+    );
+    assert!(parse(&values).is_err(), "Rapid stays GCS-only");
+
+    let mut values = process_environment();
+    values.insert("DURABLE_ACTORS_S3_REGION", "us-west-2");
+    assert!(parse(&values).is_err(), "S3 settings need the S3 provider");
+
+    let mut values = aws_environment();
+    values.insert("DURABLE_ACTORS_S3_ENDPOINT", "ftp://minio");
+    assert!(parse(&values).is_err());
+    values.insert("DURABLE_ACTORS_S3_ENDPOINT", "http://minio:9000");
+    values.insert("DURABLE_ACTORS_S3_FORCE_PATH_STYLE", "true");
+    assert!(parse(&values).is_ok());
+
+    let mut values = aws_environment();
+    values.insert("DURABLE_ACTORS_STORAGE_PROVIDER", "azure");
+    assert!(parse(&values).is_err());
+}
+
+#[test]
+fn placement_accepts_neutral_and_legacy_names_but_not_conflicts() {
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))
+    };
+    let mut values = aws_environment();
+    values.remove("DURABLE_ACTORS_PLACEMENT_ZONE");
+    values.insert(
+        "DURABLE_ACTORS_PLACEMENT_ZONES",
+        r#"{"north-america-west":["us-west-2a","us-west-2b"]}"#,
+    );
+    assert!(parse(&values).is_ok());
+    values.insert("DURABLE_ACTORS_PLACEMENT_ZONE", "us-west-2a");
+    assert!(parse(&values).is_err(), "zone and zones");
+    values.remove("DURABLE_ACTORS_PLACEMENT_ZONES");
+    values.insert("DURABLE_ACTORS_GKE_ZONE", "us-east4-a");
+    assert!(parse(&values).is_err(), "neutral and legacy disagree");
+    values.insert("DURABLE_ACTORS_GKE_ZONE", "us-west-2a");
+    assert!(parse(&values).is_ok(), "matching aliases are accepted");
+}
+
+#[test]
+fn sandbox_scheduling_is_validated() {
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))
+    };
+    for (name, value) in [
+        ("DURABLE_ACTORS_SANDBOX_RUNTIME_CLASS", "Not_A_Name"),
+        ("DURABLE_ACTORS_SANDBOX_NODE_SELECTOR", r#"{"a":1}"#),
+        ("DURABLE_ACTORS_SANDBOX_TOLERATIONS", r#"{"key":"x"}"#),
+        ("DURABLE_ACTORS_SANDBOX_TOLERATIONS", r#"[{"tolerationSeconds":"soon"}]"#),
+    ] {
+        let mut values = aws_environment();
+        values.insert(name, value);
+        assert!(parse(&values).is_err(), "{name}={value}");
+    }
+    let mut values = aws_environment();
+    values.insert("DURABLE_ACTORS_SANDBOX_RUNTIME_CLASS", "gvisor");
+    assert!(parse(&values).is_ok());
+}

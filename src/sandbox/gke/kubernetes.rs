@@ -25,6 +25,26 @@ pub(crate) struct GkeConfig {
     pub namespace: String,
     pub zones: BTreeMap<String, Vec<String>>,
     pub reap_concurrency: usize,
+    pub scheduling: PodScheduling,
+}
+
+/// Where sandbox pods run. The defaults are GKE Sandbox's; other clusters name their own runtime
+/// class (or none, for the cluster's default runtime) and the nodes reserved for actors.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PodScheduling {
+    pub runtime_class: Option<String>,
+    pub node_selector: BTreeMap<String, String>,
+    pub tolerations: Vec<serde_json::Value>,
+}
+
+impl Default for PodScheduling {
+    fn default() -> Self {
+        Self {
+            runtime_class: Some("gvisor".into()),
+            node_selector: BTreeMap::from([("sandbox.gke.io/runtime".into(), "gvisor".into())]),
+            tolerations: Vec::new(),
+        }
+    }
 }
 
 /// Reads pod state from one shared watch so provisioning costs a single API call per pod.
@@ -100,7 +120,7 @@ impl Kubernetes {
             .zones
             .get(region)
             .map(Vec::as_slice)
-            .with_context(|| format!("no GKE zone configured for {region}"))
+            .with_context(|| format!("no placement zone configured for {region}"))
     }
 }
 
@@ -112,7 +132,12 @@ impl SandboxCluster for Kubernetes {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let pod = spare_pod(request, self.zones(&request.canonical_region)?, &token)?;
+        let pod = spare_pod(
+            request,
+            self.zones(&request.canonical_region)?,
+            &self.config.scheduling,
+            &token,
+        )?;
         let ready = self.start(pod).await?;
         let ip: std::net::IpAddr = ready
             .status
@@ -224,8 +249,14 @@ async fn observe(pods: Api<Pod>, writer: Writer<Pod>, changed: watch::Sender<()>
         .await;
 }
 
-fn spare_pod(request: &CreateSpareRequest, zones: &[String], token: &str) -> Result<Pod> {
+fn spare_pod(
+    request: &CreateSpareRequest,
+    zones: &[String],
+    scheduling: &PodScheduling,
+    token: &str,
+) -> Result<Pod> {
     let mut pod = base_pod(&request.name, &request.image_ref, zones, &request.resources);
+    schedule(&mut pod, scheduling);
     pod["metadata"]["annotations"] =
         json!({"cluster-autoscaler.kubernetes.io/safe-to-evict": "true"});
     pod["spec"]["containers"][0]["env"] = json!([
@@ -246,12 +277,11 @@ fn base_pod(
     json!({
         "apiVersion":"v1", "kind":"Pod", "metadata":{"name":name, "labels":{"app.kubernetes.io/managed-by":"terse", "terse.ai/purpose":"actor"}},
         "spec":{
-            "runtimeClassName":"gvisor", "automountServiceAccountToken":false, "serviceAccountName":"sandbox",
+            "automountServiceAccountToken":false, "serviceAccountName":"sandbox",
             "restartPolicy":"Never", "terminationGracePeriodSeconds":45,
-            "nodeSelector":{"sandbox.gke.io/runtime":"gvisor"},
             "affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"topology.kubernetes.io/zone","operator":"In","values":zones}]}]}}},
             "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"terse.ai/purpose":"actor"}}}],
-            "securityContext":{"runAsNonRoot":true, "runAsUser":10000, "runAsGroup":10000, "fsGroup":10000},
+            "securityContext":{"runAsNonRoot":true, "runAsUser":10000, "runAsGroup":10000, "fsGroup":10000, "seccompProfile":{"type":"RuntimeDefault"}},
             "containers":[{"name":"runtime", "image":image, "imagePullPolicy":"IfNotPresent", "command":["/usr/local/bin/durable-actors"],
                 "securityContext":{"allowPrivilegeEscalation":false, "readOnlyRootFilesystem":true, "capabilities":{"drop":["ALL"]}},
                 "resources":container_resources(resources),
@@ -259,6 +289,19 @@ fn base_pod(
             }], "volumes":[{"name":"tmp","emptyDir":{"sizeLimit":"7Gi"}},{"name":"customer","emptyDir":{"sizeLimit":"1Gi"}}]
         }
     })
+}
+
+fn schedule(pod: &mut serde_json::Value, scheduling: &PodScheduling) {
+    let spec = &mut pod["spec"];
+    if let Some(class) = &scheduling.runtime_class {
+        spec["runtimeClassName"] = json!(class);
+    }
+    if !scheduling.node_selector.is_empty() {
+        spec["nodeSelector"] = json!(scheduling.node_selector);
+    }
+    if !scheduling.tolerations.is_empty() {
+        spec["tolerations"] = json!(scheduling.tolerations);
+    }
 }
 
 fn container_resources(resources: &ResourceLimits) -> serde_json::Value {

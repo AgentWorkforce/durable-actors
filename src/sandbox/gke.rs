@@ -11,7 +11,7 @@ use super::{
 
 mod kubernetes;
 pub(crate) use super::remote::validate_image;
-pub(crate) use kubernetes::GkeConfig;
+pub(crate) use kubernetes::{GkeConfig, PodScheduling};
 
 pub(crate) async fn provider(
     config: GkeConfig,

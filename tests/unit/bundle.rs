@@ -180,3 +180,50 @@ fn python_code_manifests_include_the_entrypoint_and_installed_dependencies() -> 
     assert_eq!(decoded.files.len(), 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn bucket_installs_pin_each_file_to_its_deployed_generation() -> Result<()> {
+    use crate::bucket::Bucket;
+    let objects = tempfile::tempdir()?;
+    let bucket = crate::bucket::FileBucket::new(objects.path().into())?;
+    let object = "durable-actors/v3/artifacts/12345678-1234-4234-8234-123456789012/actors.mjs";
+    assert!(
+        bucket
+            .compare_and_swap(object, None, Bytes::from_static(b"export {}"))
+            .await?
+    );
+    let mut file = artifact("actors.mjs", b"export {}");
+    file.object = object.into();
+    file.generation = bucket.get(object).await?.unwrap().generation;
+    let mut bundle = ActorBundle {
+        bucket: "code".into(),
+        files: vec![file],
+    };
+    let root = tempfile::tempdir()?;
+    bundle.install_from_bucket(root.path(), &bucket).await?;
+    assert_eq!(std::fs::read(root.path().join("actors.mjs"))?, b"export {}");
+
+    bundle.files[0].generation += 1;
+    let error = bundle
+        .install_from_bucket(tempfile::tempdir()?.path(), &bucket)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("changed after deployment"), "{error}");
+
+    bundle.files[0].generation -= 1;
+    bundle.files[0].sha256 = checksum(b"something else");
+    assert!(
+        bundle
+            .install_from_bucket(tempfile::tempdir()?.path(), &bucket)
+            .await
+            .is_err()
+    );
+    bundle.files[0].object = format!("{object}.missing");
+    assert!(
+        bundle
+            .install_from_bucket(tempfile::tempdir()?.path(), &bucket)
+            .await
+            .is_err()
+    );
+    Ok(())
+}

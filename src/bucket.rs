@@ -2,6 +2,8 @@ pub(crate) mod access;
 mod file;
 mod gcs;
 mod rapid;
+mod s3;
+mod s3_access;
 pub(crate) use rapid::{RAPID_OPERATION_TIMEOUT, RapidSnapshots};
 pub(crate) mod recovery;
 mod snapshots;
@@ -17,6 +19,7 @@ pub use gcs::GcsBucket;
 pub(crate) use gcs::WarmStorage;
 pub(crate) use runtime::ActorStateReader;
 pub use runtime::{LoadedActor, OwnershipHint, RuntimeStorage, RuntimeStorageReader};
+pub use s3::{S3Bucket, S3Endpoint};
 
 #[derive(Clone, Debug)]
 pub struct BucketObject {
@@ -65,3 +68,7 @@ pub(crate) async fn replace(
 #[cfg(test)]
 #[path = "../tests/support/bucket.rs"]
 pub(crate) mod testing;
+
+#[cfg(test)]
+#[path = "../tests/conformance/bucket.rs"]
+mod conformance;
