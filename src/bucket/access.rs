@@ -106,7 +106,7 @@ impl RuntimeAccess {
     pub async fn s3(
         location: BucketLocation,
         persistence: super::SnapshotStoreConfig,
-        role_arn: &str,
+        credentials: &super::S3ActorCredentials,
     ) -> Result<Self> {
         let BucketLocation::S3 { s3, .. } = &location else {
             anyhow::bail!("S3 credentials require an S3 bucket location");
@@ -116,9 +116,7 @@ impl RuntimeAccess {
             "Rapid persistence requires GCS"
         );
         Ok(Self {
-            token_source: Some(Box::new(
-                super::s3_access::AssumeRoleTokens::from_environment(s3, role_arn).await?,
-            )),
+            token_source: Some(credentials.source(s3).await?),
             location,
             persistence,
         })

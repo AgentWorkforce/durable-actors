@@ -497,7 +497,7 @@ impl HostCredentials {
         Ok(aws_credential_types::Credentials::new(
             aws.access_key_id.clone(),
             aws.secret_access_key.clone(),
-            Some(aws.session_token.clone()),
+            Some(aws.session_token.clone()).filter(|token| !token.is_empty()),
             Some(std::time::UNIX_EPOCH + Duration::from_millis(token.expires_at_ms)),
             "durable-actors-host",
         ))

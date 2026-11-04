@@ -89,9 +89,10 @@ impl google_cloud_auth::credentials::CredentialsProvider for BearerToken {
         google_cloud_auth::credentials::CacheableResource<axum::http::HeaderMap>,
         google_cloud_auth::errors::CredentialsError,
     > {
-        let mut value: axum::http::HeaderValue = format!("Bearer {}", self.0).parse().map_err(|_| {
-            google_cloud_auth::errors::CredentialsError::from_msg(false, "invalid test token")
-        })?;
+        let mut value: axum::http::HeaderValue =
+            format!("Bearer {}", self.0).parse().map_err(|_| {
+                google_cloud_auth::errors::CredentialsError::from_msg(false, "invalid test token")
+            })?;
         value.set_sensitive(true);
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(axum::http::header::AUTHORIZATION, value);

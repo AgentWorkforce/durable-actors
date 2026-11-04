@@ -133,3 +133,22 @@ fn session_names_are_valid_and_unique() {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     );
 }
+
+#[test]
+fn tokens_carry_expiring_session_credentials() -> Result<()> {
+    let expiry = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_900_000_000);
+    let issued = token("AKIA", "secret", "session", Some(expiry))?;
+    assert_eq!(issued.expires_at_ms, 1_900_000_000_000);
+    assert!(issued.access_token.is_empty());
+    let aws = issued.aws.unwrap();
+    assert_eq!(
+        (aws.access_key_id.as_str(), aws.session_token.as_str()),
+        ("AKIA", "session")
+    );
+    let static_keys = token("AKIA", "secret", "", None)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    assert!(static_keys.expires_at_ms > now && static_keys.expires_at_ms <= now + 900_000);
+    Ok(())
+}

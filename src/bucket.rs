@@ -20,6 +20,7 @@ pub(crate) use gcs::WarmStorage;
 pub(crate) use runtime::ActorStateReader;
 pub use runtime::{LoadedActor, OwnershipHint, RuntimeStorage, RuntimeStorageReader};
 pub use s3::{S3Bucket, S3Endpoint};
+pub use s3_access::S3ActorCredentials;
 
 #[derive(Clone, Debug)]
 pub struct BucketObject {

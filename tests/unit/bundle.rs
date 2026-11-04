@@ -208,7 +208,10 @@ async fn bucket_installs_pin_each_file_to_its_deployed_generation() -> Result<()
         .install_from_bucket(tempfile::tempdir()?.path(), &bucket)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("changed after deployment"), "{error}");
+    assert!(
+        error.to_string().contains("changed after deployment"),
+        "{error}"
+    );
 
     bundle.files[0].generation -= 1;
     bundle.files[0].sha256 = checksum(b"something else");

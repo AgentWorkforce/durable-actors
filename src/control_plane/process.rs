@@ -62,7 +62,7 @@ pub enum StorageProvider {
     Gcs,
     S3 {
         endpoint: crate::bucket::S3Endpoint,
-        actor_role_arn: String,
+        actor_credentials: crate::bucket::S3ActorCredentials,
     },
 }
 
@@ -376,7 +376,7 @@ async fn runtime_access(
         ),
         StorageProvider::S3 {
             endpoint,
-            actor_role_arn,
+            actor_credentials,
         } => {
             RuntimeAccess::s3(
                 BucketLocation::S3 {
@@ -385,7 +385,7 @@ async fn runtime_access(
                     s3: endpoint.clone(),
                 },
                 persistence,
-                actor_role_arn,
+                actor_credentials,
             )
             .await
         }
@@ -668,7 +668,8 @@ impl ControlPlaneProcessConfig {
 }
 
 fn storage_provider(get: &mut impl FnMut(&str) -> Option<String>) -> Result<StorageProvider> {
-    const S3_ONLY: [&str; 4] = [
+    const S3_ONLY: [&str; 5] = [
+        "DURABLE_ACTORS_S3_ACTOR_CREDENTIALS",
         "DURABLE_ACTORS_S3_REGION",
         "DURABLE_ACTORS_S3_ENDPOINT",
         "DURABLE_ACTORS_S3_FORCE_PATH_STYLE",
@@ -711,10 +712,34 @@ fn storage_provider(get: &mut impl FnMut(&str) -> Option<String>) -> Result<Stor
                     endpoint,
                     force_path_style,
                 },
-                actor_role_arn: required(get, "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN")?,
+                actor_credentials: actor_credentials(get)?,
             })
         }
         provider => anyhow::bail!("unsupported DURABLE_ACTORS_STORAGE_PROVIDER {provider:?}"),
+    }
+}
+
+fn actor_credentials(
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<crate::bucket::S3ActorCredentials> {
+    use crate::bucket::S3ActorCredentials;
+    match get("DURABLE_ACTORS_S3_ACTOR_CREDENTIALS")
+        .as_deref()
+        .unwrap_or("assume-role")
+    {
+        "assume-role" => Ok(S3ActorCredentials::AssumeRole {
+            role_arn: required(get, "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN")?,
+        }),
+        "control-plane" => {
+            ensure!(
+                get("DURABLE_ACTORS_S3_ACTOR_ROLE_ARN").is_none(),
+                "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN applies only to assume-role actor credentials"
+            );
+            Ok(S3ActorCredentials::ControlPlane)
+        }
+        other => anyhow::bail!(
+            "DURABLE_ACTORS_S3_ACTOR_CREDENTIALS must be assume-role or control-plane, not {other:?}"
+        ),
     }
 }
 
