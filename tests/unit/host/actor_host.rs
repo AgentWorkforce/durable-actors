@@ -1,3 +1,5 @@
+#[path = "../../fixtures/spans.rs"]
+mod spans;
 use crate::request_tracking::HostState;
 use crate::{
     actor::{
@@ -968,8 +970,8 @@ async fn caller_cancellation_cannot_release_an_actor_during_its_commit() -> Resu
 #[tokio::test]
 async fn traces_measure_queue_wait_and_record_panics() -> Result<()> {
     let (host, mut started, release) = controlled_host().await;
-    let (sender, mut traces) = crate::request_traces::TraceSender::channel(8);
-    let host = Arc::new(Arc::try_unwrap(host).ok().unwrap().with_traces(sender));
+    let (tracer, mut traces) = spans::request_spans();
+    let host = Arc::new(Arc::try_unwrap(host).ok().unwrap().with_traces(tracer));
     let caller = host.clone();
     let first = tokio::spawn(async move { invoke(&caller, "first").await });
     assert_eq!(started.recv().await.as_deref(), Some("first"));

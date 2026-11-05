@@ -1,36 +1,81 @@
-CREATE TABLE IF NOT EXISTS actor_traces (
-    project_id String,
-    event_id String,
-    started_at_ms UInt64,
-    actor_name LowCardinality(String),
-    actor_id String,
-    request_id String,
-    connection_id Nullable(String),
-    kind LowCardinality(String),
-    operation LowCardinality(String),
-    outcome LowCardinality(String),
-    duration_ms Float64,
-    queue_wait_ms Nullable(Float64),
-    host_id String,
-    event_json String,
-    received_at DateTime DEFAULT now()
-) ENGINE = ReplacingMergeTree
-ORDER BY (project_id, started_at_ms, event_id)
-PRIMARY KEY (project_id, started_at_ms)
-TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
+-- Columns match the OpenTelemetry Collector ClickHouse exporter (v0.163.0), which inserts by name.
+-- Tenant columns come from resource attributes the collector stamps from verified host claims.
+-- Partitioning and retention use the server's insert time. Partitioning by host timestamps would
+-- let one host's clock fail inserts that carry other projects' rows, and whole partitions expire cheaply.
+CREATE TABLE IF NOT EXISTS otel_traces (
+    Timestamp DateTime64(9) CODEC(Delta, ZSTD(1)),
+    TraceId String CODEC(ZSTD(1)),
+    SpanId String CODEC(ZSTD(1)),
+    ParentSpanId String CODEC(ZSTD(1)),
+    TraceState String CODEC(ZSTD(1)),
+    SpanName LowCardinality(String) CODEC(ZSTD(1)),
+    SpanKind LowCardinality(String) CODEC(ZSTD(1)),
+    ServiceName LowCardinality(String) CODEC(ZSTD(1)),
+    ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    ScopeName String CODEC(ZSTD(1)),
+    ScopeVersion String CODEC(ZSTD(1)),
+    SpanAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    Duration UInt64 CODEC(ZSTD(1)),
+    StatusCode LowCardinality(String) CODEC(ZSTD(1)),
+    StatusMessage String CODEC(ZSTD(1)),
+    Events Nested (
+        Timestamp DateTime64(9),
+        Name LowCardinality(String),
+        Attributes Map(LowCardinality(String), String)
+    ) CODEC(ZSTD(1)),
+    Links Nested (
+        TraceId String,
+        SpanId String,
+        TraceState String,
+        Attributes Map(LowCardinality(String), String)
+    ) CODEC(ZSTD(1)),
+    ProjectId LowCardinality(String) MATERIALIZED ResourceAttributes['durable_actors.project_id'],
+    ActorName LowCardinality(String) MATERIALIZED ResourceAttributes['durable_actors.actor_name'],
+    ActorId String MATERIALIZED ResourceAttributes['durable_actors.actor_id'],
+    HostId String MATERIALIZED ResourceAttributes['durable_actors.host_id'],
+    SessionId String MATERIALIZED ResourceAttributes['durable_actors.session_id'],
+    RequestId String MATERIALIZED SpanAttributes['durable_actors.request_id'],
+    ReceivedAt DateTime64(3) DEFAULT now64(3),
+    INDEX idx_request_id RequestId TYPE bloom_filter(0.001) GRANULARITY 1
+) ENGINE = MergeTree
+PARTITION BY toDate(ReceivedAt)
+ORDER BY (ProjectId, ActorName, ActorId, Timestamp)
+TTL toDateTime(ReceivedAt) + INTERVAL RETENTION_SECONDS SECOND
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 
-CREATE TABLE IF NOT EXISTS actor_trace_status (
-    project_id String,
-    event_id String,
-    dropped UInt64,
-    failed UInt8,
-    received_at DateTime DEFAULT now()
-) ENGINE = ReplacingMergeTree
-ORDER BY (project_id, event_id)
-TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
+CREATE TABLE IF NOT EXISTS otel_logs (
+    Timestamp DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+    TraceId String CODEC(ZSTD(1)),
+    SpanId String CODEC(ZSTD(1)),
+    TraceFlags UInt8,
+    SeverityText LowCardinality(String) CODEC(ZSTD(1)),
+    SeverityNumber UInt8,
+    ServiceName LowCardinality(String) CODEC(ZSTD(1)),
+    Body String CODEC(ZSTD(1)),
+    ResourceSchemaUrl LowCardinality(String) CODEC(ZSTD(1)),
+    ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    ScopeSchemaUrl LowCardinality(String) CODEC(ZSTD(1)),
+    ScopeName String CODEC(ZSTD(1)),
+    ScopeVersion LowCardinality(String) CODEC(ZSTD(1)),
+    ScopeAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    LogAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    EventName String CODEC(ZSTD(1)),
+    ProjectId LowCardinality(String) MATERIALIZED ResourceAttributes['durable_actors.project_id'],
+    ActorName LowCardinality(String) MATERIALIZED ResourceAttributes['durable_actors.actor_name'],
+    ActorId String MATERIALIZED ResourceAttributes['durable_actors.actor_id'],
+    HostId String MATERIALIZED ResourceAttributes['durable_actors.host_id'],
+    RequestId String MATERIALIZED LogAttributes['durable_actors.request_id'],
+    LogId String MATERIALIZED LogAttributes['durable_actors.log_id'],
+    ReceivedAt DateTime64(3) DEFAULT now64(3),
+    INDEX idx_request_id RequestId TYPE bloom_filter(0.001) GRANULARITY 1
+) ENGINE = MergeTree
+PARTITION BY toDate(ReceivedAt)
+ORDER BY (ProjectId, ActorName, ActorId, Timestamp)
+TTL toDateTime(ReceivedAt) + INTERVAL RETENTION_SECONDS SECOND
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 
-ALTER TABLE actor_traces MODIFY TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
-ALTER TABLE actor_trace_status MODIFY TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
+ALTER TABLE otel_traces MODIFY TTL toDateTime(ReceivedAt) + INTERVAL RETENTION_SECONDS SECOND;
+ALTER TABLE otel_logs MODIFY TTL toDateTime(ReceivedAt) + INTERVAL RETENTION_SECONDS SECOND;
 
 CREATE TABLE IF NOT EXISTS actor_lifecycle (
     project_id String,

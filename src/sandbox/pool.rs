@@ -17,6 +17,7 @@ mod replenishment;
 #[derive(Clone)]
 pub(crate) struct PoolConfig {
     pub control_plane_url: Option<String>,
+    pub otlp_endpoint: Option<String>,
     pub kind: SpareKind,
     pub idle: u32,
     pub fleet_maximum: u32,
@@ -311,6 +312,11 @@ impl SparePool {
             control_plane_url: self
                 .config
                 .control_plane_url
+                .clone()
+                .filter(|_| self.config.kind == SpareKind::Actor),
+            otlp_endpoint: self
+                .config
+                .otlp_endpoint
                 .clone()
                 .filter(|_| self.config.kind == SpareKind::Actor),
             name: name.into(),

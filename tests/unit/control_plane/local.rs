@@ -89,12 +89,13 @@ async fn relative_state_directories_are_absolute_in_host_configuration() -> Resu
     };
     assert_eq!(configured, directory.path().canonicalize()?.join("objects"));
     state
-        .traces
-        .record(
-            "default",
-            "host",
-            "session",
-            vec![crate::request_traces::RequestTrace {
+        .telemetry
+        .0
+        .append(&[crate::request_traces::TraceEvent {
+            event_id: "event".into(),
+            host_id: "host".into(),
+            session_id: "session".into(),
+            trace: crate::request_traces::RequestTrace {
                 state_version: None,
                 project_id: "default".into(),
                 request_id: "request".into(),
@@ -110,9 +111,8 @@ async fn relative_state_directories_are_absolute_in_host_configuration() -> Resu
                 routing_ms: 0.0,
                 outcome: crate::request_traces::RequestOutcome::Completed,
                 metadata: None,
-            }],
-            0,
-        )
+            },
+        }])
         .await?;
     let event_id = state
         .traces

@@ -1,35 +1,34 @@
 use crate::control_plane::admin::validate_component;
 use crate::request_tracking::HostState;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
+use opentelemetry::{
+    KeyValue,
+    trace::{Span, SpanKind, Status, Tracer},
+};
+use opentelemetry_sdk::trace::SdkTracer;
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
 
 pub(crate) use crate::request_tracking::RequestOutcome;
 use crate::request_tracking::{RequestCompletion, RequestObserver};
 
 pub(crate) mod history;
 pub(crate) mod live;
+pub(crate) mod logs;
 pub(crate) mod metrics;
+pub(crate) mod otlp;
 pub(crate) mod persistence;
 pub(crate) mod replay;
-use persistence::{TracePersistence, sqlite::SqliteTracePersistence};
+use live::{InProcessFeed, LiveFeed, LiveStream};
+use persistence::{TraceQueries, sqlite::SqliteTracePersistence};
 use replay::ReplayQuery;
 
 pub(crate) const TRACE_CAPACITY: usize = 500;
-pub(crate) const TRACE_BATCH_SIZE: usize = 2000;
-pub(crate) const TRACE_METADATA_LIMIT: usize = 4096;
-pub(crate) const TRACE_WRITE_CONCURRENCY: usize = 256;
-// Bounded because the queue shares the actor sandbox's memory limit.
-const TRACE_QUEUE_CAPACITY: usize = 100_000;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RequestTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,55 +51,7 @@ pub(crate) struct RequestTrace {
     pub metadata: Option<serde_json::Value>,
 }
 
-impl RequestTrace {
-    pub(crate) fn validate(&self) -> Result<()> {
-        crate::actor::ActorKey {
-            project_id: self.project_id.clone(),
-            actor_name: self.actor_name.clone(),
-            actor_id: self.actor_id.clone(),
-        }
-        .validate()?;
-        ensure!(
-            !self.request_id.is_empty() && self.request_id.len() <= 256,
-            "invalid trace request ID"
-        );
-        ensure!(
-            !self.operation.is_empty() && self.operation.len() <= 256,
-            "invalid trace operation"
-        );
-        ensure!(
-            self.connection_id.as_ref().is_none_or(|id| id.len() <= 256),
-            "invalid trace connection ID"
-        );
-        ensure!(
-            self.routing_ms.is_finite() && self.routing_ms >= 0.0,
-            "invalid routing duration"
-        );
-        ensure!(
-            self.duration_ms.is_finite() && self.duration_ms >= 0.0,
-            "invalid trace duration"
-        );
-        ensure!(
-            self.queue_wait_ms
-                .is_none_or(|ms| ms.is_finite() && ms >= 0.0 && ms <= self.duration_ms),
-            "invalid trace queue wait"
-        );
-        ensure!(
-            self.metadata
-                .as_ref()
-                .is_none_or(|metadata| metadata.to_string().len() <= TRACE_METADATA_LIMIT),
-            "trace metadata exceeds {TRACE_METADATA_LIMIT} bytes"
-        );
-        Ok(())
-    }
-}
-
-// Connection metadata beyond the limit is omitted rather than failing the trace.
-fn bounded_metadata(metadata: Option<serde_json::Value>) -> Option<serde_json::Value> {
-    metadata.filter(|value| value.to_string().len() <= TRACE_METADATA_LIMIT)
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RequestKind {
     Method,
@@ -116,7 +67,7 @@ impl RequestKind {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TraceEvent {
     #[serde(default = "new_event_id")]
@@ -145,15 +96,27 @@ pub(crate) struct TracePage {
     pub epoch: String,
     pub cursor: u64,
     pub capacity: usize,
-    pub evicted: u64,
-    pub dropped: u64,
-    pub persistence_failed: bool,
     pub records: Vec<TraceRecord>,
     pub next_cursor: Option<String>,
     pub resume_cursor: String,
     pub reset: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub snapshot: bool,
+}
+
+impl TracePage {
+    pub(crate) fn empty(capacity: usize) -> Self {
+        Self {
+            epoch: "none".into(),
+            cursor: 0,
+            capacity,
+            records: Vec::new(),
+            next_cursor: None,
+            resume_cursor: "snapshot".into(),
+            reset: false,
+            snapshot: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -168,86 +131,39 @@ impl std::error::Error for InvalidTraceQuery {}
 
 #[derive(Clone)]
 pub(crate) struct TraceStore {
-    pending: Arc<tokio::sync::Semaphore>,
-    persistence: Arc<dyn TracePersistence>,
-    pub live: Option<live::LiveTraceFeed>,
+    queries: Arc<dyn TraceQueries>,
+    live: Arc<dyn LiveFeed>,
 }
 
 impl Default for TraceStore {
     fn default() -> Self {
-        Self::new(Arc::new(SqliteTracePersistence::in_memory()))
+        Self::new(
+            Arc::new(SqliteTracePersistence::in_memory()),
+            Arc::new(InProcessFeed::default()),
+        )
     }
 }
 
 impl TraceStore {
-    pub(crate) async fn open(persistence: Arc<dyn TracePersistence>) -> Result<Self> {
-        persistence.initialize().await?;
-        Ok(Self::new(persistence))
+    pub(crate) fn new(queries: Arc<dyn TraceQueries>, live: Arc<dyn LiveFeed>) -> Self {
+        Self { queries, live }
     }
 
-    pub(crate) async fn record(
+    pub(crate) async fn subscribe(
         &self,
         project_id: &str,
-        host: &str,
-        session: &str,
-        traces: Vec<RequestTrace>,
-        dropped: u64,
-    ) -> Result<()> {
-        validate_component("project ID", project_id, 64)?;
-        ensure!(
-            traces.iter().all(|trace| trace.project_id == project_id),
-            "trace project does not match host"
-        );
-        let events = traces
-            .into_iter()
-            .map(|trace| TraceEvent {
-                event_id: new_event_id(),
-                host_id: host.into(),
-                session_id: session.into(),
-                trace,
-            })
-            .collect();
-        self.persist_detached(project_id, events, dropped).await
+        signal: otlp::Signal,
+    ) -> Result<LiveStream> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        self.live
+            .subscribe(otlp::live_channel(project_id, signal))
+            .await
     }
 
     pub(crate) async fn replay(&self, project_id: &str, query: &ReplayQuery) -> Result<TracePage> {
         validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
         query.validate().context(InvalidTraceQuery)?;
-        let mut page = self.persistence.replay(project_id, query).await?;
-        let status = self.persistence.status(project_id).await?;
-        page.dropped = status.dropped;
-        page.persistence_failed = status.persistence_failed;
-        Ok(page)
-    }
-
-    pub(crate) async fn metrics(
-        &self,
-        project_id: &str,
-        query: &metrics::TimeRange,
-    ) -> Result<metrics::OverviewMetrics> {
-        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
-        query.validate().context(InvalidTraceQuery)?;
-        self.persistence.metrics(project_id, query).await
-    }
-
-    pub(crate) async fn queue_waits(
-        &self,
-        project_id: &str,
-        query: &metrics::QueueWaitQuery,
-    ) -> Result<Vec<metrics::QueueWaitRow>> {
-        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
-        query.validate().context(InvalidTraceQuery)?;
-        self.persistence.queue_waits(project_id, query).await
-    }
-
-    pub(crate) async fn websockets(
-        &self,
-        project_id: &str,
-        query: &metrics::TimeRange,
-    ) -> Result<Vec<metrics::SocketSession>> {
-        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
-        query.validate().context(InvalidTraceQuery)?;
-        self.persistence.websockets(project_id, query).await
+        self.queries.replay(project_id, query).await
     }
 
     pub(crate) async fn history(
@@ -257,195 +173,124 @@ impl TraceStore {
     ) -> Result<TracePage> {
         validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
         query.validate().context(InvalidTraceQuery)?;
-        let mut page = self.persistence.history(project_id, query).await?;
-        let status = self.persistence.status(project_id).await?;
-        page.dropped = status.dropped;
-        page.persistence_failed = status.persistence_failed;
-        Ok(page)
+        self.queries.history(project_id, query).await
     }
 
-    fn new(persistence: Arc<dyn TracePersistence>) -> Self {
-        Self {
-            pending: Arc::new(tokio::sync::Semaphore::new(TRACE_WRITE_CONCURRENCY)),
-            persistence,
-            live: None,
-        }
-    }
-
-    async fn persist_detached(
+    pub(crate) async fn logs(
         &self,
-        project: &str,
-        events: Vec<TraceEvent>,
-        dropped: u64,
-    ) -> Result<()> {
-        if events.is_empty() {
-            return self.publish_status(project, dropped).await;
-        }
-        let permit = match self.pending.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(error) => {
-                self.report_persistence_failure(project, &error, events.len())
-                    .await?;
-                return Err(error.into());
-            }
-        };
-        let store = self.clone();
-        let project = project.to_owned();
-        // Finish the commit even if the reporting connection is cancelled.
-        tokio::spawn(async move {
-            let _permit = permit;
-            let count = events.len();
-            if let Err(error) = store.persistence.record(&project, events, dropped).await {
-                store
-                    .report_persistence_failure(&project, &error, count)
-                    .await?;
-                return Err(error);
-            }
-            Ok(())
-        })
-        .await?
+        project_id: &str,
+        query: &logs::LogQuery,
+    ) -> Result<logs::LogPage> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.logs(project_id, query).await
     }
 
-    async fn publish_status(&self, project: &str, dropped: u64) -> Result<()> {
-        if dropped > 0 {
-            self.persistence
-                .record_status(project, dropped, false)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn report_persistence_failure(
+    pub(crate) async fn log_histogram(
         &self,
-        project: &str,
-        error: &(impl std::fmt::Display + Sync),
-        count: usize,
-    ) -> Result<()> {
-        tracing::error!(%error, count, "request trace persistence failed");
-        self.persistence.record_status(project, 0, true).await?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct TraceSender {
-    sender: mpsc::Sender<RequestTrace>,
-    dropped: Arc<AtomicU64>,
-}
-
-impl TraceSender {
-    #[cfg(test)]
-    pub(crate) fn channel(capacity: usize) -> (Self, mpsc::Receiver<RequestTrace>) {
-        let (sender, receiver) = mpsc::channel(capacity);
-        (
-            Self {
-                sender,
-                dropped: Arc::new(AtomicU64::new(0)),
-            },
-            receiver,
-        )
-    }
-    pub(crate) fn start(
-        client: Arc<crate::control_plane::ControlPlaneClient>,
-        stop: tokio_util::sync::CancellationToken,
-    ) -> Self {
-        let (sender, receiver) = mpsc::channel(TRACE_QUEUE_CAPACITY);
-        let dropped = Arc::new(AtomicU64::new(0));
-        tokio::spawn(export_traces(client, receiver, dropped.clone(), stop));
-        Self { sender, dropped }
+        project_id: &str,
+        query: &logs::LogHistogramQuery,
+    ) -> Result<logs::LogHistogram> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.log_histogram(project_id, query).await
     }
 
-    fn send(&self, trace: RequestTrace) {
-        if self.sender.try_send(trace).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
+    pub(crate) async fn metrics(
+        &self,
+        project_id: &str,
+        query: &metrics::TimeRange,
+    ) -> Result<metrics::OverviewMetrics> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.metrics(project_id, query).await
     }
-}
 
-async fn export_traces(
-    client: Arc<crate::control_plane::ControlPlaneClient>,
-    mut receiver: mpsc::Receiver<RequestTrace>,
-    lost: Arc<AtomicU64>,
-    stop: tokio_util::sync::CancellationToken,
-) {
-    let mut interval = tokio::time::interval(Duration::from_millis(200));
-    loop {
-        tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
-        while report_batch(&client, &mut receiver, &lost).await == TRACE_BATCH_SIZE {}
+    pub(crate) async fn queue_waits(
+        &self,
+        project_id: &str,
+        query: &metrics::QueueWaitQuery,
+    ) -> Result<Vec<metrics::QueueWaitRow>> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.queue_waits(project_id, query).await
     }
-}
 
-async fn report_batch(
-    client: &crate::control_plane::ControlPlaneClient,
-    receiver: &mut mpsc::Receiver<RequestTrace>,
-    lost: &AtomicU64,
-) -> usize {
-    let mut batch = Vec::new();
-    while batch.len() < TRACE_BATCH_SIZE {
-        match receiver.try_recv() {
-            Ok(trace) => batch.push(trace),
-            Err(_) => break,
-        }
+    pub(crate) async fn websockets(
+        &self,
+        project_id: &str,
+        query: &metrics::TimeRange,
+    ) -> Result<Vec<metrics::SocketSession>> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.websockets(project_id, query).await
     }
-    let count = batch.len();
-    let missing = lost.swap(0, Ordering::Relaxed);
-    if count == 0 && missing == 0 {
-        return 0;
-    }
-    if client.report_traces(batch, missing).await.is_err() {
-        lost.fetch_add((count as u64).saturating_add(missing), Ordering::Relaxed);
-    }
-    count
 }
 
 pub(crate) struct TraceRecorder {
-    sender: TraceSender,
-    trace: RequestTrace,
+    tracer: SdkTracer,
+    operation: String,
+    attributes: Vec<KeyValue>,
 }
 
 impl TraceRecorder {
     pub(crate) fn new(
-        sender: TraceSender,
+        tracer: SdkTracer,
         invocation: &crate::actor::ActorInvocation,
         kind: RequestKind,
         connection_id: Option<String>,
         metadata: Option<serde_json::Value>,
     ) -> Self {
+        let mut attributes = vec![
+            KeyValue::new(otlp::REQUEST_ID, invocation.request_id.clone()),
+            KeyValue::new(otlp::KIND, kind.as_str()),
+        ];
+        attributes.extend(connection_id.map(|id| KeyValue::new(otlp::CONNECTION_ID, id)));
+        attributes.extend(metadata.map(|value| KeyValue::new(otlp::METADATA, value.to_string())));
         Self {
-            sender,
-            trace: RequestTrace {
-                state_version: None,
-                project_id: invocation.actor.project_id.clone(),
-                request_id: invocation.request_id.clone(),
-                actor_name: invocation.actor.actor_name.clone(),
-                actor_id: invocation.actor.actor_id.clone(),
-                kind,
-                operation: invocation.method.clone(),
-                connection_id,
-                started_at_ms: 0,
-                duration_ms: 0.0,
-                queue_wait_ms: None,
-                host_state: HostState::Warm,
-                routing_ms: 0.0,
-                outcome: RequestOutcome::Interrupted,
-                metadata: bounded_metadata(metadata),
-            },
+            tracer,
+            operation: invocation.method.clone(),
+            attributes,
         }
     }
 }
 
 impl RequestObserver for TraceRecorder {
     fn record(self: Box<Self>, completion: &RequestCompletion) {
-        let mut trace = self.trace;
-        trace.started_at_ms = completion.started_at_ms;
-        trace.state_version = completion.state_version;
-        trace.outcome = completion.outcome;
-        trace.duration_ms = completion.timings.duration_ms;
-        trace.queue_wait_ms = completion.timings.queue_wait_ms;
-        trace.host_state = completion.timings.host_state;
-        trace.routing_ms = completion.timings.routing_ms;
-        self.sender.send(trace);
+        let started = UNIX_EPOCH + Duration::from_millis(completion.started_at_ms);
+        let ended = started + Duration::from_secs_f64(completion.timings.duration_ms / 1000.0);
+        let mut attributes = self.attributes;
+        attributes.extend(completion_attributes(completion));
+        let mut span = self
+            .tracer
+            .span_builder(self.operation)
+            .with_kind(SpanKind::Server)
+            .with_start_time(started)
+            .with_attributes(attributes)
+            .start_with_context(&self.tracer, &opentelemetry::Context::new());
+        if matches!(completion.outcome, RequestOutcome::Failed) {
+            span.set_status(Status::error(completion.outcome.as_str()));
+        }
+        span.end_with_timestamp(ended);
     }
+}
+
+fn completion_attributes(completion: &RequestCompletion) -> impl Iterator<Item = KeyValue> {
+    let timings = &completion.timings;
+    [
+        Some(KeyValue::new(otlp::OUTCOME, completion.outcome.as_str())),
+        Some(KeyValue::new(otlp::HOST_STATE, timings.host_state.as_str())),
+        Some(KeyValue::new(otlp::ROUTING_MS, timings.routing_ms)),
+        timings
+            .queue_wait_ms
+            .map(|wait| KeyValue::new(otlp::QUEUE_WAIT_MS, wait)),
+        completion
+            .state_version
+            .and_then(|version| i64::try_from(version).ok())
+            .map(|version| KeyValue::new(otlp::STATE_VERSION, version)),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 #[cfg(test)]

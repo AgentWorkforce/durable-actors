@@ -523,9 +523,6 @@ paths:
                                             epoch: "history-1",
                                             cursor: 0,
                                             capacity: 100,
-                                            evicted: 0,
-                                            dropped: 0,
-                                            persistenceFailed: false,
                                             records: [],
                                             nextCursor: null,
                                             resumeCursor: "opaque-cursor",
@@ -618,10 +615,10 @@ paths:
             summary: Stream request history
             description: |
                 SSE requests events contain TracePage JSON. Resume with resumeCursor;
-                when reset=true or snapshot=true, replace previous records. ClickHouse sends
-                an initial snapshot followed by committed batches, with reconciliation every
-                30 seconds and after live-delivery interruptions. Deduplicate records by eventId.
-                Error events contain text and close the stream.
+                when reset=true or snapshot=true, replace previous records. The stream sends
+                an initial snapshot followed by live batches, with reconciliation every
+                30 seconds. Live batches can arrive before storage commits them; deduplicate
+                records by eventId. Error events contain text and close the stream.
             parameters:
                 - name: after
                   in: query
@@ -631,6 +628,92 @@ paths:
                   in: header
                   description: Previous SSE event ID.
                   schema: { type: string, maxLength: 4096 }
+            responses:
+                "200": { $ref: "#/components/responses/EventStream" }
+                "400": { $ref: "#/components/responses/InvalidRequest" }
+                "401": { $ref: "#/components/responses/Unauthenticated" }
+                "500": { $ref: "#/components/responses/Internal" }
+    /v1/projects/{project_id}/observe/logs:
+        parameters:
+            - { $ref: "#/components/parameters/ProjectId" }
+        get:
+            operationId: listActorLogs
+            tags: [Observability]
+            summary: Get actor logs
+            description: Console and print output from actors, newest first. Use nextCursor with the same filters for older lines.
+            parameters:
+                - { $ref: "#/components/parameters/LogActorName" }
+                - { $ref: "#/components/parameters/LogActorId" }
+                - { $ref: "#/components/parameters/LogRequestId" }
+                - { $ref: "#/components/parameters/LogLevel" }
+                - { $ref: "#/components/parameters/LogSearch" }
+                - { $ref: "#/components/parameters/FromMs" }
+                - { $ref: "#/components/parameters/ToMs" }
+                - name: limit
+                  in: query
+                  schema: { type: integer, minimum: 1, maximum: 500, default: 500 }
+                - name: cursor
+                  in: query
+                  description: nextCursor from the previous page.
+                  schema: { type: string, minLength: 1, maxLength: 4096 }
+            responses:
+                "200":
+                    description: Log lines; nextCursor is null on the last page.
+                    headers:
+                        Cache-Control: { $ref: "#/components/headers/NoStore" }
+                    content:
+                        application/json:
+                            schema: { $ref: "#/components/schemas/ActorLogPage" }
+                            examples:
+                                empty:
+                                    value: { records: [], nextCursor: null }
+                "400": { $ref: "#/components/responses/InvalidRequest" }
+                "401": { $ref: "#/components/responses/Unauthenticated" }
+                "500": { $ref: "#/components/responses/Internal" }
+    /v1/projects/{project_id}/observe/logs/histogram:
+        parameters:
+            - { $ref: "#/components/parameters/ProjectId" }
+        get:
+            operationId: getActorLogHistogram
+            tags: [Observability]
+            summary: Count actor logs over time
+            description: Line counts per level in equal time buckets, with the same filters as the logs endpoint. Bucket i starts at fromMs + i * bucketMs.
+            parameters:
+                - { $ref: "#/components/parameters/LogActorName" }
+                - { $ref: "#/components/parameters/LogActorId" }
+                - { $ref: "#/components/parameters/LogRequestId" }
+                - { $ref: "#/components/parameters/LogSearch" }
+                - { name: fromMs, in: query, required: true, schema: { type: integer, minimum: 0 } }
+                - { name: toMs, in: query, required: true, description: Exclusive; must be after fromMs., schema: { type: integer, minimum: 1 } }
+                - { name: bucketMs, in: query, required: true, description: At most 1000 buckets per range., schema: { type: integer, minimum: 1 } }
+            responses:
+                "200":
+                    description: One entry per bucket, empty buckets included.
+                    headers:
+                        Cache-Control: { $ref: "#/components/headers/NoStore" }
+                    content:
+                        application/json:
+                            schema: { $ref: "#/components/schemas/ActorLogHistogram" }
+                "400": { $ref: "#/components/responses/InvalidRequest" }
+                "401": { $ref: "#/components/responses/Unauthenticated" }
+                "500": { $ref: "#/components/responses/Internal" }
+    /v1/projects/{project_id}/observe/logs/events:
+        parameters:
+            - { $ref: "#/components/parameters/ProjectId" }
+        get:
+            operationId: streamActorLogs
+            tags: [Observability]
+            summary: Stream actor logs
+            description: |
+                SSE logs events contain {"records": ActorLog[]} for new lines matching the filters.
+                The stream carries only live lines; read history from the logs endpoint and
+                deduplicate by logId.
+            parameters:
+                - { $ref: "#/components/parameters/LogActorName" }
+                - { $ref: "#/components/parameters/LogActorId" }
+                - { $ref: "#/components/parameters/LogRequestId" }
+                - { $ref: "#/components/parameters/LogLevel" }
+                - { $ref: "#/components/parameters/LogSearch" }
             responses:
                 "200": { $ref: "#/components/responses/EventStream" }
                 "400": { $ref: "#/components/responses/InvalidRequest" }
@@ -705,6 +788,29 @@ components:
         NoStore:
             schema: { type: string, const: no-store }
     parameters:
+        LogActorName:
+            name: actorName
+            in: query
+            schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,48}$" }
+        LogActorId:
+            name: actorId
+            in: query
+            schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
+        LogRequestId:
+            name: requestId
+            in: query
+            description: Only lines written while this request's invocation ran.
+            schema: { type: string, minLength: 1, maxLength: 256 }
+        LogLevel:
+            name: level
+            in: query
+            description: Only lines at this level or more severe. warn returns warn and error lines.
+            schema: { type: string, enum: [debug, info, warn, error] }
+        LogSearch:
+            name: search
+            in: query
+            description: Only lines whose message contains this text, ignoring case.
+            schema: { type: string, minLength: 1, maxLength: 256 }
         FromMs:
             name: fromMs
             in: query
@@ -1279,19 +1385,50 @@ components:
                             toMs: { type: integer, minimum: 0 }
         TracePage:
             type: object
-            required: [epoch, cursor, capacity, evicted, dropped, persistenceFailed, records, nextCursor, resumeCursor, reset]
+            required: [epoch, cursor, capacity, records, nextCursor, resumeCursor, reset]
             properties:
                 epoch: { type: string }
                 cursor: { type: integer, minimum: 0 }
                 capacity: { type: integer, minimum: 0 }
-                evicted: { type: integer, minimum: 0 }
-                dropped: { type: integer, minimum: 0 }
-                persistenceFailed: { type: boolean }
                 records: { type: array, items: { $ref: "#/components/schemas/TraceRecord" } }
                 nextCursor: { type: [string, "null"] }
                 resumeCursor: { type: string }
                 reset: { type: boolean }
                 snapshot: { type: boolean, description: "Replace the live list with this page. Used for ClickHouse initial history and reconciliation." }
+        ActorLog:
+            type: object
+            required: [logId, actorName, actorId, hostId, requestId, timestampMs, level, message]
+            properties:
+                logId: { type: string }
+                actorName: { type: string }
+                actorId: { type: string }
+                hostId: { type: string }
+                requestId: { type: [string, "null"], description: The request whose invocation wrote the line; null outside an invocation. }
+                timestampMs: { type: integer, minimum: 0 }
+                level: { type: string, enum: [debug, info, warn, error] }
+                message: { type: string, description: Untrusted actor output, at most 256 KiB. Render as plain text. }
+        ActorLogPage:
+            type: object
+            required: [records, nextCursor]
+            properties:
+                records: { type: array, items: { $ref: "#/components/schemas/ActorLog" } }
+                nextCursor: { type: [string, "null"] }
+        ActorLogHistogram:
+            type: object
+            required: [fromMs, bucketMs, buckets]
+            properties:
+                fromMs: { type: integer, minimum: 0 }
+                bucketMs: { type: integer, minimum: 1 }
+                buckets:
+                    type: array
+                    items:
+                        type: object
+                        required: [debug, info, warn, error]
+                        properties:
+                            debug: { type: integer, minimum: 0 }
+                            info: { type: integer, minimum: 0 }
+                            warn: { type: integer, minimum: 0 }
+                            error: { type: integer, minimum: 0 }
         StateAttribution:
             type: [object, "null"]
             required: [operation, connectionId, committedAtMs, interleaved]

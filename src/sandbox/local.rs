@@ -397,6 +397,9 @@ fn host_environment(request: &EnsureHostRequest, directory: &TempDir) -> HashMap
     if let Some(hint) = &request.owner_hint {
         environment.insert("DURABLE_ACTORS_OWNER_HINT".into(), hint.clone());
     }
+    if let Some(endpoint) = &request.otlp_endpoint {
+        environment.insert("OTEL_EXPORTER_OTLP_ENDPOINT".into(), endpoint.clone());
+    }
     for (key, value) in [
         ("DURABLE_ACTORS_PROCESS_ROLE", "host".to_owned()),
         (

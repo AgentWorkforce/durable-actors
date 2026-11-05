@@ -1,6 +1,9 @@
 {{- define "actors.name" -}}
 {{- printf "%s-durable-actors" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+{{- define "actors.collectorName" -}}
+{{- printf "%s-collector" (include "actors.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
 {{- define "actors.sandboxNamespace" -}}
 {{- default (printf "%s-%s" .Release.Namespace .Release.Name | trunc 63 | trimSuffix "-") .Values.sandboxNamespace -}}
 {{- end -}}
@@ -14,6 +17,10 @@
 {{- range $key, $value := .Values.analytics.clickhouse -}}
 {{- if empty $value }}{{ fail (printf "analytics.clickhouse.%s is required" $key) }}{{ end -}}
 {{- end -}}
+{{- end -}}
+{{- if .Values.telemetry.collector.enabled -}}
+{{- if ne .Values.analytics.backend "clickhouse" }}{{ fail "telemetry.collector requires analytics.backend=clickhouse" }}{{ end -}}
+{{- if not .Values.redis.urlSecretKey }}{{ fail "telemetry.collector requires redis.urlSecretKey for live updates" }}{{ end -}}
 {{- end -}}
 {{- if .Values.ingress.enabled -}}
 {{- if or (empty .Values.ingress.className) (empty .Values.ingress.tlsSecret) }}{{ fail "ingress requires className and tlsSecret" }}{{ end -}}

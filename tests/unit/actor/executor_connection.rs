@@ -11,20 +11,20 @@ async fn generic_executor_connects_before_code_and_hydrates_after_assignment() -
     let listener = ActorExecutorListener::bind(&path).await?;
     let peer = tokio::spawn(async move {
         let mut socket = BufReader::new(tokio::net::UnixStream::connect(path).await?);
-        write_json_line(&mut socket, &json!({"type":"warm","protocol":31})).await?;
+        write_json_line(&mut socket, &json!({"type":"warm","protocol":32})).await?;
         let load = read_json_line(&mut socket).await?;
         assert_eq!(load["entrypoint"], "/customer/actors.mjs");
         assert_eq!(load["environment"]["CUSTOMER_KEY"], "value");
         write_json_line(
             &mut socket,
-            &json!({"type":"attach","protocol":31,"actor_names":["counter"]}),
+            &json!({"type":"attach","protocol":32,"actor_names":["counter"]}),
         )
         .await?;
         assert_eq!(
             read_json_line(&mut socket).await?,
             json!({
                 "type": "attached",
-                "protocol": 31,
+                "protocol": 32,
                 "actor": {"project_id": "default", "actor_name": "counter", "actor_id": "one"}
             })
         );
@@ -58,7 +58,7 @@ async fn generic_executor_connects_before_code_and_hydrates_after_assignment() -
         )
         .await?;
     connection
-        .mark_ready(counter(), None, None, None, None)
+        .mark_ready(counter(), None, None, None, None, None)
         .await?;
     let (requested, mut requests) = mpsc::unbounded_channel();
     let database = Arc::new(actor_database::DelayedDatabase {
@@ -94,7 +94,7 @@ async fn residency_reports_are_separate_from_invocation_cache_hints() -> Result<
     let mut peer = BufReader::new(UnixStream::connect(&socket).await?);
     write_json_line(
         &mut peer,
-        &json!({"type":"attach", "protocol":31, "actor_names":["Room"]}),
+        &json!({"type":"attach", "protocol":32, "actor_names":["Room"]}),
     )
     .await?;
     let connection = listener.accept().await?;
@@ -105,6 +105,7 @@ async fn residency_reports_are_separate_from_invocation_cache_hints() -> Result<
                 actor_name: "Room".into(),
                 actor_id: "one".into(),
             },
+            None,
             None,
             None,
             None,
@@ -170,6 +171,7 @@ async fn connection_lookup_is_scoped_to_its_invocation_and_does_not_block_other_
                 requested,
                 release: release.clone(),
             })),
+            None,
             None,
             None,
         )
@@ -312,7 +314,7 @@ async fn shutdown_does_not_wait_for_a_peer_that_stopped_reading() -> Result<()> 
         let mut stream = BufReader::new(stream);
         write_json_line(
             &mut stream,
-            &json!({"type":"attach", "protocol":31, "actor_names":["counter"]}),
+            &json!({"type":"attach", "protocol":32, "actor_names":["counter"]}),
         )
         .await?;
         let _ = read_json_line(&mut stream).await?;
@@ -320,7 +322,7 @@ async fn shutdown_does_not_wait_for_a_peer_that_stopped_reading() -> Result<()> 
     });
     let connection = listener.accept().await?;
     connection
-        .mark_ready(counter(), None, None, None, None)
+        .mark_ready(counter(), None, None, None, None, None)
         .await?;
     let executor = connection.executor();
     let shutdown = CancellationToken::new();
@@ -349,7 +351,7 @@ async fn one_javascript_executor_runs_until_host_shutdown() -> Result<()> {
     let connection = host.accept().await?;
     let executor = connection.executor();
     connection
-        .mark_ready(counter(), None, None, None, None)
+        .mark_ready(counter(), None, None, None, None, None)
         .await?;
     assert!(executor.supports("counter"));
 
@@ -585,7 +587,7 @@ async fn database_calls_without_a_running_command_use_the_activation_database() 
         fail: false,
     });
     executor
-        .mark_ready(counter(), None, None, Some(activation), None)
+        .mark_ready(counter(), None, None, Some(activation), None, None)
         .await?;
     let mut customer = BufReader::new(customer);
     assert_eq!(read_json_line(&mut customer).await?["type"], "attached");
@@ -621,7 +623,7 @@ async fn actor_calls_reply_with_the_hosts_outcome() -> Result<()> {
     let (executor, _running) =
         JsActorExecutor::start(BufReader::new(reader), writer, vec!["counter".into()]);
     executor
-        .mark_ready(counter(), None, None, None, Some(Arc::new(Echo)))
+        .mark_ready(counter(), None, None, None, Some(Arc::new(Echo)), None)
         .await?;
     let mut customer = BufReader::new(customer);
     assert_eq!(read_json_line(&mut customer).await?["type"], "attached");
@@ -639,13 +641,68 @@ async fn actor_calls_reply_with_the_hosts_outcome() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn logs_carry_the_request_id_of_their_running_command() -> Result<()> {
+    struct Captured(Mutex<Vec<ActorLogRecord>>);
+    impl ActorLogSink for Captured {
+        fn emit(&self, record: ActorLogRecord) {
+            self.0.lock().unwrap().push(record);
+        }
+    }
+    let logs = Arc::new(Captured(Mutex::new(Vec::new())));
+    let (host, customer) = UnixStream::pair()?;
+    let (reader, writer) = host.into_split();
+    let (executor, _running) =
+        JsActorExecutor::start(BufReader::new(reader), writer, vec!["counter".into()]);
+    executor
+        .mark_ready(counter(), None, None, None, None, Some(logs.clone()))
+        .await?;
+    let mut customer = BufReader::new(customer);
+    assert_eq!(read_json_line(&mut customer).await?["type"], "attached");
+    let caller = tokio::spawn({
+        let executor = executor.clone();
+        async move {
+            executor
+                .invoke(
+                    invocation("request-1", "increment"),
+                    actor_database::unused(),
+                )
+                .await
+        }
+    });
+    let command = read_json_line(&mut customer).await?;
+    for line in [
+        json!({"type": "log", "message_id": command["message_id"], "level": "info", "message": "inside"}),
+        json!({"type": "log", "message_id": 999, "level": "warn", "message": "unknown"}),
+        json!({"type": "log", "level": "error", "message": "outside"}),
+        json!({"type": "reply", "message_id": command["message_id"], "reply": {"type": "invoked", "result": 1}}),
+    ] {
+        write_json_line(&mut customer, &line).await?;
+    }
+    caller.await??;
+    let record = |request_id: Option<&str>, level, message: &str| ActorLogRecord {
+        request_id: request_id.map(str::to_owned),
+        level,
+        message: message.into(),
+    };
+    assert_eq!(
+        *logs.0.lock().unwrap(),
+        vec![
+            record(Some("request-1"), LogLevel::Info, "inside"),
+            record(None, LogLevel::Warn, "unknown"),
+            record(None, LogLevel::Error, "outside"),
+        ]
+    );
+    Ok(())
+}
+
 async fn database_call_exchange(fail: bool) -> Result<()> {
     let (host, customer) = UnixStream::pair()?;
     let (reader, writer) = host.into_split();
     let (executor, running) =
         JsActorExecutor::start(BufReader::new(reader), writer, vec!["counter".into()]);
     executor
-        .mark_ready(counter(), None, None, None, None)
+        .mark_ready(counter(), None, None, None, None, None)
         .await?;
     let (requested, mut requests) = mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -741,13 +798,13 @@ async fn run_incrementing_customer(socket: PathBuf) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     writer
-        .write_all(b"{\"type\":\"attach\",\"protocol\":31,\"actor_names\":[\"counter\"]}\n")
+        .write_all(b"{\"type\":\"attach\",\"protocol\":32,\"actor_names\":[\"counter\"]}\n")
         .await?;
     ensure!(
         read_json_line(&mut reader).await?
             == json!({
                 "type": "attached",
-                "protocol": 31,
+                "protocol": 32,
                 "actor": {"project_id": "default", "actor_name": "counter", "actor_id": "one"}
             })
     );

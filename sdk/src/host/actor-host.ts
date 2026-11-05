@@ -119,7 +119,7 @@ class ActorSessionConnection {
         const connection = new ActorSessionConnection(socket, supervisor)
         connection.send({
             type: "attach",
-            protocol: 31,
+            protocol: 32,
             actor_names: actorNames
         })
         await connection.waitUntilAttached(timeoutMs)
@@ -190,7 +190,14 @@ class ActorSessionConnection {
                     this.supervisor.assign(
                         message.actor,
                         call => this.callDatabase(call),
-                        call => this.callActor(call)
+                        call => this.callActor(call),
+                        log =>
+                            this.send({
+                                type: "log",
+                                message_id: log.messageId,
+                                level: log.level,
+                                message: log.message
+                            })
                     )
                     this.reportResidency()
                     this.attachedResolve?.()

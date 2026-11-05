@@ -1,7 +1,11 @@
+import { ArrowRight } from "lucide-react"
+
+import { useDrawer } from "../../client/DrawerContext.js"
 import { formatMs, formatMsValue, formatPreciseDateTime } from "../../format.js"
 import { serviceTime } from "../../lib/requestStats.js"
 import { cn } from "../../lib/utils.js"
 import type { RequestOutcome, RequestTrace } from "../../types/Requests.js"
+import { Button } from "../ui/button.js"
 import { DrawerDescription, DrawerHeader, DrawerTitle } from "../ui/drawer.js"
 import { QueueStripes } from "../ui/queueStripes.js"
 
@@ -11,9 +15,10 @@ const kindLabels: Record<RequestTrace["kind"], string> = { method: "Method", web
 export type RequestDetailsProps = {
     call: RequestTrace
     blocker: RequestTrace | undefined
+    onShowLogs: () => void
 }
 
-export function RequestDetails({ call, blocker }: RequestDetailsProps) {
+export function RequestDetails({ call, blocker, onShowLogs }: RequestDetailsProps) {
     const failed = call.outcome !== "completed"
     return (
         <>
@@ -29,12 +34,12 @@ export function RequestDetails({ call, blocker }: RequestDetailsProps) {
                     {kindLabels[call.kind]} · {formatPreciseDateTime(call.startedAtMs)}
                 </DrawerDescription>
             </DrawerHeader>
-            <RequestFacts call={call} blocker={blocker} />
+            <RequestFacts call={call} blocker={blocker} onShowLogs={onShowLogs} />
         </>
     )
 }
 
-function RequestFacts({ call, blocker }: { call: RequestTrace; blocker: RequestTrace | undefined }) {
+function RequestFacts({ call, blocker, onShowLogs }: RequestDetailsProps) {
     const queued = call.queueWaitMs
     const running = queued === null ? null : serviceTime(call)
     const queueShare = queued !== null && call.durationMs > 0 ? (queued / call.durationMs) * 100 : 0
@@ -73,7 +78,22 @@ function RequestFacts({ call, blocker }: { call: RequestTrace; blocker: RequestT
                 <Detail label="Session" value={call.sessionId} mono />
                 {call.connectionId && <Detail label="Connection" value={call.connectionId} mono />}
             </dl>
+            <LogsLink onShowLogs={onShowLogs} />
         </div>
+    )
+}
+
+function LogsLink({ onShowLogs }: { onShowLogs: () => void }) {
+    const drawer = useDrawer()
+    function showLogs() {
+        drawer.close()
+        onShowLogs()
+    }
+    return (
+        <Button variant="link" size="sm" className="mt-3 px-0 text-[13px] has-[>svg]:px-0" onClick={showLogs}>
+            View logs
+            <ArrowRight aria-hidden />
+        </Button>
     )
 }
 

@@ -183,7 +183,8 @@ test("observer proxies actor inventory and hides upstream failures", async t => 
 
 for (const [method, path, event] of [
     ["openActorStream", "/api/observe/events", "inventory"],
-    ["openRequestStream", "/api/observe/requests/events", "requests"]
+    ["openRequestStream", "/api/observe/requests/events", "requests"],
+    ["openLogStream", "/api/observe/logs/events", "logs"]
 ] as const) {
     test(`observer forwards ${event} events and aborts upstream when the viewer disconnects`, async t => {
         let signal: AbortSignal | undefined
@@ -238,6 +239,10 @@ test("observer forwards history filters and opaque replay cursors", async t => {
                 assert.ok(signal)
                 return { records: [], nextCursor: null }
             },
+            listLogs: async query => {
+                assert.deepEqual(Object.fromEntries(query), { actorName: "Room", level: "warn", search: "delta" })
+                return { records: [], nextCursor: null }
+            },
             openRequestStream: async (_signal, after) => {
                 assert.equal(after, "resume+token")
                 return new Response("event: requests\ndata: {}\n\n", {
@@ -260,6 +265,10 @@ test("observer forwards history filters and opaque replay cursors", async t => {
         await (await fetch(`${url}/api/observe/requests/events?after=resume%2Btoken`)).text(),
         /event: requests/u
     )
+    assert.deepEqual(await (await fetch(`${url}/api/observe/logs?actorName=Room&level=warn&search=delta`)).json(), {
+        records: [],
+        nextCursor: null
+    })
 })
 
 test("history proxy rejects writes and cross-origin requests and hides upstream errors", async t => {

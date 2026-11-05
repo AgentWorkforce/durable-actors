@@ -31,6 +31,7 @@ async fn every_replica_warms_ready_spares_without_claiming_them() -> Result<()> 
     with_postgres(async |fixture| {
         let database = PostgresDatabase::connect(&fixture.url).await?;
         let config = PoolConfig {
+            otlp_endpoint: None,
             control_plane_url: None,
             kind: SpareKind::Actor,
             idle: 2,

@@ -193,19 +193,23 @@ fn spare_params(
         .control_plane_url
         .as_ref()
         .context("spare control-plane URL required")?;
+    let mut env = HashMap::from([
+        ("DURABLE_ACTORS_PROCESS_ROLE".into(), "spare".into()),
+        ("DURABLE_ACTORS_SPARE_TOKEN".into(), token.into()),
+        (
+            "DURABLE_ACTORS_CONTROL_PLANE_URL".into(),
+            control_plane.clone(),
+        ),
+        ("DURABLE_ACTORS_SPARE_READY_FILE".into(), READY_FILE.into()),
+        ("TOKIO_WORKER_THREADS".into(), "2".into()),
+    ]);
+    if let Some(endpoint) = &request.otlp_endpoint {
+        env.insert("OTEL_EXPORTER_OTLP_ENDPOINT".into(), endpoint.clone());
+    }
     Ok(SandboxCreateParams {
         name: Some(request.name.clone()),
         command: vec!["/usr/local/bin/durable-actors".into()],
-        env: HashMap::from([
-            ("DURABLE_ACTORS_PROCESS_ROLE".into(), "spare".into()),
-            ("DURABLE_ACTORS_SPARE_TOKEN".into(), token.into()),
-            (
-                "DURABLE_ACTORS_CONTROL_PLANE_URL".into(),
-                control_plane.clone(),
-            ),
-            ("DURABLE_ACTORS_SPARE_READY_FILE".into(), READY_FILE.into()),
-            ("TOKIO_WORKER_THREADS".into(), "2".into()),
-        ]),
+        env,
         cpu: Some(f64::from(request.resources.cpu_millis) / 1000.0),
         cpu_limit: request
             .resources

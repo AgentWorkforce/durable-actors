@@ -23,6 +23,7 @@ use super::{
     ActorHost, HostEndpoint, HostId, HostLeaseMaintainer, LeaseRenewalTask,
     actor_host::{ActorPhase, ActorStatus},
     config::{ActorHostConfig, ExecutorConfig, HostNetwork, InvocationAuth, LeaseTiming},
+    telemetry::HostTelemetry,
 };
 
 const HOST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -86,6 +87,7 @@ pub(super) async fn serve_assigned_host(
         credentials: _credentials,
         storage,
         database,
+        telemetry,
     } = prepared;
     let mut lease_lost = renewal.lease_lost();
     let mut status = host.status();
@@ -104,6 +106,7 @@ pub(super) async fn serve_assigned_host(
             &sockets,
             &database,
             &control_plane,
+            telemetry.as_ref(),
         )
         .await?;
         let mut ready = HostReadiness {
@@ -213,6 +216,9 @@ pub(super) async fn serve_assigned_host(
             .err()
             .map(|error| format!("{error:#}"))
     );
+    if let Some(telemetry) = telemetry {
+        let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    }
     info!(%host_id, "durable-actors host stopped");
     stop_result?;
     renewal_result?;
@@ -225,6 +231,7 @@ async fn initialize_executor(
     sockets: &Arc<super::sockets::HostSockets>,
     database: &Arc<super::HostDatabase>,
     control_plane: &Arc<ControlPlaneClient>,
+    telemetry: Option<&HostTelemetry>,
 ) -> Result<u64> {
     connection
         .mark_ready(
@@ -233,6 +240,7 @@ async fn initialize_executor(
             Some(sockets.clone()),
             Some(database.background(host.actor().clone())),
             Some(control_plane.clone()),
+            telemetry.map(HostTelemetry::log_sink),
         )
         .await?;
     Ok(host.activate().await?.owner_epoch)
@@ -252,6 +260,7 @@ struct PreparedActorHostResources {
     lease: Arc<HostLeaseMaintainer>,
     renewal: LeaseRenewalTask,
     database: Arc<super::HostDatabase>,
+    telemetry: Option<HostTelemetry>,
 }
 
 async fn prepare_actor_host(
@@ -365,19 +374,18 @@ async fn prepare_actor_host(
         storage.clone(),
         control_plane.clone(),
     ));
-    let host = Arc::new(
-        ActorHost::new(
-            endpoint,
-            assignment.actor.clone(),
-            executor_connection.executor(),
-            database.clone(),
-            sockets.clone(),
-        )
-        .with_traces(crate::request_traces::TraceSender::start(
-            control_plane.clone(),
-            storage.stop.child_token(),
-        )),
+    let telemetry = HostTelemetry::from_env(control_plane.authorization())?;
+    let mut host = ActorHost::new(
+        endpoint,
+        assignment.actor.clone(),
+        executor_connection.executor(),
+        database.clone(),
+        sockets.clone(),
     );
+    if let Some(telemetry) = &telemetry {
+        host = host.with_traces(telemetry.tracer());
+    }
+    let host = Arc::new(host);
     timings.lease_registered_at_ms = Some(timings.elapsed_ms());
     Ok(PreparedActorHostResources {
         control_plane,
@@ -393,6 +401,7 @@ async fn prepare_actor_host(
         lease,
         renewal,
         database,
+        telemetry,
     })
 }
 
@@ -654,6 +663,7 @@ fn executor_command(generic: bool, socket: &str, runtime: ActorRuntime) -> Comma
         .env_remove("DURABLE_ACTORS_SPARE_TOKEN")
         .env_remove("DURABLE_ACTORS_RUNTIME_CONFIG")
         .env_remove("DURABLE_ACTORS_HOST_TOKEN")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())

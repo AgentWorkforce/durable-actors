@@ -251,6 +251,21 @@
         "maxConnections"
       ]
     },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "collector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "replicas": {"type": "integer", "minimum": 1},
+            "resources": {"type": "object"}
+          }
+        }
+      }
+    },
     "redis": {
       "type": "object",
       "additionalProperties": false,
@@ -297,7 +312,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "backend": {"enum": ["postgres", "clickhouse"]},
+        "backend": {"enum": ["none", "clickhouse"]},
         "clickhouse": {
           "type": "object",
           "additionalProperties": false,
@@ -322,12 +337,16 @@
         },
         "python": {
           "$ref": "#/definitions/image"
+        },
+        "collector": {
+          "$ref": "#/definitions/image"
         }
       },
       "required": [
         "controlPlane",
         "typescript",
-        "python"
+        "python",
+        "collector"
       ]
     }
   },

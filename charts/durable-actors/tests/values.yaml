@@ -12,3 +12,5 @@ images:
     digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   python:
     digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  collector:
+    digest: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd

@@ -34,6 +34,7 @@ async fn persisted_deployments_cold_start_on_the_current_runtime_without_redeplo
         let provisioner = SandboxHostProvisioner::new(
             Arc::new(Provider::default()),
             HostSandboxRuntimeConfig {
+                otlp_endpoint: None,
                 control_plane_url: "http://control".into(),
                 jwt_issuer: "issuer".into(),
                 invocation_jwt_audience: "invocation".into(),
@@ -372,6 +373,7 @@ fn fixture_with_idle_timeout(
         SandboxHostProvisioner::new(
             provider.clone(),
             HostSandboxRuntimeConfig {
+                otlp_endpoint: None,
                 control_plane_url: "http://control".into(),
                 jwt_issuer: "issuer".into(),
                 invocation_jwt_audience: "invocation".into(),

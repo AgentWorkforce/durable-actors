@@ -682,6 +682,7 @@ impl Stack {
                 Some(source.unwrap_or_else(|| local_sockets.clone())),
                 Some(database.background(host.actor().clone())),
                 None,
+                None,
             )
             .await?;
         host.activate().await?;

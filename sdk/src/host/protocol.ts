@@ -79,7 +79,7 @@ const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
             error: z.string().optional()
         })
         .refine(message => (message.result === undefined) !== (message.error === undefined)),
-    z.object({ type: z.literal("attached"), protocol: z.literal(31), actor: actorIdentitySchema }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(32), actor: actorIdentitySchema }),
     z.object({
         type: z.literal("actor_result"),
         call_id: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -120,10 +120,11 @@ type ActorSessionClientMessage =
     | ReplyMessage
     | { readonly type: "get_connections"; readonly message_id: number; readonly query?: SocketQuery }
     | { readonly type: "socket_effects"; readonly message_id: number; readonly effects: readonly SocketEffect[] }
+    | { readonly type: "log"; readonly message_id?: number; readonly level: LogLevel; readonly message: string }
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 31
+    readonly protocol: 32
     readonly actor_names: readonly string[]
 }
 
@@ -205,11 +206,23 @@ type ActorWorkerMessage =
     | { readonly type: "ready_for_invocation"; readonly messageId: number }
     | { readonly type: "socket_effects"; readonly messageId: number; readonly effects: readonly SocketEffect[] }
     | { readonly type: "get_connections"; readonly messageId: number; readonly query?: SocketQuery }
+    | ActorLog
+
+type LogLevel = "debug" | "info" | "warn" | "error"
+
+interface ActorLog {
+    readonly type: "log"
+    readonly messageId?: number
+    readonly level: LogLevel
+    readonly message: string
+}
 
 type WebSocketEventCommand = z.infer<typeof websocketEventCommandSchema> & AssignedActor
 export { failedReply, parseActorSessionServerMessage }
 export type {
     ActorCallRequest,
+    ActorLog,
+    LogLevel,
     ActorExecutionCommand,
     ActorExecutorCommand,
     ActorExecutorReply,

@@ -17,6 +17,20 @@ use crate::{
 };
 
 use super::{ActorJwtIssuer, admin::AdminService, inspection::ActorInspector};
+use crate::request_traces::{
+    RequestKind, RequestOutcome, RequestTrace, TraceEvent,
+    live::InProcessFeed,
+    logs::ActorLog,
+    otlp::{self, Signal},
+    persistence::sqlite::SqliteTracePersistence,
+};
+use opentelemetry_proto::tonic::{
+    collector::{logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest},
+    common::v1::{AnyValue, KeyValue, any_value},
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+    trace::v1::{ResourceSpans, ScopeSpans, Span},
+};
+use prost::Message;
 
 #[tokio::test]
 async fn inventory_reads_and_streams_filter_projects_before_grouping() -> Result<()> {
@@ -65,10 +79,7 @@ async fn project_observability_isolates_history_metrics_and_streams() -> Result<
                 "startedAtMs": index + 1, "durationMs": duration, "routingMs": 25.0,
                 "queueWaitMs": duration, "outcome": "completed"
             }))?;
-            fixture
-                .traces
-                .record(project, "host", "session", vec![trace], 0)
-                .await?;
+            fixture.record(trace).await?;
         }
     }
     let base = "/v1/projects/alpha/observe";
@@ -127,6 +138,8 @@ async fn project_observability_isolates_history_metrics_and_streams() -> Result<
     for route in [
         "requests",
         "requests/events",
+        "logs",
+        "logs/events",
         "metrics",
         "queue-waits",
         "websockets",
@@ -144,108 +157,6 @@ async fn durability_endpoint_is_not_exposed() -> Result<()> {
         fixture.get("/v1/durability").await?.status(),
         StatusCode::NOT_FOUND
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn committed_clickhouse_traces_stream_across_replicas_and_recover_on_reconnect() -> Result<()>
-{
-    use crate::{
-        redis_client::{Redis, RedisConfig},
-        request_traces::{
-            TraceStore,
-            live::{LiveTraceFeed, LiveTraceUpdate},
-            persistence::clickhouse::{ClickHouseConfig, ClickHouseTracePersistence},
-        },
-    };
-    let (Ok(url), Ok(redis_url)) = (
-        std::env::var("DURABLE_ACTORS_TEST_CLICKHOUSE_URL"),
-        std::env::var("DURABLE_ACTORS_TEST_REDIS_URL"),
-    ) else {
-        return Ok(());
-    };
-    let stop = tokio_util::sync::CancellationToken::new();
-    let _guard = stop.clone().drop_guard();
-    let redis = Redis::connect(&RedisConfig {
-        url: redis_url,
-        ca_cert: None,
-    })?;
-    let mut stores = Vec::new();
-    for _ in 0..2 {
-        let feed = LiveTraceFeed::start(Some(redis.clone()), stop.clone());
-        let mut ready = feed.subscribe();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), ready.recv())
-                .await??
-                .as_ref(),
-            LiveTraceUpdate::Resync
-        ));
-        let mut store = TraceStore::open(Arc::new(ClickHouseTracePersistence::start(
-            ClickHouseConfig {
-                url: url.clone(),
-                database: "trace_test".into(),
-                user: "trace_test".into(),
-                password: "local-test-only".into(),
-            },
-            Duration::from_secs(86400),
-            Arc::new(feed.clone()),
-            stop.clone(),
-        )?))
-        .await?;
-        store.live = Some(feed);
-        stores.push(store);
-    }
-    let writer = stores.remove(0);
-    let fixture = Fixture::start_with_traces(stores.remove(0)).await?;
-    let project = format!("live-{}", uuid::Uuid::new_v4());
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while writer.replay(&project, &Default::default()).await.is_err() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await?;
-    let route = format!("/v1/projects/{project}/observe/requests/events");
-    let mut stream = fixture.get(&route).await?.error_for_status()?;
-    let initial = stream_inventory(&mut stream).await?;
-    assert_eq!(initial["snapshot"], true);
-    assert_eq!(initial["records"], json!([]));
-    let trace = |project: &str, id: &str| {
-        serde_json::from_value(json!({
-            "projectId": project, "requestId": id, "actorName": "Counter", "actorId": "one",
-            "kind": "method", "operation": "increment", "connectionId": null,
-            "startedAtMs": 1000, "durationMs": 1, "routingMs": 0, "queueWaitMs": 0,
-            "outcome": "completed"
-        }))
-    };
-    writer
-        .record(
-            "foreign-live",
-            "host",
-            "session",
-            vec![trace("foreign-live", "private")?],
-            0,
-        )
-        .await?;
-    writer
-        .record(
-            &project,
-            "host",
-            "session",
-            vec![trace(&project, "first")?],
-            0,
-        )
-        .await?;
-    let live =
-        tokio::time::timeout(Duration::from_secs(5), stream_inventory(&mut stream)).await??;
-    assert_ne!(live["snapshot"], true);
-    assert_eq!(live["records"].as_array().unwrap().len(), 1);
-    assert_eq!(live["records"][0]["projectId"], project);
-    assert_eq!(live["records"][0]["requestId"], "first");
-    drop(stream);
-    let mut reconnected = fixture.get(&route).await?.error_for_status()?;
-    let restored = stream_inventory(&mut reconnected).await?;
-    assert_eq!(restored["snapshot"], true);
-    assert_eq!(restored["records"], live["records"]);
     Ok(())
 }
 
@@ -288,6 +199,8 @@ async fn observability_requires_admin_credentials() -> Result<()> {
 struct Fixture {
     lifecycle: LifecycleStore,
     traces: crate::request_traces::TraceStore,
+    telemetry: Arc<SqliteTracePersistence>,
+    live: InProcessFeed,
     changes: crate::postgres::notifications::ChangeFeed,
     admin: AdminService,
     _runtime: RuntimeFixture,
@@ -301,10 +214,14 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Result<Self> {
-        Self::start_with_traces(crate::request_traces::TraceStore::default()).await
+        Self::start_with_telemetry(SqliteTracePersistence::in_memory()).await
     }
 
-    async fn start_with_traces(traces: crate::request_traces::TraceStore) -> Result<Self> {
+    async fn start_with_telemetry(telemetry: SqliteTracePersistence) -> Result<Self> {
+        let telemetry = Arc::new(telemetry);
+        let live = InProcessFeed::default();
+        let traces =
+            crate::request_traces::TraceStore::new(telemetry.clone(), Arc::new(live.clone()));
         let runtime = RuntimeFixture::new()?;
         let store = runtime.runtime.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -334,6 +251,8 @@ impl Fixture {
         Ok(Self {
             lifecycle,
             traces,
+            telemetry,
+            live,
             changes,
             admin,
             _runtime: runtime,
@@ -384,6 +303,21 @@ impl Fixture {
                 },
             })
             .await
+    }
+
+    async fn record(&self, trace: RequestTrace) -> Result<()> {
+        let event = TraceEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            host_id: "host".into(),
+            session_id: "session".into(),
+            trace,
+        };
+        self.telemetry.append(std::slice::from_ref(&event)).await?;
+        self.live.publish(
+            otlp::live_channel(&event.trace.project_id, Signal::Requests),
+            span_request(&event).encode_to_vec(),
+        );
+        Ok(())
     }
 
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
@@ -527,14 +461,9 @@ async fn inventory_includes_unused_deployed_types_without_loading_actors() -> Re
 
 #[tokio::test]
 async fn request_history_streams_distinct_records_and_replays_on_reconnect() -> Result<()> {
-    use crate::request_traces::{
-        RequestKind, RequestOutcome, RequestTrace, TraceStore,
-        persistence::sqlite::SqliteTracePersistence,
-    };
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("request-traces.sqlite3");
-    let open = || TraceStore::open(Arc::new(SqliteTracePersistence::new(path.clone())));
-    let fixture = Fixture::start_with_traces(open().await?).await?;
+    let fixture = Fixture::start_with_telemetry(SqliteTracePersistence::new(path.clone())).await?;
     let mut stream = fixture
         .get("/v1/projects/default/observe/requests/events")
         .await?
@@ -544,36 +473,18 @@ async fn request_history_streams_distinct_records_and_replays_on_reconnect() -> 
     assert_eq!(empty["records"], json!([]));
     for id in ["first", "second"] {
         fixture
-            .traces
-            .record(
-                "default",
-                "host",
-                "session",
-                vec![RequestTrace {
-                    state_version: None,
-                    project_id: "default".into(),
-                    request_id: id.into(),
-                    actor_name: "Room".into(),
-                    actor_id: "one".into(),
-                    kind: RequestKind::Method,
-                    operation: "post".into(),
-                    connection_id: None,
-                    started_at_ms: 1000,
-                    duration_ms: 25.0,
-                    queue_wait_ms: Some(10.0),
-                    host_state: HostState::Warm,
-                    routing_ms: 0.0,
-                    outcome: RequestOutcome::Completed,
-                    metadata: None,
-                }],
-                0,
-            )
+            .record(request_trace(
+                id,
+                "Room",
+                "one",
+                1000,
+                RequestOutcome::Completed,
+            ))
             .await?;
         let page = stream_inventory(&mut stream).await?;
         assert_eq!(page["records"].as_array().unwrap().len(), 1);
         assert_eq!(page["records"][0]["requestId"], id);
         assert_eq!(page["records"][0]["queueWaitMs"], 10.0);
-        assert_eq!(page["epoch"], empty["epoch"]);
     }
     drop(stream);
     let snapshot = serde_json::to_value(
@@ -589,13 +500,104 @@ async fn request_history_streams_distinct_records_and_replays_on_reconnect() -> 
     assert_eq!(snapshot["records"].as_array().unwrap().len(), 2);
     drop(replay);
     drop(fixture);
-    let restarted = Fixture::start_with_traces(open().await?).await?;
+    let restarted = Fixture::start_with_telemetry(SqliteTracePersistence::new(path)).await?;
     let mut replay = restarted
         .get("/v1/projects/default/observe/requests/events")
         .await?;
     let restored = stream_inventory(&mut replay).await?;
     assert_eq!(restored["records"], snapshot["records"]);
     assert_eq!(restored["epoch"], snapshot["epoch"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn log_filters_apply_to_history_live_tail_and_histogram() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    let log = |id: &str, request: Option<&str>, level: &str| ActorLog {
+        log_id: id.into(),
+        project_id: "default".into(),
+        actor_name: "Room".into(),
+        actor_id: "one".into(),
+        host_id: "host".into(),
+        request_id: request.map(str::to_owned),
+        timestamp_ms: 1000,
+        level: level.into(),
+        message: format!("<b>{id}</b>"),
+    };
+    fixture
+        .telemetry
+        .append_logs(vec![
+            log("a", Some("request-1"), "info"),
+            log("b", None, "error"),
+            log("e", None, "debug"),
+        ])
+        .await?;
+    let page: Value = fixture
+        .get("/v1/projects/default/observe/logs?requestId=request-1")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(page["records"][0]["message"], "<b>a</b>");
+    let severe: Value = fixture
+        .get("/v1/projects/default/observe/logs?level=warn")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(severe["records"].as_array().unwrap().len(), 1);
+    assert_eq!(severe["records"][0]["logId"], "b");
+    let found: Value = fixture
+        .get("/v1/projects/default/observe/logs?search=E%3C")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(found["records"][0]["logId"], "e");
+    assert_eq!(found["records"].as_array().unwrap().len(), 1);
+    let histogram: Value = fixture
+        .get("/v1/projects/default/observe/logs/histogram?fromMs=0&toMs=2000&bucketMs=1000")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        histogram["buckets"],
+        serde_json::json!([
+            {"debug": 0, "info": 0, "warn": 0, "error": 0},
+            {"debug": 1, "info": 1, "warn": 0, "error": 1}
+        ])
+    );
+    let mut stream = fixture
+        .get("/v1/projects/default/observe/logs/events?requestId=request-2&level=warn&search=D")
+        .await?
+        .error_for_status()?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.live.publish(
+        otlp::live_channel("default", Signal::Logs),
+        log_request(&[
+            log("c", Some("request-1"), "error"),
+            log("d", Some("request-2"), "warn"),
+            log("f", Some("request-2"), "info"),
+        ])
+        .encode_to_vec(),
+    );
+    let tail = stream_inventory(&mut stream).await?;
+    assert_eq!(tail["records"].as_array().unwrap().len(), 1);
+    assert_eq!(tail["records"][0]["logId"], "d");
+    for invalid in [
+        "logs?limit=501",
+        "logs/histogram?fromMs=0&toMs=2000&bucketMs=1",
+    ] {
+        assert_eq!(
+            fixture
+                .get(&format!("/v1/projects/default/observe/{invalid}"))
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
     Ok(())
 }
 
@@ -740,34 +742,121 @@ async fn record_request(
     actor_name: &str,
     actor_id: &str,
     time: u64,
-    outcome: crate::request_traces::RequestOutcome,
+    outcome: RequestOutcome,
 ) -> Result<()> {
     fixture
-        .traces
-        .record(
-            "default",
-            "host",
-            "session",
-            vec![crate::request_traces::RequestTrace {
-                state_version: None,
-                project_id: "default".into(),
-                request_id: id.into(),
-                actor_name: actor_name.into(),
-                actor_id: actor_id.into(),
-                kind: crate::request_traces::RequestKind::Method,
-                operation: "post".into(),
-                connection_id: None,
-                started_at_ms: time,
-                duration_ms: 25.0,
-                queue_wait_ms: Some(10.0),
-                host_state: HostState::Warm,
-                routing_ms: 0.0,
-                outcome,
-                metadata: None,
-            }],
-            0,
-        )
+        .record(request_trace(id, actor_name, actor_id, time, outcome))
         .await
+}
+
+fn request_trace(
+    id: &str,
+    actor_name: &str,
+    actor_id: &str,
+    time: u64,
+    outcome: RequestOutcome,
+) -> RequestTrace {
+    RequestTrace {
+        state_version: None,
+        project_id: "default".into(),
+        request_id: id.into(),
+        actor_name: actor_name.into(),
+        actor_id: actor_id.into(),
+        kind: RequestKind::Method,
+        operation: "post".into(),
+        connection_id: None,
+        started_at_ms: time,
+        duration_ms: 25.0,
+        queue_wait_ms: Some(10.0),
+        host_state: HostState::Warm,
+        routing_ms: 0.0,
+        outcome,
+        metadata: None,
+    }
+}
+
+fn span_request(event: &TraceEvent) -> ExportTraceServiceRequest {
+    let trace = &event.trace;
+    let mut resource = None;
+    identity(&trace.project_id, &trace.actor_name, &trace.actor_id).stamp(&mut resource);
+    let started = trace.started_at_ms * 1_000_000;
+    let mut attributes = vec![
+        text(otlp::REQUEST_ID, &trace.request_id),
+        text(otlp::KIND, trace.kind.as_str()),
+        text(otlp::OUTCOME, trace.outcome.as_str()),
+        text(otlp::HOST_STATE, trace.host_state.as_str()),
+    ];
+    attributes.extend(
+        trace
+            .queue_wait_ms
+            .map(|wait| text(otlp::QUEUE_WAIT_MS, &wait.to_string())),
+    );
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource,
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    span_id: event.event_id.as_bytes().to_vec(),
+                    name: trace.operation.clone(),
+                    start_time_unix_nano: started,
+                    end_time_unix_nano: started + (trace.duration_ms * 1e6) as u64,
+                    attributes,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn log_request(logs: &[ActorLog]) -> ExportLogsServiceRequest {
+    let mut resource = None;
+    identity("default", "Room", "one").stamp(&mut resource);
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource,
+            scope_logs: vec![ScopeLogs {
+                log_records: logs
+                    .iter()
+                    .map(|log| LogRecord {
+                        time_unix_nano: log.timestamp_ms * 1_000_000,
+                        severity_text: log.level.clone(),
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(log.message.clone())),
+                        }),
+                        attributes: std::iter::once(text(otlp::LOG_ID, &log.log_id))
+                            .chain(log.request_id.iter().map(|id| text(otlp::REQUEST_ID, id)))
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn identity(project_id: &str, actor_name: &str, actor_id: &str) -> otlp::Identity {
+    otlp::Identity {
+        organization_id: None,
+        project_id: project_id.into(),
+        actor_name: actor_name.into(),
+        actor_id: actor_id.into(),
+        host_id: "host".into(),
+        session_id: "session".into(),
+    }
+}
+
+fn text(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.into(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.into())),
+        }),
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -838,38 +927,6 @@ async fn typed_observer_metrics_validate_ranges_and_return_uncached_results() ->
         StatusCode::BAD_REQUEST
     );
     Ok(())
-}
-
-#[tokio::test]
-async fn postgres_request_stream_observes_writes_from_another_control_plane() -> Result<()> {
-    use crate::{
-        postgres::{PostgresDatabase, testing::with_postgres},
-        request_traces::{TraceStore, persistence::postgres::PostgresTracePersistence},
-    };
-    with_postgres(async |database| {
-        let open = async || TraceStore::open(Arc::new(PostgresTracePersistence::new(
-            PostgresDatabase::lazy(&database.url)?, Duration::from_secs(86400),
-        ))).await;
-        let reader = Fixture::start_with_traces(open().await?).await?;
-        let writer = open().await?;
-        let mut stream = reader.get("/v1/projects/alpha/observe/requests/events").await?.error_for_status()?;
-        let initial = tokio::time::timeout(Duration::from_secs(2), stream.chunk()).await??.unwrap();
-        assert!(String::from_utf8(initial.to_vec())?.contains("\"records\":[]"));
-        writer.record("alpha", "host", "session", vec![serde_json::from_value(json!({
-            "projectId": "alpha", "requestId": "remote-instance-request", "actorName": "Room", "actorId": "one",
-            "kind": "method", "operation": "increment", "startedAtMs": 1000, "durationMs": 10.0, "routingMs": 25.0,
-            "queueWaitMs": 1.0, "outcome": "completed"
-        }))?], 0).await?;
-        tokio::time::timeout(Duration::from_secs(7), async {
-            while let Some(chunk) = stream.chunk().await? {
-                if String::from_utf8_lossy(&chunk).contains("remote-instance-request") { return anyhow::Ok(()); }
-            }
-            anyhow::bail!("request stream closed before the shared event arrived")
-        }).await??;
-        let history: Value = reader.get("/v1/projects/alpha/observe/requests").await?.error_for_status()?.json().await?;
-        assert_eq!(history["records"][0]["requestId"], "remote-instance-request");
-        Ok(())
-    }).await
 }
 
 #[tokio::test]

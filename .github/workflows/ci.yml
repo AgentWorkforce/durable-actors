@@ -68,6 +68,28 @@ jobs:
             - name: Check the python image runtime
               run: bash scripts/test-runtime-image.sh durable-actors:ci-python "python"
 
+            - name: Build collector image
+              uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
+              with:
+                  context: .
+                  target: collector
+                  platforms: ${{ matrix.platform }}
+                  load: true
+                  tags: durable-actors:ci-collector
+
+    collector:
+        name: Collector exporter
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+              with:
+                  go-version: "1.26.0"
+                  cache-dependency-path: collector/redisliveexporter/go.sum
+            - name: Test the redislive exporter
+              working-directory: collector/redisliveexporter
+              run: go vet ./... && go test ./...
+
     rust:
         name: Rust runtime
         runs-on: blacksmith-4vcpu-ubuntu-2404

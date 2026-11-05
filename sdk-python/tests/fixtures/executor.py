@@ -26,6 +26,7 @@ class ExecutorHost:
         self.reader = reader
         self.writer = writer
         self.database = database
+        self.logs = []
 
     def send(self, message):
         self.writer.write((json.dumps(message) + "\n").encode())
@@ -35,6 +36,8 @@ class ExecutorHost:
             message = await self.read()
             if message["type"] == "database_call":
                 await self.answer(message)
+            elif message["type"] == "log":
+                self.logs.append(message)
             elif message["type"] != "residency":
                 return message
 
@@ -84,7 +87,7 @@ async def warm_executor(entrypoint, environment):
         try:
             async with asyncio.timeout(10):
                 host = await connected
-                assert await host.receive() == {"type": "warm", "protocol": 31}
+                assert await host.receive() == {"type": "warm", "protocol": 32}
                 host.send({"type": "load", "entrypoint": entrypoint, "environment": environment})
                 attach = await host.receive()
                 assert attach["type"] == "attach"
@@ -92,7 +95,7 @@ async def warm_executor(entrypoint, environment):
                 host.send(
                     {
                         "type": "attached",
-                        "protocol": 31,
+                        "protocol": 32,
                         "actor": {
                             "project_id": "local",
                             "actor_name": actor_name,

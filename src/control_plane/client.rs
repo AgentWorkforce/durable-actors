@@ -55,16 +55,6 @@ impl ControlPlaneClient {
         }
     }
 
-    pub(crate) async fn report_traces(
-        &self,
-        traces: Vec<crate::request_traces::RequestTrace>,
-        dropped: u64,
-    ) -> Result<()> {
-        self.execute(ControlPlaneCommand::RequestTraces { traces, dropped })
-            .await?;
-        Ok(())
-    }
-
     pub(crate) async fn get_alarm(&self) -> Result<Option<i64>> {
         match self.execute(ControlPlaneCommand::GetAlarm).await? {
             ControlPlaneCommandReply::Alarm { timestamp_ms } => Ok(timestamp_ms),
@@ -90,6 +80,10 @@ impl ControlPlaneClient {
             ControlPlaneCommandReply::Invocation { outcome } => Ok(outcome),
             _ => anyhow::bail!("unexpected actor invocation reply"),
         }
+    }
+
+    pub(crate) fn authorization(&self) -> HostAuthorization {
+        HostAuthorization(self.authorization.clone())
     }
 
     pub(crate) fn token_expires_at_ms(&self) -> Result<u64> {
@@ -157,6 +151,23 @@ impl ControlPlaneClient {
                 .max_encoding_message_size(MAX_CONTROL_PLANE_MESSAGE_BYTES),
             authorization: Arc::new(RwLock::new(bearer_authorization(token)?)),
         })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HostAuthorization(Arc<RwLock<MetadataValue<tonic::metadata::Ascii>>>);
+
+impl tonic::service::Interceptor for HostAuthorization {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
+        let authorization = self
+            .0
+            .read()
+            .map_err(|_| tonic::Status::internal("actor authorization lock poisoned"))?
+            .clone();
+        request
+            .metadata_mut()
+            .insert("authorization", authorization);
+        Ok(request)
     }
 }
 

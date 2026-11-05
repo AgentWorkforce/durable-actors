@@ -170,7 +170,7 @@ pub(crate) struct RequestMetadata {
     pub host_state: HostState,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RequestOutcome {
     Completed,

@@ -18,10 +18,6 @@ pub(crate) enum ControlPlaneCommand {
     UpdateAlarm {
         timestamp_ms: Option<i64>,
     },
-    RequestTraces {
-        traces: Vec<crate::request_traces::RequestTrace>,
-        dropped: u64,
-    },
     InvokeActor {
         call: crate::actor::ActorCall,
     },

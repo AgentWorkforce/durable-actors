@@ -9,7 +9,8 @@ use crate::{
     redis_client::{Redis, RedisConfig},
     request_traces::{
         TraceStore,
-        persistence::{clickhouse::ClickHouseTracePersistence, postgres::PostgresTracePersistence},
+        live::{InProcessFeed, LiveFeed, RedisFeed},
+        persistence::{NoTraceQueries, clickhouse::ClickHouseTracePersistence},
     },
     sandbox::{HostSandboxRuntimeConfig, gke::GkeConfig, modal::ModalConfig},
 };
@@ -57,7 +58,7 @@ pub struct ControlPlaneStorageConfig {
 #[derive(Default)]
 pub enum AnalyticsBackend {
     #[default]
-    Postgres,
+    None,
     ClickHouse(super::ClickHouseConfig),
 }
 
@@ -184,13 +185,7 @@ async fn control_plane_routes(
         stop.clone(),
     )
     .await?;
-    let (traces, lifecycle) = telemetry_stores(
-        &config.storage,
-        database.clone(),
-        redis.clone(),
-        stop.clone(),
-    )
-    .await?;
+    let (traces, lifecycle) = telemetry_stores(&config.storage, redis.clone(), stop.clone())?;
     let retention = config
         .jwt_max_lifetime
         .saturating_add(Duration::from_millis(
@@ -297,7 +292,6 @@ async fn control_plane_routes(
     )
     .with_runtime_access(runtime_access)
     .with_alarm_store(Arc::new(super::alarms::PostgresAlarmStore::new(database)))
-    .with_traces(traces)
     .with_socket_event_sink(socket_events);
     if let Some(redis) = redis {
         service.routes = Arc::new(super::routes::RedisRoutes::new(
@@ -316,12 +310,14 @@ async fn control_plane_routes(
         Arc::new(service.lifecycle.clone()),
         service.gateway.as_ref().unwrap().connections.clone(),
     ));
+    let discovery = super::discovery::router(&issuer)?;
     let admin = super::admin::AdminService::new(config.api_key, registry, issuer)?;
     let inspector =
         super::inspection::ActorInspector::new(inventory, storage.clone(), service.changes.clone())
-            .with_traces(service.traces.clone());
+            .with_traces(traces);
     let public_api = super::public_api::router(service.clone(), admin.clone())
-        .merge(super::inspection::router(inspector, admin));
+        .merge(super::inspection::router(inspector, admin))
+        .merge(discovery);
     let internal_api = service.into_internal_service();
     Ok(tonic::service::Routes::from(public_api).add_service(internal_api))
 }
@@ -343,34 +339,28 @@ async fn snapshot_store(
     )?))
 }
 
-async fn telemetry_stores(
+fn telemetry_stores(
     storage: &ControlPlaneStorageConfig,
-    database: PostgresDatabase,
     redis: Option<Redis>,
     stop: tokio_util::sync::CancellationToken,
 ) -> Result<(TraceStore, crate::actor_lifecycle::LifecycleStore)> {
+    let live: Arc<dyn LiveFeed> = match redis {
+        Some(redis) => Arc::new(RedisFeed::new(redis)),
+        None => Arc::new(InProcessFeed::default()),
+    };
     match &storage.analytics {
-        AnalyticsBackend::Postgres => {
-            let persistence = Arc::new(PostgresTracePersistence::new(
-                database,
-                storage.trace_retention,
-            ));
-            let traces = TraceStore::open(persistence.clone()).await?;
-            persistence.start_retention(stop);
-            Ok((traces, Default::default()))
-        }
+        AnalyticsBackend::None => Ok((
+            TraceStore::new(Arc::new(NoTraceQueries), live),
+            Default::default(),
+        )),
         AnalyticsBackend::ClickHouse(config) => {
-            let live = crate::request_traces::live::LiveTraceFeed::start(redis, stop.clone());
             let persistence = Arc::new(ClickHouseTracePersistence::start(
                 config.clone(),
                 storage.trace_retention,
-                Arc::new(live.clone()),
                 stop,
             )?);
-            let mut traces = TraceStore::open(persistence.clone()).await?;
-            traces.live = Some(live);
             Ok((
-                traces,
+                TraceStore::new(persistence.clone(), live),
                 crate::actor_lifecycle::LifecycleStore::new(persistence),
             ))
         }
@@ -651,9 +641,9 @@ fn postgres_max_connections(get: &mut impl FnMut(&str) -> Option<String>) -> Res
 fn analytics_backend(get: &mut impl FnMut(&str) -> Option<String>) -> Result<AnalyticsBackend> {
     match get("DURABLE_ACTORS_ANALYTICS_BACKEND")
         .as_deref()
-        .unwrap_or("postgres")
+        .unwrap_or("none")
     {
-        "postgres" => Ok(AnalyticsBackend::Postgres),
+        "none" => Ok(AnalyticsBackend::None),
         "clickhouse" => Ok(AnalyticsBackend::ClickHouse(super::ClickHouseConfig {
             url: validated_http_url(
                 &required(get, "DURABLE_ACTORS_CLICKHOUSE_URL")?,
@@ -663,7 +653,7 @@ fn analytics_backend(get: &mut impl FnMut(&str) -> Option<String>) -> Result<Ana
             user: required(get, "DURABLE_ACTORS_CLICKHOUSE_USER")?,
             password: required(get, "DURABLE_ACTORS_CLICKHOUSE_PASSWORD")?,
         })),
-        _ => anyhow::bail!("DURABLE_ACTORS_ANALYTICS_BACKEND must be postgres or clickhouse"),
+        _ => anyhow::bail!("DURABLE_ACTORS_ANALYTICS_BACKEND must be none or clickhouse"),
     }
 }
 
@@ -757,6 +747,10 @@ fn sandbox_provider_config(
         "DURABLE_ACTORS_SPARE_IDLE must not exceed DURABLE_ACTORS_SPARE_FLEET_MAX"
     );
     let (backend, regions) = sandbox_backend(get, &control_plane_url)?;
+    let otlp_endpoint = get("DURABLE_ACTORS_OTLP_ENDPOINT")
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(|endpoint| validated_http_url(&endpoint, "DURABLE_ACTORS_OTLP_ENDPOINT"))
+        .transpose()?;
     Ok(SandboxProviderConfig {
         runtime_images: RuntimeImages {
             typescript: runtime_image(get, "DURABLE_ACTORS_TYPESCRIPT_IMAGE")?,
@@ -764,6 +758,7 @@ fn sandbox_provider_config(
         },
         pool: crate::sandbox::pool::PoolConfig {
             control_plane_url: Some(control_plane_url.clone()),
+            otlp_endpoint: otlp_endpoint.clone(),
             kind: crate::sandbox::SpareKind::Actor,
             idle,
             fleet_maximum,
@@ -816,6 +811,7 @@ fn sandbox_provider_config(
         resource_bounds: resource_bounds(get)?,
         runtime: HostSandboxRuntimeConfig {
             control_plane_url,
+            otlp_endpoint,
             jwt_issuer: jwt_issuer.into(),
             invocation_jwt_audience: invocation_audience.into(),
             host_idle_timeout_ms: crate::host::host_idle_timeout_ms(get)?,

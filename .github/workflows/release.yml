@@ -487,13 +487,35 @@ jobs:
                   compression-level: 0
                   retention-days: 1
 
+            - name: Build collector image
+              uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
+              with:
+                  context: .
+                  target: collector
+                  platforms: ${{ matrix.platform }}
+                  outputs: type=docker,dest=${{ runner.temp }}/runtime-image.tar
+                  tags: ${{ env.IMAGE }}:${{ needs.preflight.outputs.version }}-collector-${{ matrix.arch }}
+                  labels: |
+                      org.opencontainers.image.source=https://github.com/TerseAI/durable-actors
+                      org.opencontainers.image.revision=${{ github.sha }}
+                      org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+                      org.opencontainers.image.licenses=MIT
+
+            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                  name: runtime-image-collector-${{ matrix.arch }}
+                  path: ${{ runner.temp }}/runtime-image.tar
+                  if-no-files-found: error
+                  compression-level: 0
+                  retention-days: 1
+
     image-push:
         name: Push runtime image (${{ matrix.target }}, ${{ matrix.arch }})
         needs: [preflight, rust, npm-ci, python-ci, image-build]
         strategy:
             fail-fast: false
             matrix:
-                target: [control-plane, typescript, python]
+                target: [control-plane, typescript, python, collector]
                 arch: [amd64, arm64]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 15
@@ -532,6 +554,7 @@ jobs:
             control-plane-digest: ${{ steps.manifest.outputs.control-plane-digest }}
             typescript-digest: ${{ steps.manifest.outputs.typescript-digest }}
             python-digest: ${{ steps.manifest.outputs.python-digest }}
+            collector-digest: ${{ steps.manifest.outputs.collector-digest }}
         needs: [preflight, image-push]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 10
@@ -558,7 +581,7 @@ jobs:
                   VERSION: ${{ needs.preflight.outputs.version }}
               run: |
                   set -euo pipefail
-                  for target in control-plane typescript python; do
+                  for target in control-plane typescript python collector; do
                       docker buildx imagetools create \
                         --tag "${IMAGE}:${VERSION}-${target}" \
                         --tag "${IMAGE}:latest-${target}" \
@@ -591,6 +614,12 @@ jobs:
                   subject-name: ${{ env.IMAGE }}
                   subject-digest: ${{ steps.manifest.outputs.python-digest }}
 
+            - name: Attest collector image provenance
+              uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+              with:
+                  subject-name: ${{ env.IMAGE }}
+                  subject-digest: ${{ steps.manifest.outputs.collector-digest }}
+
     helm:
         name: Publish Helm chart
         needs: [preflight, image]
@@ -615,7 +644,8 @@ jobs:
                   CONTROL_PLANE_DIGEST: ${{ needs.image.outputs.control-plane-digest }}
                   TYPESCRIPT_DIGEST: ${{ needs.image.outputs.typescript-digest }}
                   PYTHON_DIGEST: ${{ needs.image.outputs.python-digest }}
-              run: bun scripts/pin-chart-image.mjs "$CONTROL_PLANE_DIGEST" "$TYPESCRIPT_DIGEST" "$PYTHON_DIGEST"
+                  COLLECTOR_DIGEST: ${{ needs.image.outputs.collector-digest }}
+              run: bun scripts/pin-chart-image.mjs "$CONTROL_PLANE_DIGEST" "$TYPESCRIPT_DIGEST" "$PYTHON_DIGEST" "$COLLECTOR_DIGEST"
             - run: helm lint charts/durable-actors -f charts/durable-actors/tests/values.yaml
             - run: bun test --timeout 60000 charts/durable-actors/tests/chart.test.mjs tests/scripts/chart-image.test.mjs tests/scripts/python-release.test.mjs
             - run: helm package charts/durable-actors --destination .artifacts/charts

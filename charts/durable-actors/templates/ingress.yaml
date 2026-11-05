@@ -16,6 +16,17 @@ spec:
     - host: {{ (urlParse .Values.publicUrl).hostname | quote }}
       http:
         paths:
+          {{- if .Values.telemetry.collector.enabled }}
+          # Sandboxes outside the cluster export OTLP over gRPC through the ingress.
+          {{- range list "/opentelemetry.proto.collector.trace.v1.TraceService" "/opentelemetry.proto.collector.logs.v1.LogsService" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "actors.collectorName" $ }}
+                port: {number: 4317}
+          {{- end }}
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:

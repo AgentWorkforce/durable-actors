@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-mod live_traces;
+mod live;
 
 use super::{
     admin::AdminService,
@@ -61,6 +61,15 @@ pub(super) fn local_router(inspector: ActorInspector, admin: AdminService) -> Ro
         .route(
             "/v1/projects/{project_id}/observe/requests/events",
             get(request_events),
+        )
+        .route("/v1/projects/{project_id}/observe/logs", get(log_history))
+        .route(
+            "/v1/projects/{project_id}/observe/logs/events",
+            get(log_events),
+        )
+        .route(
+            "/v1/projects/{project_id}/observe/logs/histogram",
+            get(log_histogram),
         )
         .with_state(InspectionApi { inspector, admin })
 }
@@ -333,9 +342,7 @@ async fn request_events(
     query: Result<Query<RequestReplay>, QueryRejection>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    use crate::request_traces::replay::ReplayQuery;
-    use axum::response::sse::{KeepAlive, Sse};
-    use tokio_stream::wrappers::ReceiverStream;
+    use crate::request_traces::{otlp::Signal, replay::ReplayQuery};
     let project = path.0.project_id;
     let Query(replay) = query.map_err(ApiError::bad_request)?;
     let cursor = replay.after.or_else(|| {
@@ -349,21 +356,78 @@ async fn request_events(
         ..Default::default()
     };
     let store = state.inspector.traces;
-    let live = store.live.as_ref().map(|feed| feed.subscribe());
+    let live = store
+        .subscribe(&project, Signal::Requests)
+        .await
+        .map_err(trace_query_error)?;
     let page = store
         .replay(&project, &query)
         .await
         .map_err(trace_query_error)?;
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
-    match live {
-        Some(live) => {
-            tokio::spawn(live_traces::stream(store, project, live, sender, page));
-        }
-        None => {
-            tokio::spawn(stream_requests(store, project, sender, page));
-        }
-    }
-    Ok((
+    tokio::spawn(live::requests(store, project, live, sender, page));
+    Ok(event_stream(receiver))
+}
+
+async fn log_history(
+    State(state): State<InspectionApi>,
+    path: Path<ProjectPath>,
+    query: Result<Query<crate::request_traces::logs::LogQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let project = path.0.project_id;
+    let Query(query) = query.map_err(ApiError::bad_request)?;
+    let page = state
+        .inspector
+        .traces
+        .logs(&project, &query)
+        .await
+        .map_err(trace_query_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(page)).into_response())
+}
+
+async fn log_histogram(
+    State(state): State<InspectionApi>,
+    path: Path<ProjectPath>,
+    query: Result<Query<crate::request_traces::logs::LogHistogramQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(ApiError::bad_request)?;
+    let histogram = state
+        .inspector
+        .traces
+        .log_histogram(&path.0.project_id, &query)
+        .await
+        .map_err(trace_query_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(histogram)).into_response())
+}
+
+async fn log_events(
+    State(state): State<InspectionApi>,
+    path: Path<ProjectPath>,
+    query: Result<Query<crate::request_traces::logs::LogQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    use crate::request_traces::otlp::Signal;
+    let project = path.0.project_id;
+    let Query(filter) = query.map_err(ApiError::bad_request)?;
+    filter.validate().map_err(ApiError::bad_request)?;
+    let live = state
+        .inspector
+        .traces
+        .subscribe(&project, Signal::Logs)
+        .await
+        .map_err(trace_query_error)?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(live::logs(live, filter, project, sender));
+    Ok(event_stream(receiver))
+}
+
+fn event_stream(
+    receiver: tokio::sync::mpsc::Receiver<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+) -> Response {
+    use axum::response::sse::{KeepAlive, Sse};
+    use tokio_stream::wrappers::ReceiverStream;
+    (
         [
             (header::CACHE_CONTROL, "no-store"),
             (header::HeaderName::from_static("x-accel-buffering"), "no"),
@@ -371,50 +435,7 @@ async fn request_events(
         Sse::new(ReceiverStream::new(receiver))
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(10))),
     )
-        .into_response())
-}
-
-async fn stream_requests(
-    store: crate::request_traces::TraceStore,
-    project: String,
-    sender: tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
-    mut page: crate::request_traces::TracePage,
-) {
-    use crate::request_traces::replay::ReplayQuery;
-    use axum::response::sse::Event;
-    loop {
-        let more = page.next_cursor.is_some();
-        let query = ReplayQuery {
-            cursor: Some(page.resume_cursor.clone()),
-            ..Default::default()
-        };
-        let event = Event::default()
-            .event("requests")
-            .id(&page.resume_cursor)
-            .json_data(&page)
-            .expect("serializable trace page");
-        if sender.send(Ok(event)).await.is_err() {
-            return;
-        }
-        if !more {
-            tokio::select! {
-                _ = sender.closed() => return,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-            }
-        }
-        page = match store.replay(&project, &query).await {
-            Ok(page) => page,
-            Err(error) => {
-                tracing::error!(%error, "request trace query failed");
-                let _ = sender
-                    .send(Ok(Event::default()
-                        .event("error")
-                        .data("Request history unavailable")))
-                    .await;
-                return;
-            }
-        };
-    }
+        .into_response()
 }
 
 #[derive(Deserialize)]

@@ -40,7 +40,6 @@ const FALLBACK_REGION: &str = "north-america-central";
 #[derive(Clone)]
 pub struct ControlPlaneService {
     pub(super) lifecycle: crate::actor_lifecycle::LifecycleStore,
-    pub(super) traces: crate::request_traces::TraceStore,
     pub(super) changes: crate::postgres::notifications::ChangeFeed,
     pub(super) region: Option<String>,
     runtime_access: Option<Arc<crate::bucket::access::RuntimeAccess>>,
@@ -83,7 +82,6 @@ impl ControlPlaneService {
     ) -> Self {
         Self {
             lifecycle: Default::default(),
-            traces: crate::request_traces::TraceStore::default(),
             changes: Default::default(),
             runtime_access: None,
             gateway: None,
@@ -130,11 +128,6 @@ impl ControlPlaneService {
         sink: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
     ) -> Self {
         self.socket_events = sink;
-        self
-    }
-
-    pub(crate) fn with_traces(mut self, traces: crate::request_traces::TraceStore) -> Self {
-        self.traces = traces;
         self
     }
 
@@ -536,25 +529,6 @@ impl ControlPlaneService {
             }
             ControlPlaneCommand::SocketOperation { .. } => {
                 anyhow::bail!("socket operation requires authenticated routing")
-            }
-            ControlPlaneCommand::RequestTraces { traces, dropped } => {
-                ensure!(
-                    traces.len() <= crate::request_traces::TRACE_BATCH_SIZE,
-                    "trace batch too large"
-                );
-                for trace in &traces {
-                    trace.validate()?;
-                }
-                self.traces
-                    .record(
-                        &principal.actor.project_id,
-                        principal.host_id.as_str(),
-                        &principal.session_id,
-                        traces,
-                        dropped,
-                    )
-                    .await?;
-                Ok(ControlPlaneCommandReply::Unit)
             }
             ControlPlaneCommand::GetAlarm => {
                 let timestamp_ms = self.alarms.get(&principal.actor).await?;
@@ -1388,6 +1362,7 @@ impl SandboxHostProvisioner {
             host_token,
             jwt_public_keys: self.issuer.verifier_keys_json()?,
             control_plane_url: self.runtime.control_plane_url.clone(),
+            otlp_endpoint: self.runtime.otlp_endpoint.clone(),
             jwt_issuer: self.runtime.jwt_issuer.clone(),
             invocation_jwt_audience: self.runtime.invocation_jwt_audience.clone(),
             image_ref: match &self.runtime_images {

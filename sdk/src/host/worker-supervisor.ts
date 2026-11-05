@@ -13,6 +13,7 @@ import type {
     ActorExecutionCommand,
     ActorExecutorCommand,
     ActorExecutorReply,
+    ActorLog,
     ActorWorkerCommand,
     ActorWorkerData,
     ActorWorkerMessage,
@@ -27,6 +28,7 @@ import type {
     ActorWorkerState,
     ActorWorkerSupervisorOptions,
     DatabaseRequester,
+    LogWriter,
     ResidentActorWorkerOptions,
     SocketPublisher,
     SocketSource
@@ -62,7 +64,8 @@ class ActorWorker implements ActorWorkerHandle {
         data?: ActorWorkerData,
         private onStateChange: () => void = () => {},
         private activationDatabase: DatabaseRequester = unavailableDatabase,
-        private actorCalls: ActorCallRequester = unavailableActorCalls
+        private actorCalls: ActorCallRequester = unavailableActorCalls,
+        private logs: LogWriter = writeToStdio
     ) {
         this.assigned = data !== undefined
         this.warmPromise = new Promise((resolve, reject) => {
@@ -119,6 +122,9 @@ class ActorWorker implements ActorWorkerHandle {
             case "socket_effects":
                 this.pending.get(message.messageId)?.publish?.(message.effects)
                 return
+            case "log":
+                this.logs(message)
+                return
             case "failed":
                 this.stop(new Error(message.message))
                 return
@@ -141,12 +147,14 @@ class ActorWorker implements ActorWorkerHandle {
         data: ActorWorkerData,
         onStateChange: () => void,
         database: DatabaseRequester,
-        calls: ActorCallRequester
+        calls: ActorCallRequester,
+        logs: LogWriter = writeToStdio
     ): void {
         if (this.assigned) throw new Error("customer code already assigned")
         this.onStateChange = onStateChange
         this.activationDatabase = database
         this.actorCalls = calls
+        this.logs = logs
         this.assigned = true
         this.post({ type: "load", data })
     }
@@ -285,6 +293,7 @@ class ActorWorkerSupervisor {
     private identity: ActorIdentity | undefined
     private activationDatabase: DatabaseRequester = unavailableDatabase
     private actorCalls: ActorCallRequester = unavailableActorCalls
+    private logs: LogWriter = writeToStdio
     private closed = false
     private actorNames: readonly string[] | undefined
     private lastSequence = 0
@@ -293,7 +302,8 @@ class ActorWorkerSupervisor {
         this.actorEntrypointUrl = options.actorEntrypointUrl
         this.createWorker =
             options.createWorker ??
-            ((data, onStateChange, database, calls) => new ActorWorker(data, onStateChange, database, calls))
+            ((data, onStateChange, database, calls, logs) =>
+                new ActorWorker(data, onStateChange, database, calls, logs))
         this.preload()
     }
 
@@ -305,12 +315,18 @@ class ActorWorkerSupervisor {
         return this.actorNames
     }
 
-    assign(actor: ActorIdentity, database: DatabaseRequester, calls: ActorCallRequester): void {
+    assign(
+        actor: ActorIdentity,
+        database: DatabaseRequester,
+        calls: ActorCallRequester,
+        logs: LogWriter = writeToStdio
+    ): void {
         if (!this.actorNames?.includes(actor.actor_name))
             throw new Error(`actor name ${actor.actor_name} is not loaded in this customer process`)
         this.identity = { ...actor }
         this.activationDatabase = database
         this.actorCalls = calls
+        this.logs = logs
     }
 
     async handle(
@@ -367,7 +383,8 @@ class ActorWorkerSupervisor {
             { moduleUrl: this.actorEntrypointUrl },
             () => this.notifyResidencyChange(),
             this.callActivationDatabase,
-            this.callActor
+            this.callActor,
+            this.writeLog
         )
         this.speculativeWorker = worker
         void worker.ready().catch(() => this.discardPreload(worker))
@@ -396,7 +413,8 @@ class ActorWorkerSupervisor {
                 createWorker: this.createWorker,
                 onResidencyChange: () => this.notifyResidencyChange(),
                 database: this.callActivationDatabase,
-                calls: this.callActor
+                calls: this.callActor,
+                logs: this.writeLog
             })
             this.resident = actor
         }
@@ -432,6 +450,8 @@ class ActorWorkerSupervisor {
 
     private readonly callActor: ActorCallRequester = call => this.actorCalls(call)
 
+    private readonly writeLog: LogWriter = log => this.logs(log)
+
     private workerCommand(command: ActorExecutorCommand): ActorWorkerCommand {
         if (this.identity === undefined) throw new Error("actor supervisor has no assigned actor")
         return { ...command, actor: this.identity }
@@ -451,6 +471,7 @@ class ResidentActorWorker {
     private readonly onResidencyChange: () => void
     private readonly database: DatabaseRequester
     private readonly calls: ActorCallRequester
+    private readonly logs: LogWriter
     private worker: ActorWorkerHandle | undefined
 
     constructor(options: ResidentActorWorkerOptions) {
@@ -460,6 +481,7 @@ class ResidentActorWorker {
         this.onResidencyChange = options.onResidencyChange
         this.database = options.database
         this.calls = options.calls
+        this.logs = options.logs
         this.worker = options.worker
     }
 
@@ -474,7 +496,8 @@ class ResidentActorWorker {
             { moduleUrl: this.moduleUrl },
             this.onResidencyChange,
             this.database,
-            this.calls
+            this.calls,
+            this.logs
         )
         const worker = this.worker
         this.onResidencyChange()
@@ -511,6 +534,12 @@ class ResidentActorWorker {
         this.worker = undefined
         this.onResidencyChange()
     }
+}
+
+// Before the host session attaches there is no socket, so output keeps going to the terminal.
+function writeToStdio(log: ActorLog): void {
+    const stream = log.level === "warn" || log.level === "error" ? process.stderr : process.stdout
+    stream.write(`${log.message}\n`)
 }
 
 async function unavailableDatabase(): Promise<never> {

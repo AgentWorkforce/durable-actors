@@ -307,3 +307,35 @@ fn session_verification_rejects_invalid_claims_and_tampering() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn host_tokens_carry_flat_telemetry_claims() -> Result<()> {
+    let issuer = socket_issuer()?;
+    let issued = issuer.issue_host(
+        "org-test",
+        &HostId::new("host.v3.r1.one"),
+        "session-1",
+        "r1",
+        "us-east",
+        &ActorKey {
+            project_id: "default".into(),
+            actor_name: "Counter".into(),
+            actor_id: "one".into(),
+        },
+    )?;
+    let payload = issued.token.split('.').nth(1).context("JWT payload")?;
+    let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    assert!(
+        claims["aud"]
+            .as_array()
+            .context("audiences")?
+            .contains(&TELEMETRY_AUDIENCE.into())
+    );
+    assert_eq!(claims["projectId"], "default");
+    assert_eq!(claims["actorName"], "Counter");
+    assert_eq!(claims["actorId"], "one");
+    assert_eq!(claims["organizationId"], "org-test");
+    assert_eq!(claims["sessionId"], "session-1");
+    assert_eq!(claims["sub"], "host.v3.r1.one");
+    Ok(())
+}

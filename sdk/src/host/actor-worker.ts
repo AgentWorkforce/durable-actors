@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks"
+import { format } from "node:util"
 import { parentPort, workerData } from "node:worker_threads"
 import type { TransferListItem } from "node:worker_threads"
 
@@ -17,7 +18,7 @@ import { DatabaseProxy } from "./database.js"
 import type { DatabaseCall, DatabaseResult } from "./database.js"
 import { HostActorClient } from "./host-actor-client.js"
 import { failedReply } from "./protocol.js"
-import type { ActorCallRequest, ActorWorkerData, ActorWorkerMessage, ActorWorkerRequest } from "./protocol.js"
+import type { ActorCallRequest, ActorWorkerData, ActorWorkerMessage, ActorWorkerRequest, LogLevel } from "./protocol.js"
 
 const port = parentPort
 if (port === null) throw new Error("actor Worker requires a parent message port")
@@ -31,6 +32,8 @@ process.once("exit", () => {
 
 let assigned = false
 const invocation = new AsyncLocalStorage<number>()
+const LOG_LIMIT_BYTES = 256 * 1024
+captureConsole()
 const loadingConnections = new Map<
     number,
     { resolve: (connections: SocketLookup) => void; reject: (error: Error) => void }
@@ -106,6 +109,26 @@ async function initialize(data: ActorWorkerData): Promise<void> {
 
 function post(message: ActorWorkerMessage, transfer?: readonly TransferListItem[]): void {
     if (!exiting) port!.postMessage(message, transfer)
+}
+
+// Console output travels to the host tagged with the invocation that wrote it, instead of stdout.
+function captureConsole(): void {
+    const levels = [
+        ["debug", "debug"],
+        ["log", "info"],
+        ["info", "info"],
+        ["warn", "warn"],
+        ["error", "error"]
+    ] as const satisfies readonly (readonly [keyof Console, LogLevel])[]
+    for (const [method, level] of levels)
+        console[method] = (...args: unknown[]) =>
+            post({ type: "log", messageId: invocation.getStore(), level, message: truncateLog(format(...args)) })
+}
+
+function truncateLog(message: string): string {
+    if (message.length * 3 <= LOG_LIMIT_BYTES) return message
+    const bytes = Buffer.from(message)
+    return bytes.length <= LOG_LIMIT_BYTES ? message : bytes.subarray(0, LOG_LIMIT_BYTES).toString()
 }
 
 function allowNextInvocation(): void {

@@ -38,7 +38,7 @@ export function DrawerProvider({ children }: { children: ReactNode }) {
                     className="bg-card font-satoshi text-card-foreground antialiased shadow-(--shadow-dialog) data-[vaul-drawer-direction=right]:w-full"
                     onCloseAutoFocus={event => {
                         event.preventDefault()
-                        trigger.current?.focus()
+                        trigger.current?.focus({ preventScroll: true })
                     }}
                 >
                     {state.entry?.content}

@@ -44,3 +44,6 @@
 !third_party/terse-litestream
 !third_party/terse-litestream/LICENSE
 !third_party/terse-litestream/NOTICE
+!collector
+!collector/**
+collector/build

@@ -19,6 +19,8 @@ use crate::{
 };
 
 const HOST_TOKEN_TTL: Duration = Duration::from_secs(1_800);
+pub(crate) const TELEMETRY_AUDIENCE: &str = "durable-actors-telemetry";
+pub(crate) const JWKS_PATH: &str = "/.well-known/jwks.json";
 const INVOCATION_TARGET_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -199,6 +201,17 @@ impl ActorJwtIssuer {
         })?)
     }
 
+    /// OpenID discovery only works when the issuer is the URL that serves this document.
+    pub(crate) fn openid_configuration(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "issuer": self.issuer,
+            "jwks_uri": format!("{}{JWKS_PATH}", self.issuer.trim_end_matches('/')),
+            "response_types_supported": ["id_token"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["EdDSA"],
+        }))?)
+    }
+
     pub(crate) fn issue_host(
         &self,
         organization_id: &str,
@@ -218,6 +231,7 @@ impl ActorJwtIssuer {
             aud: vec![
                 self.authority_audience.clone(),
                 self.invocation_audience.clone(),
+                TELEMETRY_AUDIENCE.into(),
             ],
             sub: host_id.as_str().to_owned(),
             process_id: host_id.as_str().to_owned(),
@@ -229,6 +243,11 @@ impl ActorJwtIssuer {
             nbf: now_ms / 1000,
             exp: expires_at_ms / 1000,
             invocation: None,
+            telemetry: Some(TelemetryClaims {
+                project_id: actor.project_id.clone(),
+                actor_name: actor.actor_name.clone(),
+                actor_id: actor.actor_id.clone(),
+            }),
             actor: actor.clone(),
         })
     }
@@ -275,6 +294,7 @@ impl ActorJwtIssuer {
             nbf: now,
             exp: expires_at,
             actor: actor.clone(),
+            telemetry: None,
             invocation: Some(ActorInvocationCapability {
                 route: super::gateway::backend_origin(route)?.to_string(),
                 actor: actor.clone(),
@@ -328,6 +348,17 @@ struct ActorJwtClaims {
     exp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     invocation: Option<ActorInvocationCapability>,
+    // Top-level copies of the actor key so the telemetry collector can read them as flat claims.
+    #[serde(flatten)]
+    telemetry: Option<TelemetryClaims>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TelemetryClaims {
+    project_id: String,
+    actor_name: String,
+    actor_id: String,
 }
 
 fn unix_millis() -> Result<i64> {

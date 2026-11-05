@@ -1,0 +1,62 @@
+# Hosts are untrusted: every export needs a host JWT for the telemetry audience, and tenant
+# identity comes only from its verified claims. The collector fetches the verifying keys from
+# the control plane at startup and again whenever a signature fails, so it restarts until the
+# control plane is reachable. Everything else stays at component defaults.
+extensions:
+  health_check:
+    # The default binds localhost, which Kubernetes probes can't reach.
+    endpoint: 0.0.0.0:13133
+  oidc:
+    providers:
+      - issuer_url: ${env:JWT_ISSUER}
+        audience: durable-actors-telemetry
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # The OTLP spec's recommended default; the receiver still uses gRPC's 4 MiB.
+        max_recv_msg_size_mib: 64
+        auth:
+          authenticator: oidc
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+  resource/tenant:
+    attributes:
+      - {pattern: ^durable_actors\., action: delete}
+      - {key: durable_actors.organization_id, from_context: auth.claims.organizationId, action: insert}
+      - {key: durable_actors.project_id, from_context: auth.claims.projectId, action: insert}
+      - {key: durable_actors.actor_name, from_context: auth.claims.actorName, action: insert}
+      - {key: durable_actors.actor_id, from_context: auth.claims.actorId, action: insert}
+      - {key: durable_actors.host_id, from_context: auth.claims.sub, action: insert}
+      - {key: durable_actors.session_id, from_context: auth.claims.sessionId, action: insert}
+
+exporters:
+  clickhouse:
+    endpoint: ${env:CLICKHOUSE_URL}
+    database: ${env:CLICKHOUSE_DATABASE}
+    username: ${env:CLICKHOUSE_USER}
+    password: ${env:CLICKHOUSE_PASSWORD}
+    # The control plane owns the schema (src/request_traces/persistence/clickhouse/schema.sql).
+    create_schema: false
+    sending_queue:
+      batch: {}
+  redislive:
+    endpoint: ${env:REDIS_URL}
+    ca_file: ${env:REDIS_CA_FILE}
+
+service:
+  extensions: [health_check, oidc]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/tenant]
+      exporters: [clickhouse, redislive]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/tenant]
+      exporters: [clickhouse, redislive]

@@ -25,14 +25,14 @@ fn usage_publishing_is_opt_in() -> Result<()> {
 }
 
 #[test]
-fn analytics_defaults_to_postgres_and_clickhouse_is_opt_in() -> Result<()> {
+fn analytics_defaults_to_none_and_clickhouse_is_opt_in() -> Result<()> {
     let mut values = process_environment();
     let parse = |values: &HashMap<&str, &str>| {
         ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|value| (*value).into()))
     };
     assert!(matches!(
         parse(&values)?.storage.analytics,
-        AnalyticsBackend::Postgres
+        AnalyticsBackend::None
     ));
     values.insert("DURABLE_ACTORS_ANALYTICS_BACKEND", "clickhouse");
     assert!(parse(&values).is_err());

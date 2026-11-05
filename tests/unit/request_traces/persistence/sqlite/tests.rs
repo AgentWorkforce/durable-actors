@@ -1,4 +1,4 @@
-use super::super::contract_tests::event;
+use super::fixtures::event;
 use super::*;
 
 #[tokio::test]

@@ -228,11 +228,17 @@ fn spare_pod(request: &CreateSpareRequest, zones: &[String], token: &str) -> Res
     let mut pod = base_pod(&request.name, &request.image_ref, zones, &request.resources);
     pod["metadata"]["annotations"] =
         json!({"cluster-autoscaler.kubernetes.io/safe-to-evict": "true"});
-    pod["spec"]["containers"][0]["env"] = json!([
+    let mut env = json!([
         {"name":"DURABLE_ACTORS_PROCESS_ROLE", "value":"spare"},
         {"name":"DURABLE_ACTORS_SPARE_TOKEN", "value":token},
         {"name":"DURABLE_ACTORS_CONTROL_PLANE_URL", "value":request.control_plane_url.as_ref().context("spare control plane URL required")?}
     ]);
+    if let Some(endpoint) = &request.otlp_endpoint {
+        env.as_array_mut()
+            .expect("env list")
+            .push(json!({"name":"OTEL_EXPORTER_OTLP_ENDPOINT", "value":endpoint}));
+    }
+    pod["spec"]["containers"][0]["env"] = env;
     pod["spec"]["containers"][0]["readinessProbe"] = json!({"exec":{"command":["/usr/bin/test", "-f", "/tmp/durable-actors-spare-ready"]}, "periodSeconds":1, "failureThreshold":3});
     Ok(serde_json::from_value(pod)?)
 }

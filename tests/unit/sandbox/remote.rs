@@ -122,6 +122,7 @@ fn request() -> Result<EnsureHostRequest> {
         session_id: uuid::Uuid::new_v4().to_string(),
         host_token: "host-jwt".into(),
         jwt_public_keys: "{}".into(),
+        otlp_endpoint: None,
         control_plane_url: "http://control:7100".into(),
         jwt_issuer: "issuer".into(),
         invocation_jwt_audience: "invoke".into(),

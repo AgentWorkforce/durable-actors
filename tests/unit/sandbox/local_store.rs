@@ -74,6 +74,7 @@ fn request(id: &str) -> EnsureHostRequest {
         session_id: format!("session-{id}"),
         host_token: "unused".into(),
         jwt_public_keys: "unused".into(),
+        otlp_endpoint: None,
         control_plane_url: "http://127.0.0.1:7100".into(),
         jwt_issuer: "local".into(),
         invocation_jwt_audience: "local".into(),

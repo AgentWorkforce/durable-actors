@@ -1,147 +1,81 @@
-use std::{sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
-use tokio_util::sync::CancellationToken;
+use async_trait::async_trait;
+use futures_util::{Stream, StreamExt, stream};
+use tokio::sync::broadcast;
 
-use super::{TRACE_BATCH_SIZE, TraceEvent};
 use crate::redis_client::Redis;
 
-const CHANNEL: &str = "durable-actors:v1:traces";
+/// Each item is one OTLP export request (traces or logs) for the subscribed channel.
+pub(crate) type LiveStream = Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>;
 
-pub(crate) trait CommittedTracePublisher: Send + Sync {
-    fn publish(&self, events: &[TraceEvent]);
+#[async_trait]
+pub(crate) trait LiveFeed: Send + Sync {
+    async fn subscribe(&self, channel: String) -> Result<LiveStream>;
+}
+
+/// Receives what the collector's Redis exporter publishes.
+pub(crate) struct RedisFeed {
+    redis: Redis,
+}
+
+impl RedisFeed {
+    pub(crate) fn new(redis: Redis) -> Self {
+        Self { redis }
+    }
+}
+
+#[async_trait]
+impl LiveFeed for RedisFeed {
+    async fn subscribe(&self, channel: String) -> Result<LiveStream> {
+        let mut subscriber = self.redis.pubsub().await?;
+        tokio::time::timeout(Duration::from_secs(5), subscriber.subscribe(&channel)).await??;
+        Ok(Box::pin(
+            subscriber
+                .into_on_message()
+                .map(|message| message.get_payload_bytes().to_vec()),
+        ))
+    }
 }
 
 #[derive(Clone)]
-pub(crate) struct LiveTraceFeed {
-    updates: broadcast::Sender<Arc<LiveTraceUpdate>>,
-    outgoing: Option<mpsc::Sender<Arc<LiveTraceUpdate>>>,
+pub(crate) struct InProcessFeed {
+    updates: broadcast::Sender<Arc<(String, Vec<u8>)>>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) enum LiveTraceUpdate {
-    Batch(Vec<TraceEvent>),
-    Resync,
-}
-
-impl Default for LiveTraceFeed {
+impl Default for InProcessFeed {
     fn default() -> Self {
         Self {
-            updates: broadcast::channel(128).0,
-            outgoing: None,
+            updates: broadcast::channel(256).0,
         }
     }
 }
 
-impl LiveTraceFeed {
-    pub(crate) fn start(redis: Option<Redis>, stop: CancellationToken) -> Self {
-        let mut feed = Self::default();
-        if let Some(redis) = redis {
-            let origin = uuid::Uuid::new_v4().to_string();
-            let (sender, receiver) = mpsc::channel(128);
-            feed.outgoing = Some(sender);
-            tokio::spawn(publish_batches(
-                redis.clone(),
-                origin.clone(),
-                receiver,
-                stop.clone(),
-            ));
-            tokio::spawn(subscribe(redis, origin, feed.updates.clone(), stop));
-        }
-        feed
-    }
-
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Arc<LiveTraceUpdate>> {
-        self.updates.subscribe()
+impl InProcessFeed {
+    pub(crate) fn publish(&self, channel: String, payload: Vec<u8>) {
+        let _ = self.updates.send(Arc::new((channel, payload)));
     }
 }
 
-impl CommittedTracePublisher for LiveTraceFeed {
-    fn publish(&self, events: &[TraceEvent]) {
-        for events in events.chunks(TRACE_BATCH_SIZE) {
-            let update = Arc::new(LiveTraceUpdate::Batch(events.to_vec()));
-            let _ = self.updates.send(update.clone());
-            if let Some(outgoing) = &self.outgoing {
-                if outgoing.try_send(update).is_err() {
-                    tracing::warn!("Live trace broadcast queue full; dashboards will reconcile");
+#[async_trait]
+impl LiveFeed for InProcessFeed {
+    async fn subscribe(&self, channel: String) -> Result<LiveStream> {
+        let updates = self.updates.subscribe();
+        Ok(Box::pin(stream::unfold(
+            (updates, channel),
+            |(mut updates, channel)| async move {
+                loop {
+                    match updates.recv().await {
+                        Ok(update) if update.0 == channel => {
+                            let payload = update.1.clone();
+                            return Some((payload, (updates, channel)));
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
                 }
-            }
-        }
+            },
+        )))
     }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Envelope<T> {
-    origin: String,
-    update: T,
-}
-
-async fn publish_batches(
-    redis: Redis,
-    origin: String,
-    mut receiver: mpsc::Receiver<Arc<LiveTraceUpdate>>,
-    stop: CancellationToken,
-) {
-    let work = async {
-        while let Some(update) = receiver.recv().await {
-            let result = async {
-                let payload = serde_json::to_string(&Envelope {
-                    origin: origin.clone(),
-                    update: update.as_ref(),
-                })?;
-                let mut command = redis::cmd("PUBLISH");
-                command.arg(CHANNEL).arg(payload);
-                redis.run::<usize>(command).await?;
-                anyhow::Ok(())
-            }
-            .await;
-            if let Err(error) = result {
-                tracing::warn!(%error, "Live trace broadcast failed; dashboards will reconcile");
-            }
-        }
-    };
-    tokio::select! { _ = stop.cancelled() => {}, _ = work => {} }
-}
-
-async fn subscribe(
-    redis: Redis,
-    origin: String,
-    updates: broadcast::Sender<Arc<LiveTraceUpdate>>,
-    stop: CancellationToken,
-) {
-    loop {
-        let result = tokio::select! {
-            _ = stop.cancelled() => return,
-            result = listen(&redis, &origin, &updates) => result,
-        };
-        if let Err(error) = result {
-            tracing::warn!(%error, "Live trace subscription disconnected; dashboards will reconcile");
-        }
-        tokio::select! {
-            _ = stop.cancelled() => return,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-        }
-    }
-}
-
-async fn listen(
-    redis: &Redis,
-    origin: &str,
-    updates: &broadcast::Sender<Arc<LiveTraceUpdate>>,
-) -> Result<()> {
-    let mut subscriber = redis.pubsub().await?;
-    tokio::time::timeout(Duration::from_secs(5), subscriber.subscribe(CHANNEL)).await??;
-    let _ = updates.send(Arc::new(LiveTraceUpdate::Resync));
-    let mut messages = subscriber.on_message();
-    while let Some(message) = messages.next().await {
-        let envelope: Envelope<LiveTraceUpdate> =
-            serde_json::from_slice(message.get_payload_bytes())?;
-        if envelope.origin != origin {
-            let _ = updates.send(Arc::new(envelope.update));
-        }
-    }
-    anyhow::bail!("Redis trace subscription closed")
 }

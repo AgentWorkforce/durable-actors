@@ -91,6 +91,8 @@ impl SpareKind {
 pub struct CreateSpareRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_plane_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
     pub kind: SpareKind,
     pub name: String,
     pub image_ref: String,
@@ -119,6 +121,8 @@ pub struct EnsureHostRequest {
     pub host_token: String,
     pub jwt_public_keys: String,
     pub control_plane_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
     pub jwt_issuer: String,
     pub invocation_jwt_audience: String,
     pub image_ref: String,
@@ -218,6 +222,7 @@ pub trait SandboxProvider: Send + Sync {
 #[derive(Clone)]
 pub struct HostSandboxRuntimeConfig {
     pub control_plane_url: String,
+    pub otlp_endpoint: Option<String>,
     pub jwt_issuer: String,
     pub invocation_jwt_audience: String,
     pub host_idle_timeout_ms: u64,

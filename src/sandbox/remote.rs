@@ -103,6 +103,7 @@ impl SandboxProvider for RemoteSandboxProvider {
             None => {
                 self.create_spare(&CreateSpareRequest {
                     control_plane_url: Some(request.control_plane_url.clone()),
+                    otlp_endpoint: request.otlp_endpoint.clone(),
                     kind: SpareKind::Actor,
                     name: format!("do-actor-{}", request.session_id),
                     image_ref: request.image_ref.clone(),

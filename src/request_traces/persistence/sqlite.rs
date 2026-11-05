@@ -8,18 +8,20 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, Transaction, params};
 use serde::Deserialize;
 
-use super::{TracePersistence, TraceStatus};
+use super::TraceQueries;
 use crate::request_traces::{
     TraceEvent, TracePage,
     history::HistoryQuery,
+    logs::{ActorLog, LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, SocketSession, TimeRange},
     replay::ReplayQuery,
 };
 
 mod history;
+mod logs;
 mod metrics;
 mod replay;
 
@@ -57,7 +59,8 @@ impl SqliteTracePersistence {
                     Connection::open(&path).context("open request trace database")?;
                 connection.busy_timeout(Duration::from_secs(5))?;
                 initialize(&mut connection, &path)?;
-                connection.execute_batch("CREATE TABLE IF NOT EXISTS trace_status(project_id TEXT PRIMARY KEY,dropped INTEGER NOT NULL DEFAULT 0,persistence_failed INTEGER NOT NULL DEFAULT 0)")?;
+                logs::initialize(&connection)?;
+                connection.execute_batch("DROP TABLE IF EXISTS trace_status")?;
                 *shared = Some(connection);
             }
             operation(shared.as_mut().unwrap())
@@ -66,41 +69,8 @@ impl SqliteTracePersistence {
     }
 }
 
-#[async_trait]
-impl TracePersistence for SqliteTracePersistence {
-    async fn initialize(&self) -> Result<()> {
-        self.run(|_| Ok(())).await
-    }
-
-    async fn record_status(&self, project: &str, dropped: u64, failed: bool) -> Result<()> {
-        let project = project.to_owned();
-        self.run(move |db| {
-            db.execute("INSERT INTO trace_status(project_id,dropped,persistence_failed) VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET dropped=CAST(MIN(9223372036854775807,dropped+excluded.dropped) AS INTEGER),persistence_failed=persistence_failed OR excluded.persistence_failed", params![project, dropped.min(i64::MAX as u64) as i64, failed])?;
-            Ok(())
-        }).await
-    }
-
-    async fn status(&self, project: &str) -> Result<TraceStatus> {
-        let project = project.to_owned();
-        self.run(move |db| {
-            Ok(db
-                .query_row(
-                    "SELECT dropped,persistence_failed FROM trace_status WHERE project_id=?1",
-                    [project],
-                    |row| {
-                        Ok(TraceStatus {
-                            dropped: row.get::<_, i64>(0)? as u64,
-                            persistence_failed: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()?
-                .unwrap_or_default())
-        })
-        .await
-    }
-
-    async fn append(&self, events: &[TraceEvent]) -> Result<()> {
+impl SqliteTracePersistence {
+    pub(crate) async fn append(&self, events: &[TraceEvent]) -> Result<()> {
         let events = events.to_vec();
         let retention = self.retention;
         self.run(move |connection| {
@@ -117,6 +87,15 @@ impl TracePersistence for SqliteTracePersistence {
         }).await
     }
 
+    pub(crate) async fn append_logs(&self, records: Vec<ActorLog>) -> Result<()> {
+        let retention = self.retention;
+        self.run(move |connection| logs::append(connection, &records, retention))
+            .await
+    }
+}
+
+#[async_trait]
+impl TraceQueries for SqliteTracePersistence {
     async fn metrics(&self, project_id: &str, query: &TimeRange) -> Result<OverviewMetrics> {
         let project_id = project_id.to_owned();
         let query = query.clone();
@@ -153,6 +132,24 @@ impl TracePersistence for SqliteTracePersistence {
         let project_id = project_id.to_owned();
         let query = query.clone();
         self.run(move |connection| replay::query(connection, &project_id, &query))
+            .await
+    }
+
+    async fn logs(&self, project_id: &str, query: &LogQuery) -> Result<LogPage> {
+        let project_id = project_id.to_owned();
+        let query = query.clone();
+        self.run(move |connection| logs::query(connection, &project_id, &query))
+            .await
+    }
+
+    async fn log_histogram(
+        &self,
+        project_id: &str,
+        query: &LogHistogramQuery,
+    ) -> Result<LogHistogram> {
+        let project_id = project_id.to_owned();
+        let query = query.clone();
+        self.run(move |connection| logs::histogram(connection, &project_id, &query))
             .await
     }
 }
@@ -267,6 +264,10 @@ struct LegacySnapshot {
 struct LegacyHistory {
     records: Vec<serde_json::Value>,
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/request_traces/persistence/sqlite/fixtures.rs"]
+mod fixtures;
 
 #[cfg(test)]
 #[path = "../../../tests/unit/request_traces/persistence/sqlite/tests.rs"]

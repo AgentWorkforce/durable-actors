@@ -10,7 +10,6 @@ pub(super) struct Metadata {
     pub generation: String,
     pub head: u64,
     pub pruned: u64,
-    pub evicted: u64,
 }
 
 pub(super) struct HistoryPage {
@@ -71,9 +70,6 @@ impl HistoryPage {
             epoch: self.metadata.generation,
             cursor: self.watermark,
             capacity: limit,
-            evicted: self.metadata.evicted,
-            dropped: 0,
-            persistence_failed: false,
             records,
             next_cursor,
             reset: self.reset,
@@ -171,9 +167,6 @@ impl ReplayPage {
             epoch: self.metadata.generation,
             cursor: position,
             capacity: limit,
-            evicted: self.metadata.evicted,
-            dropped: 0,
-            persistence_failed: false,
             records,
             next_cursor: more.then(|| resume_cursor.clone()),
             resume_cursor,

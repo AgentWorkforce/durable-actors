@@ -1,4 +1,4 @@
-use super::super::contract_tests::event;
+use super::fixtures::event;
 use super::*;
 use crate::request_traces::{
     RequestKind, RequestOutcome,
@@ -15,7 +15,6 @@ async fn replay_metadata_counts_only_the_requested_project() -> Result<()> {
     store.append(&records).await?;
     let page = store.replay("other", &ReplayQuery::default()).await?;
     assert_eq!(page.records.len(), 1);
-    assert_eq!(page.evicted, 0);
     assert_eq!(
         store.replay("empty", &ReplayQuery::default()).await?.cursor,
         0

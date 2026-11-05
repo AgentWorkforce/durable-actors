@@ -77,6 +77,10 @@ spec:
             - {name: DURABLE_ACTORS_ALARM_POLL_INTERVAL_MS, value: {{ $.Values.alarms.pollIntervalMs | quote }}}
             - {name: DURABLE_ACTORS_POSTGRES_MAX_CONNECTIONS, value: {{ $.Values.postgres.maxConnections | quote }}}
             - {name: DURABLE_ACTORS_ANALYTICS_BACKEND, value: {{ $.Values.analytics.backend | quote }}}
+            {{- if $.Values.telemetry.collector.enabled }}
+            - name: DURABLE_ACTORS_OTLP_ENDPOINT
+              value: {{ printf "http://%s.%s.svc.cluster.local:4317" (include "actors.collectorName" $) $.Release.Namespace | quote }}
+            {{- end }}
             {{- with $.Values.usage.topic }}
             - {name: DURABLE_ACTORS_USAGE_TOPIC, value: {{ . | quote }}}
             {{- end }}
@@ -95,6 +99,8 @@ spec:
             - name: DURABLE_ACTORS_CONTROL_PLANE_URL
               value: {{ printf "http://%s.%s.svc.cluster.local:7100" (include "actors.name" $) $.Release.Namespace | quote }}
             - {name: DURABLE_ACTORS_PUBLIC_URL, value: {{ $.Values.publicUrl | quote }}}
+            # The collector discovers token keys at <issuer>/.well-known/openid-configuration.
+            - {name: DURABLE_ACTORS_JWT_ISSUER, value: {{ $.Values.publicUrl | quote }}}
             - {name: DURABLE_ACTORS_TYPESCRIPT_IMAGE, value: {{ include "actors.image" $.Values.images.typescript | quote }}}
             - {name: DURABLE_ACTORS_PYTHON_IMAGE, value: {{ include "actors.image" $.Values.images.python | quote }}}
             - {name: DURABLE_ACTORS_GKE_NAMESPACE, value: {{ include "actors.sandboxNamespace" $ | quote }}}

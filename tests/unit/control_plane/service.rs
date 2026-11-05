@@ -582,6 +582,7 @@ fn sandbox_resources_override_only_the_configured_fields() -> Result<()> {
     let provisioner = SandboxHostProvisioner::new(
         provider,
         HostSandboxRuntimeConfig {
+            otlp_endpoint: None,
             control_plane_url: "http://control".into(),
             jwt_issuer: "issuer".into(),
             invocation_jwt_audience: "invocation".into(),
@@ -598,6 +599,7 @@ fn sandbox_resources_override_only_the_configured_fields() -> Result<()> {
         crate::postgres::PostgresDatabase::lazy("postgresql://localhost:1/unavailable")?,
         provisioner.provider.clone(),
         crate::sandbox::pool::PoolConfig {
+            otlp_endpoint: None,
             control_plane_url: None,
             kind: crate::sandbox::SpareKind::Actor,
             idle: 0,

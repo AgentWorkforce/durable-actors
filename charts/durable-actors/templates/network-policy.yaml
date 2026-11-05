@@ -23,6 +23,15 @@ spec:
             matchLabels: {app.kubernetes.io/name: {{ include "actors.name" . }}}
       ports:
         - {protocol: TCP, port: 7100}
+    {{- if .Values.telemetry.collector.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: {{ include "actors.collectorName" . }}}
+      ports:
+        - {protocol: TCP, port: 4317}
+    {{- end }}
     - to:
         - namespaceSelector:
             matchLabels: {kubernetes.io/metadata.name: kube-system}

@@ -1,4 +1,4 @@
-use super::super::contract_tests::event;
+use super::fixtures::event;
 use super::*;
 use crate::request_traces::history::HistoryQuery;
 
@@ -62,7 +62,6 @@ async fn history_resets_when_retention_or_generation_changes() -> Result<()> {
     let reset = store.history("default", &query).await?;
     assert!(reset.reset);
     assert_eq!(ids(&reset), ["d", "c"]);
-    assert_eq!(reset.evicted, 1);
     let fresh = SqliteTracePersistence::in_memory();
     fresh.append(&[event("fresh")]).await?;
     let reset = fresh.history("default", &query).await?;
@@ -72,7 +71,7 @@ async fn history_resets_when_retention_or_generation_changes() -> Result<()> {
 }
 
 #[tokio::test]
-async fn history_counts_pruned_events_without_counting_duplicate_appends() -> Result<()> {
+async fn history_keeps_only_retained_events_without_duplicate_appends() -> Result<()> {
     let store = SqliteTracePersistence {
         retention: 1,
         ..SqliteTracePersistence::in_memory()
@@ -82,14 +81,6 @@ async fn history_counts_pruned_events_without_counting_duplicate_appends() -> Re
         .await?;
     let page = store.history("default", &HistoryQuery::default()).await?;
     assert_eq!(ids(&page), ["c"]);
-    assert_eq!(page.evicted, 2);
-    assert_eq!(
-        store
-            .replay("default", &ReplayQuery::default())
-            .await?
-            .evicted,
-        2
-    );
     Ok(())
 }
 
@@ -99,7 +90,10 @@ async fn history_is_bounded_and_rejects_live_or_incompatible_cursors() -> Result
     store
         .append(&(0..502).map(|i| event(&i.to_string())).collect::<Vec<_>>())
         .await?;
-    let store = crate::request_traces::TraceStore::open(Arc::new(store)).await?;
+    let store = crate::request_traces::TraceStore::new(
+        Arc::new(store),
+        Arc::new(crate::request_traces::live::InProcessFeed::default()),
+    );
     let first = store.history("default", &HistoryQuery::default()).await?;
     assert_eq!(first.records.len(), 100);
     let largest = store

@@ -277,6 +277,10 @@ fn prepare_directory(directory: &Path) -> Result<File> {
 
 struct LocalState {
     traces: crate::request_traces::TraceStore,
+    telemetry: (
+        Arc<crate::request_traces::persistence::sqlite::SqliteTracePersistence>,
+        crate::request_traces::live::InProcessFeed,
+    ),
     runtime: Arc<RuntimeStorage>,
     access: Arc<RuntimeAccess>,
     region: String,
@@ -300,13 +304,15 @@ async fn local_storage(options: &DevOptions, directory: &Path) -> Result<LocalSt
     };
     let runtime = Arc::new(RuntimeStorage::new(bucket, Arc::new(SystemClock))?);
     let bootstrap = Arc::new(RuntimeAccess::new(location, runtime.persistence.clone())?);
+    let telemetry = Arc::new(
+        crate::request_traces::persistence::sqlite::SqliteTracePersistence::new(
+            directory.join("request-traces.sqlite3"),
+        ),
+    );
+    let live = crate::request_traces::live::InProcessFeed::default();
     Ok(LocalState {
-        traces: crate::request_traces::TraceStore::open(Arc::new(
-            crate::request_traces::persistence::sqlite::SqliteTracePersistence::new(
-                directory.join("request-traces.sqlite3"),
-            ),
-        ))
-        .await?,
+        traces: crate::request_traces::TraceStore::new(telemetry.clone(), Arc::new(live.clone())),
+        telemetry: (telemetry, live),
         runtime,
         access: bootstrap,
         region: "north-america-east".into(),
@@ -345,6 +351,7 @@ async fn local_routes(
     let registry = Arc::new(LocalAdminRegistry::default());
     let runtime = HostSandboxRuntimeConfig {
         control_plane_url: origin.to_owned(),
+        otlp_endpoint: Some(origin.to_owned()),
         jwt_issuer: "durable-actors-control-plane".into(),
         invocation_jwt_audience: "durable-actors-invoke".into(),
         host_idle_timeout_ms: crate::host::host_idle_timeout_ms(&mut |name| {
@@ -384,13 +391,13 @@ async fn local_routes(
         Arc::new(super::local_build::ActorCodeCompiler::new(
             options.sdk_host.clone(),
         )),
-    )))
-    .with_traces(storage.traces.clone());
+    )));
     if let Some(admission) = admission {
         service.lifecycle = service.lifecycle.with_observer(admission);
     }
     service.gateway = Some(gateway);
     service.start_access_reconciliation(stop.clone());
+    let telemetry_keys = issuer.verifier_keys_json()?;
     let admin = AdminService::new(options.api_key.clone(), registry, issuer)?;
     let inventory = Arc::new(super::socket_inventory::GatewayInventoryReader::new(
         Arc::new(service.lifecycle.clone()),
@@ -401,7 +408,7 @@ async fn local_routes(
         storage.runtime.clone(),
         service.changes.clone(),
     )
-    .with_traces(service.traces.clone());
+    .with_traces(storage.traces.clone());
     let reload = LocalReload {
         service: service.clone(),
         admin: admin.clone(),
@@ -411,8 +418,21 @@ async fn local_routes(
     };
     let public = public_api::router(service.clone(), admin.clone())
         .merge(super::inspection::local_router(inspector, admin));
+    let telemetry = super::local_telemetry::LocalTelemetrySink::new(
+        ActorJwtVerifier::for_scope(
+            telemetry_keys,
+            "durable-actors-control-plane",
+            super::issuer::TELEMETRY_AUDIENCE,
+            ActorTokenPurpose::ControlPlane,
+            Duration::from_secs(86_400),
+        )?,
+        storage.telemetry.0.clone(),
+        storage.telemetry.1.clone(),
+    );
     Ok((
-        tonic::service::Routes::from(public).add_service(service.into_internal_service()),
+        telemetry.add_to(
+            tonic::service::Routes::from(public).add_service(service.into_internal_service()),
+        ),
         reload,
     ))
 }

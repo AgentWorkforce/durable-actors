@@ -89,6 +89,30 @@ class ControlPlaneClient {
         )
     }
 
+    listLogs(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
+        return this.requestJson(
+            "GET",
+            `${this.projectPath()}/observe/logs${query.size ? `?${query}` : ""}`,
+            undefined,
+            30_000,
+            signal
+        )
+    }
+
+    getLogHistogram(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
+        return this.requestJson(
+            "GET",
+            `${this.projectPath()}/observe/logs/histogram?${query}`,
+            undefined,
+            30_000,
+            signal
+        )
+    }
+
+    async openLogStream(signal: AbortSignal, query: URLSearchParams): Promise<Response> {
+        return this.openStream(`${this.projectPath()}/observe/logs/events${query.size ? `?${query}` : ""}`, signal)
+    }
+
     listWebSockets(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
         return this.requestJson(
             "GET",

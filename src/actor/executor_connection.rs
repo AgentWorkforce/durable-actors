@@ -23,11 +23,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    ActorCall, ActorDatabase, ActorInvocationFailure, ActorKey, ActorSocketSource, DatabaseCall,
-    DatabaseResult,
+    ActorCall, ActorDatabase, ActorInvocationFailure, ActorKey, ActorLogRecord, ActorLogSink,
+    ActorSocketSource, DatabaseCall, DatabaseResult, LogLevel, StdioLogSink,
 };
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 31;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 32;
 
 #[derive(Debug, Serialize)]
 pub struct ActorMethodInvocation {
@@ -336,9 +336,10 @@ impl ActorExecutorConnection {
         sockets: Option<Arc<dyn ActorSocketSource>>,
         database: Option<Arc<dyn ActorDatabase>>,
         calls: Option<Arc<dyn ActorCaller>>,
+        logs: Option<Arc<dyn ActorLogSink>>,
     ) -> Result<()> {
         self.executor
-            .mark_ready(actor, publisher, sockets, database, calls)
+            .mark_ready(actor, publisher, sockets, database, calls, logs)
             .await?;
         info!(
             actor_names = ?self.executor.actor_names,
@@ -533,6 +534,7 @@ impl JsActorExecutor {
         sockets: Option<Arc<dyn ActorSocketSource>>,
         database: Option<Arc<dyn ActorDatabase>>,
         calls: Option<Arc<dyn ActorCaller>>,
+        logs: Option<Arc<dyn ActorLogSink>>,
     ) -> Result<()> {
         let (reply, ready) = oneshot::channel();
         self.commands
@@ -543,6 +545,7 @@ impl JsActorExecutor {
                 sockets,
                 database,
                 calls,
+                logs,
             })
             .context("actor executor stopped")?;
         ready
@@ -591,6 +594,7 @@ async fn run_executor_connection(
         sockets: None,
         database: None,
         calls: None,
+        logs: Arc::new(StdioLogSink),
         loading_connections: JoinSet::new(),
         connection_lookup_ids: HashSet::new(),
         database_calls: JoinSet::new(),
@@ -616,6 +620,7 @@ struct ExecutorDriver {
     sockets: Option<Arc<dyn ActorSocketSource>>,
     database: Option<Arc<dyn ActorDatabase>>,
     calls: Option<Arc<dyn ActorCaller>>,
+    logs: Arc<dyn ActorLogSink>,
     loading_connections: JoinSet<(u64, Result<super::SocketLookup>)>,
     connection_lookup_ids: HashSet<u64>,
     database_calls: JoinSet<(u64, Option<u64>, Result<DatabaseResult>)>,
@@ -646,6 +651,7 @@ impl ExecutorDriver {
                         ActorExecutorClientMessage::DatabaseCall { call_id, message_id, call } => self.call_database(call_id, message_id, call)?,
                         ActorExecutorClientMessage::GetConnections { message_id, query } => self.load_connections(message_id, query)?,
                         ActorExecutorClientMessage::ActorCall { call_id, call } => self.call_actor(call_id, call),
+                        ActorExecutorClientMessage::Log { message_id, level, message } => self.log(message_id, level, message),
                         ActorExecutorClientMessage::Warm { .. } | ActorExecutorClientMessage::Attach { .. } => anyhow::bail!("customer actor executor attached more than once"),
                     }
                 }
@@ -686,11 +692,15 @@ impl ExecutorDriver {
                 sockets,
                 database,
                 calls,
+                logs,
             } => {
                 self.publisher = publisher;
                 self.sockets = sockets;
                 self.database = database;
                 self.calls = calls;
+                if let Some(logs) = logs {
+                    self.logs = logs;
+                }
                 self.outbound
                     .send(ExecutorWrite {
                         bytes: encode_server_message(&ActorExecutorServerMessage::Attached {
@@ -847,6 +857,18 @@ impl ExecutorDriver {
         Ok(())
     }
 
+    fn log(&self, message_id: Option<u64>, level: LogLevel, message: String) {
+        let request_id = message_id
+            .and_then(|id| self.pending.get(&id))
+            .and_then(|pending| pending.command.request_id())
+            .map(str::to_owned);
+        self.logs.emit(ActorLogRecord {
+            request_id,
+            level,
+            message,
+        });
+    }
+
     fn enqueue(&mut self, pending: PendingCommand) -> Result<()> {
         let message_id = self.next_message_id;
         self.next_message_id = message_id
@@ -948,6 +970,7 @@ enum ExecutorRequest {
         sockets: Option<Arc<dyn ActorSocketSource>>,
         database: Option<Arc<dyn ActorDatabase>>,
         calls: Option<Arc<dyn ActorCaller>>,
+        logs: Option<Arc<dyn ActorLogSink>>,
     },
 }
 
@@ -1085,6 +1108,12 @@ enum ActorExecutorClientMessage {
         message_id: u64,
         reply: ExecutorReply,
     },
+    Log {
+        #[serde(default)]
+        message_id: Option<u64>,
+        level: LogLevel,
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1102,6 +1131,18 @@ enum ExecutorCommand {
     Evict {
         graceful: bool,
     },
+}
+
+impl ExecutorCommand {
+    fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Hydrate { request_id } | Self::WebsocketEvent { request_id, .. } => {
+                Some(request_id)
+            }
+            Self::Invoke(invocation) => Some(&invocation.request_id),
+            Self::Evict { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

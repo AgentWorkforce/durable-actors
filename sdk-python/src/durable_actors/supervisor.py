@@ -52,7 +52,7 @@ class Supervisor(Channel):
 
         try:
             if generic:
-                await self.send({"type": "warm", "protocol": 31})
+                await self.send({"type": "warm", "protocol": 32})
                 load = await self.read()
                 if load.get("type") != "load":
                     raise ValueError("expected actor code assignment")
@@ -65,7 +65,7 @@ class Supervisor(Channel):
             self.entrypoint = entrypoint
             self.worker = await self.create_worker(entrypoint, self.environment)
             self.actor_names = self.worker.actor_names
-            await self.send({"type": "attach", "protocol": 31, "actor_names": self.actor_names})
+            await self.send({"type": "attach", "protocol": 32, "actor_names": self.actor_names})
             self.attached = await self.read()
             attached_actor(self.attached, self.actor_names)
             await self.start_pump()
@@ -126,7 +126,7 @@ class Supervisor(Channel):
         try:
             while True:
                 message = await worker.read()
-                if message["type"] == "residency":
+                if message["type"] in {"residency", "log"}:
                     await self.send(message)
                     continue
                 if message["type"] == "actor_call":
@@ -227,7 +227,7 @@ class Worker(Channel):
             worker = cls(reader, writer, process)
             async with asyncio.timeout(60):
                 attach = await worker.read()
-            if attach.get("type") != "attach" or attach.get("protocol") != 31:
+            if attach.get("type") != "attach" or attach.get("protocol") != 32:
                 raise ValueError("worker did not attach")
             worker.actor_names = attach["actor_names"]
             return worker

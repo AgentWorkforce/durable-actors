@@ -34,6 +34,14 @@ RUN pip install --no-cache-dir .
 
 FROM oven/bun:1.4.2 AS bun
 
+FROM golang:1.26.0-bookworm AS collector-builder
+WORKDIR /build
+RUN go install go.opentelemetry.io/collector/cmd/builder@v0.163.0
+COPY collector ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 builder --config builder-config.yaml
+
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update -qq \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates libssl3 \
@@ -67,6 +75,14 @@ USER 10000:10000
 ENV RUST_LOG=warn,durable_actors=info
 ENV DURABLE_ACTORS_EXECUTOR_RUNTIME=python
 ENTRYPOINT ["/usr/local/bin/durable-actors"]
+
+FROM debian:bookworm-slim AS collector
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=collector-builder /build/build/otelcol-durable-actors /usr/local/bin/otelcol
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/otelcol"]
 
 FROM runtime-base AS control-plane
 ENV DURABLE_ACTORS_PROCESS_ROLE=control_plane

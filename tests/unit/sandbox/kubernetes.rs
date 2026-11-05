@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
     let request = CreateSpareRequest {
+        otlp_endpoint: None,
         control_plane_url: Some("http://control:7100".into()),
         kind: SpareKind::Actor,
         name: "warm-one".into(),
@@ -341,6 +342,7 @@ fn ready_event(name: &str, ip: &str) -> serde_json::Value {
 
 fn spare_request(name: &str) -> CreateSpareRequest {
     CreateSpareRequest {
+        otlp_endpoint: None,
         control_plane_url: Some("http://control:7100".into()),
         kind: SpareKind::Actor,
         name: name.into(),

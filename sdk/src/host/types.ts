@@ -2,7 +2,7 @@ import type { SocketEffect, SocketSource } from "../actor/socketProtocol.js"
 import type { JsonValue } from "../json.js"
 
 import type { DatabaseCall, DatabaseResult } from "./database.js"
-import type { ActorCallRequest, ActorExecutorReply, ActorWorkerCommand, ActorWorkerData } from "./protocol.js"
+import type { ActorCallRequest, ActorExecutorReply, ActorLog, ActorWorkerCommand, ActorWorkerData } from "./protocol.js"
 import type { ActorWorkerSupervisor } from "./worker-supervisor.js"
 
 interface ActorHostSettings {
@@ -16,6 +16,8 @@ type SocketPublisher = (effects: readonly SocketEffect[]) => void
 type DatabaseRequester = (call: DatabaseCall) => Promise<DatabaseResult>
 
 type ActorCallRequester = (call: ActorCallRequest) => Promise<JsonValue>
+
+type LogWriter = (log: ActorLog) => void
 
 type ActorSessionSupervisor = Pick<ActorWorkerSupervisor, "assign" | "handle" | "isResident" | "onResidencyChange">
 
@@ -33,6 +35,7 @@ interface ResidentActorWorkerOptions {
     readonly onResidencyChange: () => void
     readonly database: DatabaseRequester
     readonly calls: ActorCallRequester
+    readonly logs: LogWriter
     readonly moduleUrl: string
     readonly worker?: ActorWorkerHandle
     readonly createWorker: ActorWorkerFactory
@@ -57,7 +60,8 @@ type ActorWorkerFactory = (
     data: ActorWorkerData,
     onStateChange: () => void,
     database: DatabaseRequester,
-    calls: ActorCallRequester
+    calls: ActorCallRequester,
+    logs: LogWriter
 ) => ActorWorkerHandle
 
 export type {
@@ -70,6 +74,7 @@ export type {
     ActorWorkerSupervisorFactory,
     ActorWorkerSupervisorOptions,
     DatabaseRequester,
+    LogWriter,
     ResidentActorWorkerOptions,
     SocketPublisher,
     SocketSource

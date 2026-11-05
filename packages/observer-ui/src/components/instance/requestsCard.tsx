@@ -34,9 +34,10 @@ export type RequestsCardProps = {
     requests: RequestTrace[] | null
     failed: boolean
     timeWindow: TimeWindow
+    onShowLogs: (requestId: string) => void
 }
 
-export function RequestsCard({ requests, failed, timeWindow }: RequestsCardProps) {
+export function RequestsCard({ requests, failed, timeWindow, onShowLogs }: RequestsCardProps) {
     const [picked, setPicked] = useState<number | null>(null)
     const drawer = useDrawer()
 
@@ -49,7 +50,7 @@ export function RequestsCard({ requests, failed, timeWindow }: RequestsCardProps
     function inspect(call: RequestTrace, element: HTMLElement) {
         if (drawer.openKey === call.eventId) return drawer.close()
         const blocker = traces ? blockerOf(call, traces) : undefined
-        drawer.show({ key: call.eventId, content: <RequestDetails call={call} blocker={blocker} /> }, element)
+        drawer.show({ key: call.eventId, content: <RequestDetails call={call} blocker={blocker} onShowLogs={() => onShowLogs(call.requestId)} /> }, element)
     }
 
     return (

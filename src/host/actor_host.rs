@@ -18,10 +18,11 @@ use crate::actor::{
     ActorSocketInvocation, ActorSocketOutcome, ActorSocketPublisher, validate_socket_effects,
 };
 use crate::host_leases::WaitingOperation;
-use crate::request_traces::{RequestKind, TraceRecorder, TraceSender};
+use crate::request_traces::{RequestKind, TraceRecorder};
 use crate::request_tracking::{
     HostState, RequestCompletion, RequestMetadata, RequestObserver, RequestStage, RequestTracker,
 };
+use opentelemetry_sdk::trace::SdkTracer;
 
 use super::{
     HostEndpoint,
@@ -36,7 +37,7 @@ pub(crate) struct ActorHost {
     endpoint: HostEndpoint,
     mailbox: mpsc::UnboundedSender<ActorMessage>,
     status: watch::Receiver<ActorStatus>,
-    traces: Option<TraceSender>,
+    traces: Option<SdkTracer>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,8 +110,8 @@ impl ActorHost {
         }
     }
 
-    pub(crate) fn with_traces(mut self, traces: TraceSender) -> Self {
-        self.traces = Some(traces);
+    pub(crate) fn with_traces(mut self, tracer: SdkTracer) -> Self {
+        self.traces = Some(tracer);
         self
     }
 
@@ -221,7 +222,7 @@ impl ActorHost {
     }
 
     fn observer(&self, operation: &ActorOperation) -> Option<Box<dyn RequestObserver>> {
-        let sender = self.traces.as_ref()?.clone();
+        let tracer = self.traces.as_ref()?.clone();
         let (kind, connection, metadata) = match operation {
             ActorOperation::Activate { .. } => return None,
             ActorOperation::Method(_) => (RequestKind::Method, None, None),
@@ -240,7 +241,7 @@ impl ActorHost {
             },
         };
         Some(Box::new(TraceRecorder::new(
-            sender,
+            tracer,
             &operation.invocation(),
             kind,
             connection,

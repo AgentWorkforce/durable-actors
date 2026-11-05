@@ -1,0 +1,99 @@
+{{- if .Values.telemetry.collector.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "actors.collectorName" . }}
+data:
+  collector.yaml: |
+    {{- .Files.Get "files/collector.yaml" | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "actors.collectorName" . }}
+spec:
+  replicas: {{ .Values.telemetry.collector.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "actors.collectorName" . }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "actors.collectorName" . }}
+      annotations:
+        checksum/config: {{ .Files.Get "files/collector.yaml" | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: sandbox.gke.io/runtime
+                    operator: NotIn
+                    values: [gvisor]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: collector
+          image: {{ include "actors.image" .Values.images.collector | quote }}
+          args: ["--config=/etc/otelcol/collector.yaml"]
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: health, containerPort: 13133}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            {{- toYaml .Values.telemetry.collector.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 10
+          env:
+            - {name: JWT_ISSUER, value: {{ .Values.publicUrl | quote }}}
+            - {name: CLICKHOUSE_URL, value: {{ .Values.analytics.clickhouse.url | quote }}}
+            - {name: CLICKHOUSE_DATABASE, value: {{ .Values.analytics.clickhouse.database | quote }}}
+            - {name: CLICKHOUSE_USER, value: {{ .Values.analytics.clickhouse.user | quote }}}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.credentialsSecret | quote }}, key: {{ .Values.analytics.clickhouse.passwordSecretKey | quote }}}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.credentialsSecret | quote }}, key: {{ .Values.redis.urlSecretKey | quote }}}
+            - {name: REDIS_CA_FILE, value: {{ ternary "/redis/ca.crt" "" (not (empty .Values.redis.caSecretKey)) | quote }}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol, readOnly: true}
+            {{- if .Values.redis.caSecretKey }}
+            - {name: redis-ca, mountPath: /redis, readOnly: true}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "actors.collectorName" . }}}
+        {{- with .Values.redis.caSecretKey }}
+        - name: redis-ca
+          secret:
+            secretName: {{ $.Values.credentialsSecret | quote }}
+            items: [{key: {{ . | quote }}, path: ca.crt}]
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "actors.collectorName" . }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "actors.collectorName" . }}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc, appProtocol: grpc}
+{{- end }}

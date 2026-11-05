@@ -56,6 +56,7 @@ async fn completed_hosts_are_removed_but_live_hosts_and_uncertain_observations_a
             PostgresDatabase::connect(&fixture.url).await?,
             provider.clone(),
             PoolConfig {
+                otlp_endpoint: None,
                 control_plane_url: None,
                 kind: SpareKind::Actor,
                 idle: 0,
@@ -135,6 +136,7 @@ async fn stale_cleanup_observation_cannot_remove_a_replacement_identity() -> Res
             PostgresDatabase::connect(&fixture.url).await?,
             provider,
             PoolConfig {
+                otlp_endpoint: None,
                 control_plane_url: None,
                 kind: SpareKind::Actor,
                 idle: 0,
@@ -188,6 +190,7 @@ async fn reconciliation_excludes_evicted_spares_from_subsequent_claims() -> Resu
     with_postgres(async |fixture| {
         let provider = Arc::new(Provider { fail: false.into(), pause: None.into(), reaped: 0.into() });
         let pool = SparePool::new(PostgresDatabase::connect(&fixture.url).await?, provider, PoolConfig {
+            otlp_endpoint: None,
             control_plane_url: None, kind: SpareKind::Actor, idle: 2, fleet_maximum: 4,
             max_starting: 2, idle_ttl_seconds: 600, refill_interval: Duration::from_secs(1), retire_concurrency: 8, reap_interval: Duration::from_secs(30),
             pod_reap_interval: Duration::from_secs(1), regions: vec![],

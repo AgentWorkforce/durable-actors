@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 import type { SocketEffect } from "../../src/actor/socketProtocol.js"
 import { buildActor } from "../../src/compiler/actor-build.js"
+import type { ActorLog } from "../../src/host/protocol.js"
 import { ActorWorker, ActorWorkerSupervisor } from "../../src/host/worker-supervisor.js"
 import { assertReply } from "../fixtures/reply.js"
 import { execute, handle, hostDatabase, seed } from "../fixtures/worker-supervisor.js"
@@ -49,6 +50,44 @@ test("worker eviction restores fields and SQL from the host database", { timeout
         assert.deepEqual(restored.result, [{ count: 1 }])
     } finally {
         supervisor.close()
+        await rm(root, { recursive: true, force: true })
+    }
+})
+
+test("console output reaches the host tagged with the invocation that wrote it", { timeout: 30000 }, async () => {
+    const root = await createTypeScriptConsumer("LoggingCounter")
+    await writeFile(
+        path.join(root, "src/actors.ts"),
+        `import { Actor } from ${JSON.stringify(fileURLToPath(new URL("../../src/index.js", import.meta.url)))}
+        console.info("loaded", { ready: true })
+        export class LoggingCounter extends Actor {
+            async increment(): Promise<number> {
+                console.warn("inside %s", "increment")
+                return 1
+            }
+        }`
+    )
+    const logs: ActorLog[] = []
+    const worker = new ActorWorker(
+        { moduleUrl: await buildConsumer(root) },
+        () => {},
+        noDatabase,
+        noActorCalls,
+        log => logs.push(log)
+    )
+    try {
+        await worker.ready()
+        const reply = await execute(worker, { ...invokeCommand(), actor: identity("LoggingCounter") }, () => {})
+        assert.equal(reply.type, "invoked")
+        assert.deepEqual(
+            logs.map(({ messageId, level, message }) => ({ tagged: messageId !== undefined, level, message })),
+            [
+                { tagged: false, level: "info", message: "loaded { ready: true }" },
+                { tagged: true, level: "warn", message: "inside increment" }
+            ]
+        )
+    } finally {
+        worker.terminate("test finished")
         await rm(root, { recursive: true, force: true })
     }
 })

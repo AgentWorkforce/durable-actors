@@ -22,18 +22,14 @@ pub(super) fn query(
 
 pub(super) fn metadata(transaction: &Transaction<'_>, project_id: &str) -> Result<Metadata> {
     Ok(transaction.query_row(
-        "SELECT generation, COALESCE(p.pruned, 0),
-                MAX(0, COALESCE(p.total, 0) - (
-                    SELECT COUNT(*) FROM traces WHERE project_id = ?1
-                )), COALESCE(p.head, 0)
+        "SELECT generation, COALESCE(p.pruned, 0), COALESCE(p.head, 0)
          FROM trace_meta LEFT JOIN trace_projects p ON p.project_id = ?1",
         [project_id],
         |row| {
             Ok(Metadata {
                 generation: row.get(0)?,
                 pruned: row.get::<_, i64>(1)? as u64,
-                evicted: row.get::<_, i64>(2)? as u64,
-                head: row.get::<_, i64>(3)? as u64,
+                head: row.get::<_, i64>(2)? as u64,
             })
         },
     )?)

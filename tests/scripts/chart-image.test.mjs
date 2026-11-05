@@ -3,9 +3,9 @@ import test from "node:test"
 
 import { pinChartImages } from "../../scripts/pin-chart-image.mjs"
 
-const images = Object.fromEntries(["controlPlane", "typescript", "python"].map(name => [name, { repository: `example.com/${name}`, digest: "" }]))
+const images = Object.fromEntries(["controlPlane", "typescript", "python", "collector"].map(name => [name, { repository: `example.com/${name}`, digest: "" }]))
 const values = Bun.YAML.stringify({ images, replicaCount: 2 })
-const digests = { controlPlane: `sha256:${"a".repeat(64)}`, typescript: `sha256:${"b".repeat(64)}`, python: `sha256:${"c".repeat(64)}` }
+const digests = { controlPlane: `sha256:${"a".repeat(64)}`, typescript: `sha256:${"b".repeat(64)}`, python: `sha256:${"c".repeat(64)}`, collector: `sha256:${"d".repeat(64)}` }
 
 test("published chart pins each image to its own release digest and preserves other settings", () => {
     const pinned = Bun.YAML.parse(pinChartImages(values, digests))

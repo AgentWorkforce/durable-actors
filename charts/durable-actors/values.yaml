@@ -41,7 +41,8 @@ actors:
 alarms:
   pollIntervalMs: 100
 analytics:
-  backend: postgres
+  # none or clickhouse; actor spans and logs need clickhouse and telemetry.collector.
+  backend: none
   clickhouse:
     url: ""
     database: ""
@@ -59,11 +60,18 @@ postgres:
 redis:
   urlSecretKey: ""
   caSecretKey: ""
+telemetry:
+  collector:
+    enabled: false
+    replicas: 2
+    resources:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits: {memory: 1Gi}
 resources:
   requests: {cpu: 250m, memory: 512Mi}
   limits: {memory: 1Gi}
 images:
-  # Release packaging supplies immutable digests for all three images.
+  # Release packaging supplies immutable digests for all four images.
   controlPlane:
     repository: us-central1-docker.pkg.dev/fluid-analogy-473415-c2/public/durable-actors
     digest: ""
@@ -71,6 +79,9 @@ images:
     repository: us-central1-docker.pkg.dev/fluid-analogy-473415-c2/public/durable-actors
     digest: ""
   python:
+    repository: us-central1-docker.pkg.dev/fluid-analogy-473415-c2/public/durable-actors
+    digest: ""
+  collector:
     repository: us-central1-docker.pkg.dev/fluid-analogy-473415-c2/public/durable-actors
     digest: ""
 sandboxNamespace: ""

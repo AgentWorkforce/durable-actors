@@ -1,6 +1,6 @@
+use super::queries::SpanRow;
 use super::*;
-use crate::request_traces::live::{LiveTraceFeed, LiveTraceUpdate};
-use crate::request_traces::{InvalidTraceQuery, RequestKind, RequestOutcome, TraceStore};
+use crate::request_traces::{RequestKind, RequestOutcome};
 
 #[tokio::test]
 async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Result<()> {
@@ -18,13 +18,14 @@ async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Resul
         ClickHouseTracePersistence::start(
             config(url.clone()),
             Duration::from_secs(86400),
-            Arc::new(LiveTraceFeed::default()),
             stop.clone(),
         )
         .map(Arc::new)
     };
-    let writer = LifecycleStore::new(backend()?);
     let persistence = backend()?;
+    // Surfaces schema errors directly; the writer would otherwise retry them silently.
+    ingestion::initialize(&persistence.client, 86400).await?;
+    let writer = LifecycleStore::new(backend()?);
     let reader = LifecycleStore::new(persistence.clone());
     let project = format!("lifecycle-{}", uuid::Uuid::new_v4());
     let mut event = LifecycleEvent {
@@ -137,7 +138,150 @@ async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Resul
             .actors
             .is_empty()
     );
+    read_collector_rows(&persistence, &project).await
+}
+
+// Inserts with the exporter's column lists, so the schema stays compatible with the collector.
+async fn read_collector_rows(store: &ClickHouseTracePersistence, project: &str) -> Result<()> {
+    use crate::actor::LogLevel;
+    use crate::request_traces::{
+        history::HistoryQuery,
+        logs::{LogHistogramQuery, LogQuery},
+        metrics::{QueueWaitQuery, TimeRange},
+        persistence::TraceQueries,
+    };
+    let resource = format!(
+        "map('durable_actors.project_id', '{project}', 'durable_actors.actor_name', 'Room', \
+         'durable_actors.actor_id', 'lobby', 'durable_actors.host_id', 'host', \
+         'durable_actors.session_id', 'session')"
+    );
+    store
+        .client
+        .query(&format!(
+            "INSERT INTO otel_traces (Timestamp, TraceId, SpanId, ParentSpanId, TraceState, SpanName, \
+             SpanKind, ServiceName, ResourceAttributes, ScopeName, ScopeVersion, SpanAttributes, Duration, \
+             StatusCode, StatusMessage, `Events.Timestamp`, `Events.Name`, `Events.Attributes`, \
+             `Links.TraceId`, `Links.SpanId`, `Links.TraceState`, `Links.Attributes`) VALUES \
+             (now64(9), 't', 'span-1', '', '', 'onConnect', 'Server', 'durable-actors-host', {resource}, \
+             'durable-actors-host', '', map('durable_actors.request_id', 'request-1', \
+             'durable_actors.kind', 'websocket', 'durable_actors.connection_id', 'socket-1', \
+             'durable_actors.outcome', 'completed', 'durable_actors.queue_wait_ms', '2.5', \
+             'durable_actors.metadata', '{{\"userId\":\"alice\"}}'), 12500000, 'Unset', '', \
+             [], [], [], [], [], [], [])"
+        ))
+        .execute()
+        .await?;
+    store
+        .client
+        .query(&format!(
+            "INSERT INTO otel_logs (Timestamp, TraceId, SpanId, TraceFlags, SeverityText, SeverityNumber, \
+             ServiceName, Body, ResourceSchemaUrl, ResourceAttributes, ScopeSchemaUrl, ScopeName, ScopeVersion, \
+             ScopeAttributes, LogAttributes, EventName) VALUES (now64(9), '', '', 0, 'info', 9, \
+             'durable-actors-host', 'hello', '', {resource}, '', 'durable-actors-host', '', map(), \
+             map('durable_actors.log_id', 'log-1', 'durable_actors.request_id', 'request-1'), '')"
+        ))
+        .execute()
+        .await?;
+    let history = store.history(project, &HistoryQuery::default()).await?;
+    assert_eq!(ids(&history), ["span-1"]);
+    let trace = &history.records[0].event.trace;
+    assert_eq!(
+        (trace.actor_name.as_str(), trace.actor_id.as_str()),
+        ("Room", "lobby")
+    );
+    assert_eq!(trace.duration_ms, 12.5);
+    assert_eq!(trace.queue_wait_ms, Some(2.5));
+    let filtered = HistoryQuery {
+        request_id: Some("request-1".into()),
+        connection_id: Some("socket-1".into()),
+        outcome: Some(RequestOutcome::Completed),
+        ..Default::default()
+    };
+    assert_eq!(ids(&store.history(project, &filtered).await?), ["span-1"]);
+    let logs = store
+        .logs(
+            project,
+            &LogQuery {
+                request_id: Some("request-1".into()),
+                level: Some(LogLevel::Info),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(logs.records.len(), 1);
+    assert_eq!(logs.records[0].message, "hello");
+    let severe = LogQuery {
+        level: Some(LogLevel::Warn),
+        ..Default::default()
+    };
+    assert!(store.logs(project, &severe).await?.records.is_empty());
+    let search = LogQuery {
+        search: Some("HELL".into()),
+        ..Default::default()
+    };
+    assert_eq!(store.logs(project, &search).await?.records.len(), 1);
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let histogram = store
+        .log_histogram(
+            project,
+            &LogHistogramQuery {
+                actor_name: Some("Room".into()),
+                actor_id: None,
+                request_id: None,
+                search: Some("hello".into()),
+                from_ms: now - 3_600_000,
+                to_ms: now + 60_000,
+                bucket_ms: 60_000,
+            },
+        )
+        .await?;
+    assert_eq!(
+        histogram
+            .buckets
+            .iter()
+            .map(|bucket| bucket.info)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        store
+            .metrics(project, &TimeRange::default())
+            .await?
+            .total
+            .count,
+        1
+    );
+    assert_eq!(
+        store
+            .queue_waits(project, &QueueWaitQuery::default())
+            .await?[0]
+            .admitted,
+        1
+    );
+    let sockets = store.websockets(project, &TimeRange::default()).await?;
+    assert_eq!(
+        sockets[0].metadata,
+        Some(serde_json::json!({"userId": "alice"}))
+    );
+    assert!(
+        store
+            .history("different-project", &HistoryQuery::default())
+            .await?
+            .records
+            .is_empty()
+    );
     Ok(())
+}
+
+fn ids(page: &TracePage) -> Vec<&str> {
+    page.records
+        .iter()
+        .map(|record| record.event.event_id.as_str())
+        .collect()
 }
 
 async fn wait_lifecycle(
@@ -163,194 +307,88 @@ async fn wait_lifecycle(
 }
 
 #[tokio::test]
-async fn unavailable_clickhouse_cannot_block_reports_and_the_queue_is_bounded() -> Result<()> {
+async fn unavailable_clickhouse_cannot_block_lifecycle_reports_and_the_queue_is_bounded()
+-> Result<()> {
+    use crate::actor_lifecycle::{LifecycleEvent, LifecyclePersistence};
     let stop = CancellationToken::new();
     let _guard = stop.clone().drop_guard();
-    let feed = LiveTraceFeed::default();
-    let mut live = feed.subscribe();
-    let backend = Arc::new(ClickHouseTracePersistence::start(
+    let backend = ClickHouseTracePersistence::start(
         config("http://127.0.0.1:9".into()),
         Duration::from_secs(86400),
-        Arc::new(feed),
         stop,
-    )?);
-    let store = TraceStore::open(backend.clone()).await?;
-    let trace = super::super::contract_tests::event("bounded").trace;
+    )?;
+    let event = LifecycleEvent {
+        organization_id: None,
+        event_id: "session:1".into(),
+        actor: crate::actor::ActorKey {
+            project_id: "default".into(),
+            actor_name: "Counter".into(),
+            actor_id: "one".into(),
+        },
+        host_id: "host".into(),
+        session_id: "session".into(),
+        region: "us-east".into(),
+        received_at_ms: 1,
+        report: crate::actor_lifecycle::LifecycleReport {
+            kind: crate::actor_lifecycle::LifecycleKind::Started,
+            owner_epoch: 1,
+            sequence: 1,
+            started_at_ms: 1,
+            occurred_at_ms: 1,
+            resources: Default::default(),
+            resident: None,
+            last_active_at_ms: None,
+            waiting: Vec::new(),
+        },
+    };
     tokio::time::timeout(Duration::from_secs(2), async {
-        for _ in 0..MAX_QUEUED_ROWS / TRACE_BATCH_SIZE {
-            store
-                .record(
-                    "default",
-                    "host",
-                    "session",
-                    vec![trace.clone(); TRACE_BATCH_SIZE],
-                    0,
-                )
-                .await?;
+        for _ in 0..MAX_QUEUED_ROWS {
+            backend.record(&event).await?;
         }
-        assert!(
-            store
-                .record("default", "host", "session", vec![trace], 0)
-                .await
-                .is_err()
-        );
+        assert!(backend.record(&event).await.is_err());
         assert_eq!(backend.queued_rows.available_permits(), 0);
-        assert!(matches!(
-            live.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
         anyhow::Ok(())
     })
     .await??;
     Ok(())
 }
 
-#[tokio::test]
-async fn clickhouse_ingestion_deduplication_history_and_rollups() -> Result<()> {
-    let Ok(url) = std::env::var("DURABLE_ACTORS_TEST_CLICKHOUSE_URL") else {
-        return Ok(());
+#[test]
+fn span_rows_map_to_request_traces() {
+    let row = SpanRow {
+        event_id: "00f067aa0ba902b7".into(),
+        host_id: "host".into(),
+        session_id: "session".into(),
+        project_id: "default".into(),
+        request_id: "request".into(),
+        actor_name: "Room".into(),
+        actor_id: "lobby".into(),
+        kind: "websocket".into(),
+        operation: "onConnect".into(),
+        connection_id: "socket-1".into(),
+        started_at_ms: 1_000,
+        routing_ms: 1.5,
+        duration_ms: 12.25,
+        queue_wait_ms: Some(3.0),
+        host_state: "cold".into(),
+        outcome: "completed".into(),
+        state_version: Some(7),
+        metadata: r#"{"userId":"alice"}"#.into(),
     };
-    let stop = CancellationToken::new();
-    let _guard = stop.clone().drop_guard();
-    let feed = LiveTraceFeed::default();
-    let mut live = feed.subscribe();
-    let store = ClickHouseTracePersistence::start(
-        config(url.clone()),
-        Duration::from_secs(86400),
-        Arc::new(feed),
-        stop.clone(),
-    )?;
-    let project = format!("test-{}", uuid::Uuid::new_v4());
-    let mut events: Vec<_> = ["a", "b", "c", "d"]
-        .map(|id| {
-            let mut event = super::super::contract_tests::event(id);
-            event.trace.project_id = project.clone();
-            event.trace.started_at_ms = 1000;
-            event.trace.duration_ms = 10.0;
-            event.trace.queue_wait_ms = Some(1.0);
-            event
-        })
-        .into();
-    events[0].trace.request_id = "request\0id".into();
-    for event in &mut events[1..3] {
-        event.trace.kind = RequestKind::Websocket;
-        event.trace.connection_id = Some("socket".into());
-    }
-    events[1].trace.operation = "onConnect".into();
-    events[1].trace.metadata = Some(serde_json::json!({"client": "test"}));
-    events[2].trace.operation = "onMessage".into();
-    events[2].trace.outcome = RequestOutcome::Failed;
-    events[3].trace.outcome = RequestOutcome::Rerouted;
-    store.record(&project, events.clone(), 3).await?;
-    let committed = tokio::time::timeout(Duration::from_secs(20), live.recv()).await??;
-    let LiveTraceUpdate::Batch(committed) = committed.as_ref() else {
-        panic!("expected committed traces");
-    };
-    assert_eq!(committed.len(), 4);
+    let event = row.into_event().unwrap();
+    assert_eq!(event.event_id, "00f067aa0ba902b7");
+    assert_eq!(event.trace.kind, RequestKind::Websocket);
+    assert_eq!(event.trace.outcome, RequestOutcome::Completed);
     assert_eq!(
-        store
-            .metrics(&project, &TimeRange::default())
-            .await?
-            .total
-            .count,
-        4
+        event.trace.host_state,
+        crate::request_tracking::HostState::Cold
     );
-
-    // Retry after an uncertain response with the same event IDs.
-    store.record(&project, events.clone(), 0).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let other = ClickHouseTracePersistence::start(
-        config(url),
-        Duration::from_secs(86400),
-        Arc::new(LiveTraceFeed::default()),
-        stop,
-    )?;
-    let metrics = other.metrics(&project, &TimeRange::default()).await?;
-    assert_eq!(metrics.total.count, 4);
-    assert!((metrics.total.success.unwrap() - 200.0 / 3.0).abs() < 0.001);
-    assert_eq!(other.status(&project).await?.dropped, 3);
-    let first = other
-        .history(
-            &project,
-            &HistoryQuery {
-                limit: 2,
-                ..Default::default()
-            },
-        )
-        .await?;
-    assert_eq!(ids(&first), ["d", "c"]);
-    let next = HistoryQuery {
-        cursor: first.next_cursor,
-        limit: 2,
-        ..Default::default()
-    };
-    assert_eq!(ids(&other.history(&project, &next).await?), ["b", "a"]);
-    assert!(
-        other
-            .history("foreign", &next)
-            .await
-            .err()
-            .unwrap()
-            .is::<InvalidTraceQuery>()
-    );
-    let request = other
-        .history(
-            &project,
-            &HistoryQuery {
-                request_id: Some("request\0id".into()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    assert_eq!(ids(&request), ["a"]);
+    assert_eq!(event.trace.connection_id.as_deref(), Some("socket-1"));
     assert_eq!(
-        other
-            .queue_waits(&project, &QueueWaitQuery::default())
-            .await?[0]
-            .admitted,
-        3
+        event.trace.metadata,
+        Some(serde_json::json!({"userId": "alice"}))
     );
-    let sockets = other.websockets(&project, &TimeRange::default()).await?;
-    assert_eq!(sockets.len(), 1);
-    assert_eq!((sockets[0].messages, sockets[0].failures), (1, 1));
-    assert_eq!(sockets[0].metadata, events[1].trace.metadata);
-    assert_eq!(sockets[0].opened_at_ms, Some(1000));
-    assert_eq!(sockets[0].closed_at_ms, None);
-    assert!(
-        other
-            .history("foreign", &HistoryQuery::default())
-            .await?
-            .records
-            .is_empty()
-    );
-
-    let mut late = events[0].clone();
-    late.event_id = "late".into();
-    late.trace.started_at_ms = 500;
-    store.record(&project, vec![late], 0).await?;
-    wait_count(&store, &project, 5).await?;
-    let snapshot = other
-        .replay(
-            &project,
-            &ReplayQuery {
-                cursor: Some("snapshot".into()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    assert!(snapshot.snapshot);
-    assert!(!snapshot.reset);
-    assert!(snapshot.next_cursor.is_none());
-    assert_eq!(ids(&snapshot), ["d", "c", "b", "a", "late"]);
-    let burst_project = format!("burst-{}", uuid::Uuid::new_v4());
-    for index in 0..1000 {
-        let mut event = events[0].clone();
-        event.event_id = format!("burst-{index}");
-        event.trace.project_id = burst_project.clone();
-        store.record(&burst_project, vec![event], 0).await?;
-    }
-    wait_count(&other, &burst_project, 1000).await?;
-    Ok(())
+    assert_eq!(event.trace.state_version, Some(7));
 }
 
 fn config(url: String) -> ClickHouseConfig {
@@ -360,28 +398,4 @@ fn config(url: String) -> ClickHouseConfig {
         user: "trace_test".into(),
         password: "local-test-only".into(),
     }
-}
-
-async fn wait_count(store: &ClickHouseTracePersistence, project: &str, count: u64) -> Result<()> {
-    let mut observed = String::new();
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            match store.metrics(project, &TimeRange::default()).await {
-                Ok(result) if result.total.count == count => return,
-                Ok(result) => observed = format!("count was {}", result.total.count),
-                Err(error) => observed = format!("{error:#}"),
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
-    ensure!(result.is_ok(), "waiting for {count} traces: {observed}");
-    Ok(())
-}
-
-fn ids(page: &TracePage) -> Vec<&str> {
-    page.records
-        .iter()
-        .map(|record| record.event.event_id.as_str())
-        .collect()
 }

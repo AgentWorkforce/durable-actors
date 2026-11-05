@@ -72,6 +72,7 @@ fn config() -> ModalConfig {
 
 fn request() -> CreateSpareRequest {
     CreateSpareRequest {
+        otlp_endpoint: None,
         control_plane_url: Some("https://control.example.com".into()),
         kind: SpareKind::Actor,
         name: "spare-one".into(),

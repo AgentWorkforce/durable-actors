@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import signal
 import socket
 import sys
+import threading
 import traceback
 from collections.abc import Collection
 from contextlib import suppress
@@ -21,6 +23,7 @@ from .runtime import ActorRuntime
 from .sqlite import DatabaseProxy
 
 message_id: ContextVar[int] = ContextVar("actor_message_id")
+LOG_LIMIT_BYTES = 256 * 1024
 
 
 class Session(Channel):
@@ -32,11 +35,12 @@ class Session(Channel):
         self.database_calls = asyncio.Lock()
         self.actor_calls: dict[int, asyncio.Future[Document]] = {}
         self.next_actor_call = 0
+        self.loop = asyncio.get_running_loop()
 
     async def run(self, entrypoint: str | None, generic: bool) -> None:
         try:
             if generic:
-                await self.send({"type": "warm", "protocol": 31})
+                await self.send({"type": "warm", "protocol": 32})
                 assignment = await self.read()
                 if (
                     assignment.get("type") != "load"
@@ -51,8 +55,9 @@ class Session(Channel):
                 while not path.is_file():
                     await asyncio.sleep(0.01)
             actors = {actor.__name__: actor for actor in load_artifact(path)}
-            await self.send({"type": "attach", "protocol": 31, "actor_names": sorted(actors)})
+            await self.send({"type": "attach", "protocol": 32, "actor_names": sorted(actors)})
             identity = attached_actor(await self.read(), actors)
+            capture_output(self)
             database = DatabaseProxy(self.call_database, asyncio.get_running_loop())
             runtime = ActorRuntime(actors[identity["actor_name"]], identity, self, database)
             route_through_host(self.call_actor, asyncio.get_running_loop())
@@ -134,6 +139,20 @@ class Session(Channel):
             ),
         )
 
+    def log(self, level: str, message: str) -> None:
+        data = serialize(
+            {
+                "type": "log",
+                "message_id": message_id.get(None),
+                "level": level,
+                "message": truncate_log(message),
+            }
+        )
+        if running_loop() is self.loop:
+            self.writer.write(data)
+        else:
+            self.loop.call_soon_threadsafe(self.writer.write, data)
+
     def admit(self) -> None:
         data = serialize({"type": "ready_for_invocation", "message_id": message_id.get()})
         self.writer.write(data)
@@ -170,13 +189,61 @@ class Session(Channel):
         await self.writer.wait_closed()
 
 
+class HostLog(io.TextIOBase):
+    """Sends each complete line to the host, tagged with the invocation that wrote it."""
+
+    def __init__(self, session: Session, level: str) -> None:
+        self.session = session
+        self.level = level
+        self.pending = ""
+        self.lock = threading.Lock()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        with self.lock:
+            lines = (self.pending + text).split("\n")
+            self.pending = lines.pop()
+        for line in lines:
+            self.session.log(self.level, line)
+        return len(text)
+
+    def flush(self) -> None:
+        with self.lock:
+            line, self.pending = self.pending, ""
+        if line:
+            self.session.log(self.level, line)
+
+
+def capture_output(session: Session) -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stdout = HostLog(session, "info")
+    sys.stderr = HostLog(session, "error")
+
+
+def truncate_log(message: str) -> str:
+    encoded = message.encode()
+    if len(encoded) <= LOG_LIMIT_BYTES:
+        return message
+    return encoded[:LOG_LIMIT_BYTES].decode(errors="ignore")
+
+
+def running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
 def reply_id(message: Document) -> int:
     # Python reuses each command's message ID as the ID of its database call.
     return cast(int, message["call_id" if message["type"] == "database_result" else "message_id"])
 
 
 def attached_actor(message: Document, actor_names: Collection[str]) -> Document:
-    if message.get("type") != "attached" or message.get("protocol") != 31:
+    if message.get("type") != "attached" or message.get("protocol") != 32:
         raise ValueError("unsupported executor protocol")
     actor = cast(Document, message["actor"])
     for field, size in (("project_id", 64), ("actor_name", 255), ("actor_id", 128)):

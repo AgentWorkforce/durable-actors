@@ -1,3 +1,5 @@
+#[path = "../../fixtures/spans.rs"]
+mod spans;
 use super::*;
 use crate::request_tracking::HostState;
 use crate::{
@@ -130,10 +132,14 @@ async fn queued_response_reuses_observability_queue_wait() -> Result<()> {
 fn assert_trace_metadata(reply: &Value, trace: crate::request_traces::RequestTrace) {
     // Decode both through JSON, as the HTTP response and observability API do.
     let trace: Value = serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+    let mut metadata = reply["metadata"].clone();
+    let duration = metadata["durationMs"].take().as_f64().unwrap();
+    // Spans store whole nanoseconds.
+    assert!((duration - trace["durationMs"].as_f64().unwrap()).abs() < 1e-6);
     assert_eq!(
-        reply["metadata"],
+        metadata,
         json!({
-            "durationMs": trace["durationMs"],
+            "durationMs": null,
             "queueWaitMs": trace["queueWaitMs"],
             "hostState": trace["hostState"],
             "routingMs": trace["routingMs"],
@@ -240,7 +246,7 @@ fn without_metadata(mut reply: Value) -> Value {
 struct HttpHost {
     host: Arc<ActorHost>,
     started: mpsc::UnboundedReceiver<String>,
-    traces: mpsc::Receiver<crate::request_traces::RequestTrace>,
+    traces: mpsc::UnboundedReceiver<crate::request_traces::RequestTrace>,
     release: Arc<tokio::sync::Semaphore>,
     issuer: ActorJwtIssuer,
     grant: Option<InvocationGrant>,
@@ -253,7 +259,7 @@ impl HttpHost {
     async fn start(grant: Option<InvocationGrant>) -> Result<Self> {
         let (started_tx, started) = mpsc::unbounded_channel();
         let storage = Arc::new(FakeAuthority::default());
-        let (trace_sender, traces) = crate::request_traces::TraceSender::channel(16);
+        let (tracer, traces) = spans::request_spans();
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let sockets = Arc::new(HostSockets::new(
             counter(),
@@ -275,7 +281,7 @@ impl HttpHost {
                 sockets.clone(),
                 replication().await,
             )
-            .with_traces(trace_sender),
+            .with_traces(tracer),
         );
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
         let issuer = ActorJwtIssuer::from_base64_pkcs8(
