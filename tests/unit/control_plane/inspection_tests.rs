@@ -982,7 +982,9 @@ async fn residency_api_filters_projects_and_actors_and_validates_ranges() -> Res
     }
     let base = "/v1/projects/alpha/observe/residency";
     let history: Value = fixture
-        .get(&format!("{base}?actorName=Room.with.dots"))
+        .get(&format!(
+            "{base}?actorName=Room.with.dots&toMs=9007199254740991"
+        ))
         .await?
         .error_for_status()?
         .json()
