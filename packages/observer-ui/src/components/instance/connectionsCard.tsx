@@ -1,6 +1,7 @@
 import { useState } from "react"
 
 import { formatClock, formatDuration, formatPlural, formatPreciseTimeSpan } from "../../format.js"
+import { websocketActivity } from "../../lib/requestStats.js"
 import { sessionSpan } from "../../lib/sockets.js"
 import { describeWindow } from "../../lib/timeRange.js"
 import { cn } from "../../lib/utils.js"
@@ -46,7 +47,7 @@ export function ConnectionsCard({ instance, sessions, livePeriods, requests, fai
                             <>
                                 <InstanceRow instance={instance} periods={livePeriods} requests={requests} timeWindow={timeWindow} />
                                 {shown.map(row => (
-                                    <SocketRow key={row.session.connectionId} row={row} timeWindow={timeWindow} />
+                                    <SocketRow key={row.session.connectionId} row={row} requests={requests} timeWindow={timeWindow} />
                                 ))}
                                 {!sockets.length && <p className="pb-2 text-[13px] text-muted-foreground">No connections, {describeWindow(timeWindow)}.</p>}
                             </>
@@ -124,8 +125,11 @@ function InstanceRow({ instance, periods, requests, timeWindow }: InstanceRowPro
     )
 }
 
-function SocketRow({ row: { session, open, span, segment }, timeWindow }: { row: Connection; timeWindow: TimeWindow }) {
-    const failedClose = !open && session.failures > 0
+function SocketRow({ row: { session, open, span, segment }, requests, timeWindow }: { row: Connection; requests: RequestTrace[] | null; timeWindow: TimeWindow }) {
+    const activity = requests ? websocketActivity(requests, session.connectionId, segment) : null
+    const messages = activity?.messages ?? session.messages
+    const failures = activity?.failures ?? session.failures
+    const failedClose = !open && failures > 0
     return (
         <div className={`${rowGrid} h-11 border-b border-border/50 last:border-b-0`}>
             <div className="min-w-0">
@@ -133,20 +137,20 @@ function SocketRow({ row: { session, open, span, segment }, timeWindow }: { row:
                     {session.connectionId}
                 </b>
                 <span className={cn("mt-0.5 block truncate text-[11px] text-muted-foreground tabular-nums", failedClose && "text-danger")}>
-                    {open ? `${formatPlural(session.messages, "message")} · ${formatDuration(timeWindow.toMs - span.fromMs)}` : `Closed ${formatClock(span.toMs)}`}
-                    {failedClose && ` · ${formatPlural(session.failures, "failure")}`}
+                    {open ? `${formatPlural(messages, "message")} · ${formatDuration(timeWindow.toMs - span.fromMs)}` : `Closed ${formatClock(span.toMs)}`}
+                    {failedClose && ` · ${formatPlural(failures, "failure")}`}
                 </span>
             </div>
             <TimelineTrack label={`${session.connectionId}: ${open ? "open" : "closed"}, ${formatPreciseTimeSpan(segment.fromMs, segment.toMs)}`}>
-                <SocketSegment session={session} segment={segment} open={open} failed={failedClose} />
+                <SocketSegment messages={messages} failures={failures} segment={segment} open={open} failed={failedClose} />
             </TimelineTrack>
         </div>
     )
 }
 
-type SocketSegmentProps = { session: SocketSession; segment: TimelineSegment; open: boolean; failed: boolean }
+type SocketSegmentProps = { messages: number; failures: number; segment: TimelineSegment; open: boolean; failed: boolean }
 
-function SocketSegment({ session, segment, open, failed }: SocketSegmentProps) {
+function SocketSegment({ messages, failures, segment, open, failed }: SocketSegmentProps) {
     return (
         <Tooltip>
             <TooltipTrigger asChild>
@@ -164,7 +168,7 @@ function SocketSegment({ session, segment, open, failed }: SocketSegmentProps) {
             <TooltipContent className="tabular-nums">
                 <div className="font-medium">{formatPreciseTimeSpan(segment.fromMs, segment.toMs)}</div>
                 <div className="mt-1 opacity-80">
-                    {formatPlural(session.messages, "message")} · {formatPlural(session.failures, "failure")}
+                    {formatPlural(messages, "message")} · {formatPlural(failures, "failure")}
                 </div>
             </TooltipContent>
         </Tooltip>

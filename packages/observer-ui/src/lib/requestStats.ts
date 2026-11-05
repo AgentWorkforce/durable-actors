@@ -1,5 +1,5 @@
 import type { RequestTrace } from "../types/Requests.js"
-import type { TimeWindow } from "../types/TimeRange.js"
+import type { TimeSpan, TimeWindow } from "../types/TimeRange.js"
 
 import { bucketCount, bucketIndex } from "./timeRange.js"
 
@@ -43,6 +43,22 @@ export function requestCounts(requests: RequestTrace[], timeWindow: TimeWindow):
 // Rerouted attempts are retried under the same request, so counting them would double-count.
 export function countable(requests: RequestTrace[]): RequestTrace[] {
     return requests.filter(trace => trace.outcome !== "rerouted")
+}
+
+export function requestsDuring(requests: RequestTrace[], span: TimeSpan): RequestTrace[] {
+    return countable(requests).filter(trace => overlaps(trace, span))
+}
+
+export function websocketActivity(requests: RequestTrace[], connectionId: string, span: TimeSpan): { messages: number; failures: number } {
+    const during = requests.filter(trace => trace.kind === "websocket" && trace.connectionId === connectionId && overlaps(trace, span))
+    return {
+        messages: during.filter(trace => trace.operation === "onMessage").length,
+        failures: during.filter(trace => trace.outcome !== "completed" && trace.outcome !== "rerouted").length
+    }
+}
+
+function overlaps(trace: RequestTrace, span: TimeSpan): boolean {
+    return trace.startedAtMs <= span.toMs && trace.startedAtMs + trace.durationMs >= span.fromMs
 }
 
 export function averageOf(requests: RequestTrace[], pick: TimingPick): number | null {

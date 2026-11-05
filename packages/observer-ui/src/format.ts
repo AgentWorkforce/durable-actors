@@ -14,6 +14,7 @@ const timeSpan = (day: Intl.DateTimeFormat, time: Intl.DateTimeFormat) => (fromM
 
 export const formatClock = (ms: number) => clock.format(ms)
 export const formatPreciseClock = (ms: number) => preciseClock.format(ms)
+export const formatPreciseDateTime = (ms: number) => preciseDateTime.format(ms)
 export const formatTick = (ms: number, spanMs: number) => (spanMs < 86_400_000 ? clock : dateTime).format(ms)
 export const formatTimeSpan = timeSpan(dateTime, clock)
 export const formatPreciseTimeSpan = timeSpan(preciseDateTime, preciseClock)

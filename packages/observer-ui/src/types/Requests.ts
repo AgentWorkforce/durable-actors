@@ -21,6 +21,16 @@ export interface RequestTrace {
 
 export interface RequestTracePage {
     records: RequestTrace[]
+    nextCursor?: string | null
     resumeCursor: string
     snapshot?: boolean
+}
+
+export type RequestHistoryQuery = {
+    fromMs: number
+    toMs: number
+    limit?: number
+    cursor?: string
+    actorName?: string
+    actorId?: string
 }

@@ -3,6 +3,7 @@ import { useParams } from "react-router"
 import { useData } from "../../client/DatatContext.js"
 import { useTimeWindow } from "../../client/TimeRangeContext.js"
 import { formatPlural } from "../../format.js"
+import { useActorTypeRequests } from "../../hooks/useActorRequests.js"
 import { useResidency } from "../../hooks/useResidency.js"
 import { summarizeActorType } from "../../lib/actorTypes.js"
 import { queueTime, serviceTime } from "../../lib/requestStats.js"
@@ -19,11 +20,11 @@ import { TimingCard } from "./timingCard.js"
 
 export function ActorTypePage() {
     const { actorName = "" } = useParams()
-    const { actorTypes, isError, requests, isRequestsError } = useData()
+    const { actorTypes, isError } = useData()
     const timeWindow = useTimeWindow()
+    const { requests: typeRequests, isError: isRequestsError } = useActorTypeRequests(actorName)
     const { residency, isError: isResidencyError } = useResidency(actorName, timeWindow)
     const actor = actorTypes?.actors.find(type => type.actorName === actorName) ?? null
-    const typeRequests = requests?.filter(trace => trace.actorName === actorName) ?? null
 
     return (
         <section aria-labelledby="actor-type-heading" className="flex flex-col gap-5">

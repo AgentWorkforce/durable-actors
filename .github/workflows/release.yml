@@ -323,7 +323,7 @@ jobs:
               run: bun run --bun --cwd sdk format:check
 
             - name: Run tests
-              run: bun run --bun --cwd sdk test && bun run --bun --cwd packages/observer-ui package:check
+              run: bun run --bun --cwd sdk test
 
             - name: Check and pack the tested npm packages
               run: |

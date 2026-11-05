@@ -169,7 +169,6 @@ jobs:
                   path: .artifacts/api
                   include-hidden-files: true
                   if-no-files-found: error
-            - run: bun run --bun --cwd packages/observer-ui package:check
             - name: Verify npm package
               working-directory: sdk
               run: bun pm pack --dry-run

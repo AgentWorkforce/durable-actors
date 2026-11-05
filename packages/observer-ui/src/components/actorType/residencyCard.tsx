@@ -3,6 +3,7 @@ import { Link } from "react-router"
 
 import { formatClock, formatDuration, formatPlural, formatPreciseTimeSpan } from "../../format.js"
 import { byLastActive, instancePath } from "../../lib/actorTypes.js"
+import { requestsDuring } from "../../lib/requestStats.js"
 import { describeWindow } from "../../lib/timeRange.js"
 import { cn } from "../../lib/utils.js"
 import type { ActorInstance, ActorType } from "../../types/Actors.js"
@@ -45,7 +46,7 @@ export function ResidencyCard({ actor, history, requests, failed, timeWindow }: 
                                     key={instance.actorId}
                                     instance={instance}
                                     periods={livePeriods.get(instance.actorId) ?? []}
-                                    requests={requests && requests.filter(trace => trace.actorId === instance.actorId && trace.outcome !== "rerouted")}
+                                    requests={requests && requests.filter(trace => trace.actorId === instance.actorId)}
                                     timeWindow={timeWindow}
                                 />
                             ))
@@ -142,7 +143,7 @@ export function ResidencyTrack({ segments, requests, label }: { segments: Timeli
 }
 
 function LiveSegment({ segment, requests }: { segment: TimelineSegment; requests: RequestTrace[] | null }) {
-    const handled = requests?.filter(trace => trace.startedAtMs <= segment.toMs && trace.startedAtMs + trace.durationMs >= segment.fromMs)
+    const handled = requests && requestsDuring(requests, segment)
     return (
         <Tooltip>
             <TooltipTrigger asChild>
