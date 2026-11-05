@@ -182,7 +182,8 @@ async fn stalled_persistence_has_a_bounded_backlog() -> Result<()> {
     ));
     let store = TraceStore::open(persistence.clone()).await?;
     let mut writes = tokio::task::JoinSet::new();
-    for id in 0..64 {
+    let limit = crate::request_traces::TRACE_WRITE_CONCURRENCY;
+    for id in 0..limit {
         let store = store.clone();
         writes.spawn(async move {
             store
@@ -199,7 +200,7 @@ async fn stalled_persistence_has_a_bounded_backlog() -> Result<()> {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(100),
-            store.record("default", "host", "session", vec![trace(64)], 0),
+            store.record("default", "host", "session", vec![trace(limit)], 0),
         )
         .await?
         .is_err()
@@ -217,7 +218,7 @@ async fn stalled_persistence_has_a_bounded_backlog() -> Result<()> {
             .await?
             .persistence_failed
     );
-    persistence.0.add_permits(64);
+    persistence.0.add_permits(limit);
     while let Some(result) = writes.join_next().await {
         result??;
     }

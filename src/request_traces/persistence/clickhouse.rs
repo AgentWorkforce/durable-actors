@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::{TracePersistence, TraceStatus};
@@ -26,6 +26,9 @@ mod ingestion;
 mod lifecycle;
 mod queries;
 
+// Rows stay queued while ClickHouse is slow; the bound covers memory, not report count.
+const MAX_QUEUED_ROWS: usize = 100_000;
+
 #[derive(Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -36,7 +39,8 @@ pub struct ClickHouseConfig {
 
 pub(crate) struct ClickHouseTracePersistence {
     client: Client,
-    sender: mpsc::Sender<Report>,
+    sender: mpsc::UnboundedSender<Report>,
+    queued_rows: Arc<Semaphore>,
     failed: Arc<AtomicBool>,
     retention_seconds: u64,
 }
@@ -63,7 +67,7 @@ impl ClickHouseTracePersistence {
             .with_user(config.user)
             .with_password(config.password)
             .with_setting("max_execution_time", "10");
-        let (sender, receiver) = mpsc::channel(1024);
+        let (sender, receiver) = mpsc::unbounded_channel();
         let failed = Arc::new(AtomicBool::new(false));
         tokio::spawn(ingestion::run(
             client.clone(),
@@ -76,6 +80,7 @@ impl ClickHouseTracePersistence {
         Ok(Self {
             client,
             sender,
+            queued_rows: Arc::new(Semaphore::new(MAX_QUEUED_ROWS)),
             failed,
             retention_seconds: retention.as_secs(),
         })
@@ -86,20 +91,40 @@ impl ClickHouseTracePersistence {
             events.len() <= TRACE_BATCH_SIZE,
             "trace batch exceeds limit"
         );
-        let report = Report {
-            events: events.to_vec(),
-            status,
-            lifecycle: None,
-        };
-        self.sender.try_send(report).map_err(|error| {
-            anyhow::anyhow!(
-                "ClickHouse trace queue unavailable: {}",
-                match error {
-                    mpsc::error::TrySendError::Full(_) => "full",
-                    mpsc::error::TrySendError::Closed(_) => "closed",
-                }
-            )
-        })
+        self.send(events.to_vec(), status, None)
+    }
+
+    fn send(
+        &self,
+        events: Vec<TraceEvent>,
+        status: Option<StatusRow>,
+        lifecycle: Option<crate::actor_lifecycle::LifecycleEvent>,
+    ) -> Result<()> {
+        let rows = events.len() + usize::from(status.is_some()) + usize::from(lifecycle.is_some());
+        if rows == 0 {
+            return Ok(());
+        }
+        let permit = self
+            .queued_rows
+            .clone()
+            .try_acquire_many_owned(u32::try_from(rows)?)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "ClickHouse trace queue unavailable: {}",
+                    match error {
+                        TryAcquireError::NoPermits => "full",
+                        TryAcquireError::Closed => "closed",
+                    }
+                )
+            })?;
+        self.sender
+            .send(Report {
+                events,
+                status,
+                lifecycle,
+                permit,
+            })
+            .map_err(|_| anyhow::anyhow!("ClickHouse trace queue unavailable: closed"))
     }
 }
 
@@ -187,6 +212,7 @@ struct Report {
     events: Vec<TraceEvent>,
     status: Option<StatusRow>,
     lifecycle: Option<crate::actor_lifecycle::LifecycleEvent>,
+    permit: OwnedSemaphorePermit,
 }
 
 #[derive(Row, Serialize)]

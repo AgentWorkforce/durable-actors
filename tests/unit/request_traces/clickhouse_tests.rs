@@ -177,9 +177,15 @@ async fn unavailable_clickhouse_cannot_block_reports_and_the_queue_is_bounded() 
     let store = TraceStore::open(backend.clone()).await?;
     let trace = super::super::contract_tests::event("bounded").trace;
     tokio::time::timeout(Duration::from_secs(2), async {
-        for _ in 0..1024 {
+        for _ in 0..MAX_QUEUED_ROWS / TRACE_BATCH_SIZE {
             store
-                .record("default", "host", "session", vec![trace.clone()], 0)
+                .record(
+                    "default",
+                    "host",
+                    "session",
+                    vec![trace.clone(); TRACE_BATCH_SIZE],
+                    0,
+                )
                 .await?;
         }
         assert!(
@@ -188,7 +194,7 @@ async fn unavailable_clickhouse_cannot_block_reports_and_the_queue_is_bounded() 
                 .await
                 .is_err()
         );
-        assert_eq!(backend.sender.capacity(), 0);
+        assert_eq!(backend.queued_rows.available_permits(), 0);
         assert!(matches!(
             live.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)

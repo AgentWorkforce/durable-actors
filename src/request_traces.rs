@@ -23,8 +23,11 @@ use persistence::{TracePersistence, sqlite::SqliteTracePersistence};
 use replay::ReplayQuery;
 
 pub(crate) const TRACE_CAPACITY: usize = 500;
-pub(crate) const TRACE_BATCH_SIZE: usize = 64;
+pub(crate) const TRACE_BATCH_SIZE: usize = 2000;
 pub(crate) const TRACE_METADATA_LIMIT: usize = 4096;
+pub(crate) const TRACE_WRITE_CONCURRENCY: usize = 256;
+// Bounded because the queue shares the actor sandbox's memory limit.
+const TRACE_QUEUE_CAPACITY: usize = 100_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -263,7 +266,7 @@ impl TraceStore {
 
     fn new(persistence: Arc<dyn TracePersistence>) -> Self {
         Self {
-            pending: Arc::new(tokio::sync::Semaphore::new(64)),
+            pending: Arc::new(tokio::sync::Semaphore::new(TRACE_WRITE_CONCURRENCY)),
             persistence,
             live: None,
         }
@@ -346,7 +349,7 @@ impl TraceSender {
         client: Arc<crate::control_plane::ControlPlaneClient>,
         stop: tokio_util::sync::CancellationToken,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel(1024);
+        let (sender, receiver) = mpsc::channel(TRACE_QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         tokio::spawn(export_traces(client, receiver, dropped.clone(), stop));
         Self { sender, dropped }
@@ -389,9 +392,7 @@ async fn report_batch(
     if count == 0 && missing == 0 {
         return 0;
     }
-    let reported =
-        tokio::time::timeout(Duration::from_secs(3), client.report_traces(batch, missing)).await;
-    if !matches!(reported, Ok(Ok(()))) {
+    if client.report_traces(batch, missing).await.is_err() {
         lost.fetch_add((count as u64).saturating_add(missing), Ordering::Relaxed);
     }
     count

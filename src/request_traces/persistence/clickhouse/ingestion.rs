@@ -2,10 +2,11 @@ use super::*;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_INSERT_EVENTS: usize = 50_000;
 
 pub(super) async fn run(
     client: Client,
-    mut receiver: mpsc::Receiver<Report>,
+    mut receiver: mpsc::UnboundedReceiver<Report>,
     failed: Arc<AtomicBool>,
     retention: u64,
     publisher: Arc<dyn CommittedTracePublisher>,
@@ -18,7 +19,7 @@ pub(super) async fn run(
             batch.push(first);
             let deadline = tokio::time::sleep(FLUSH_INTERVAL);
             tokio::pin!(deadline);
-            while batch.events.len() < 1024
+            while batch.events.len() < MAX_INSERT_EVENTS
                 && batch.status.len() < 128
                 && batch.lifecycle.len() < 1024
             {
@@ -83,6 +84,8 @@ struct Batch {
     events: Vec<TraceEvent>,
     status: Vec<StatusRow>,
     lifecycle: Vec<crate::actor_lifecycle::LifecycleEvent>,
+    // Released only after the batch is written, so retried rows still count against the bound.
+    permits: Vec<OwnedSemaphorePermit>,
 }
 
 impl Batch {
@@ -90,6 +93,7 @@ impl Batch {
         self.events.extend(report.events);
         self.status.extend(report.status);
         self.lifecycle.extend(report.lifecycle);
+        self.permits.push(report.permit);
     }
 
     async fn write(&self, client: &Client) -> Result<()> {
