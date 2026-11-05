@@ -26,7 +26,7 @@ Other settings are environment variables. See [Configuration](configuration.md).
 
 ## durable-actors init
 
-Create a sample actor project.
+Create a sample actor project. The project includes the `durable-actors-quickstart` agent skill in `.agents/skills` and `.claude/skills`.
 
 ```sh
 durable-actors init <directory> [--template <name>]

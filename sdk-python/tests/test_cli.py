@@ -10,6 +10,7 @@ import time
 import tomllib
 from contextlib import contextmanager
 from importlib.metadata import version
+from pathlib import Path
 
 import httpx
 import pytest
@@ -139,6 +140,11 @@ def test_init_and_local_generation_need_only_python(tmp_path, cli_env):
     assert not (project / "bunfig.toml").exists()
     assert not (project / "node_modules").exists()
     assert (project / ".gitignore").is_file()
+    # Wheels cannot include files outside sdk-python, so the package keeps a copy of the root skill.
+    skill = Path(__file__).parents[2] / "skills/durable-actors-quickstart/SKILL.md"
+    for agent in (".agents", ".claude"):
+        installed = project / agent / "skills/durable-actors-quickstart/SKILL.md"
+        assert installed.read_text() == skill.read_text()
     existing = cli(tmp_path, cli_env, "init", "counter", check=False)
     assert existing.returncode != 0
     assert "Traceback" not in existing.stderr

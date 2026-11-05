@@ -152,6 +152,8 @@ def initialize(directory: Path) -> None:
             .replace("SDK_VERSION", version("durable-actors"))
         )
         (directory / "gitignore").rename(directory / ".gitignore")
+        for agent in (".agents", ".claude"):
+            shutil.copytree(Path(__file__).with_name("skills"), directory / agent / "skills")
     except BaseException:
         shutil.rmtree(directory)
         raise

@@ -4,6 +4,11 @@ import path from "node:path"
 const { version } = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
 
 for (const template of ["actor", "chat", "ai-chat", "documents"]) await buildTemplate(template)
+await cp(
+    new URL("../../skills/durable-actors-quickstart/", import.meta.url),
+    new URL("../dist/skills/durable-actors-quickstart/", import.meta.url),
+    { recursive: true }
+)
 
 async function buildTemplate(template) {
     const source = new URL(

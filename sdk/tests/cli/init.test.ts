@@ -19,7 +19,16 @@ for (const template of ["actor", "chat", "ai-chat", "documents"]) {
         const project = path.join(directory, name)
         await run(process.execPath, [cli, "init", name, "--template", template], { cwd: directory })
         const metadata = JSON.parse(await readFile(path.join(project, "package.json"), "utf8"))
-        const files = [".gitignore", "README.md", "bunfig.toml", "package.json", "src", "tsconfig.json"]
+        const files = [
+            ".agents",
+            ".claude",
+            ".gitignore",
+            "README.md",
+            "bunfig.toml",
+            "package.json",
+            "src",
+            "tsconfig.json"
+        ]
         if (template !== "actor") files.push(".env.example", "index.html")
         assert.deepEqual((await readdir(project)).sort(), files.sort())
         assert.equal(metadata.name, name)
@@ -85,6 +94,12 @@ test("init defaults to a standalone actor project that can typecheck and generat
     assert.equal(metadata.scripts.check, "tsc --noEmit")
     assert.deepEqual(await readdir(path.join(project, "src")), ["actors.ts"])
     assert.match(await readFile(path.join(project, ".gitignore"), "utf8"), /\.durable-actors\//)
+    const skill = await readFile(path.join(sdk, "../skills/durable-actors-quickstart/SKILL.md"), "utf8")
+    for (const agent of [".agents", ".claude"])
+        assert.equal(
+            await readFile(path.join(project, agent, "skills/durable-actors-quickstart/SKILL.md"), "utf8"),
+            skill
+        )
     assert.match(stdout, /bun install/)
     assert.match(stdout, /\n\s+bunx durable-actors dev\n/)
     assert.match(stdout, /separate.*project/i)

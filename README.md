@@ -165,7 +165,7 @@ For complete sample applications, see [AI Chat](examples/ai-chat), [Collaborativ
 
 ## Build with a coding agent
 
-In Claude Code, install the plugin:
+Projects created with `durable-actors init` already include the skill. To use it elsewhere in Claude Code, install the plugin:
 
 ```
 /plugin install durable-actors --marketplace TerseAI/durable-actors

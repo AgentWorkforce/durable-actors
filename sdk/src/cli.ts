@@ -60,6 +60,7 @@ async function initializeProject(directory: string, options: { template: string 
         await rename(path.join(destination, "gitignore"), path.join(destination, ".gitignore"))
         await rename(path.join(destination, "bunfig"), path.join(destination, "bunfig.toml"))
         await nameProject(destination)
+        await addAgentSkills(destination)
     } catch (error) {
         await rm(destination, { recursive: true, force: true })
         throw error
@@ -78,6 +79,14 @@ async function nameProject(destination: string): Promise<void> {
         .slice(0, 214)
     if (validatePackageName(name).validForNewPackages) metadata.name = name
     await writeFile(manifest, JSON.stringify(metadata, null, 4) + "\n")
+}
+
+async function addAgentSkills(destination: string): Promise<void> {
+    for (const agent of [".agents", ".claude"])
+        await cp(new URL("./skills/", import.meta.url), path.join(destination, agent, "skills"), {
+            recursive: true,
+            force: false
+        })
 }
 
 function projectInstructions(destination: string, template: string): string {
