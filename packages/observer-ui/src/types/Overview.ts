@@ -11,6 +11,14 @@ export interface RequestRateMetrics {
     series: number[]
 }
 
+export interface RequestCountMetrics {
+    total: number
+    perSecond: number
+    peak: number
+    peakAt: string
+    series: number[]
+}
+
 export interface SocketMetrics {
     open: number
     change: number

@@ -1,5 +1,3 @@
-import { useData } from "../../client/DatatContext.js"
-import { useTimeWindow } from "../../client/TimeRangeContext.js"
 import { formatClock, formatDecimal } from "../../format.js"
 import { average, requestRates } from "../../lib/requestStats.js"
 import { bucketCount, bucketEnd, bucketLabel, describeWindow, windowTicks } from "../../lib/timeRange.js"
@@ -8,11 +6,6 @@ import type { RequestTrace } from "../../types/Requests.js"
 import type { TimeWindow } from "../../types/TimeRange.js"
 import { Skeleton } from "../ui/skeleton.js"
 import { TrendCard, TrendStat, TrendStatsSkeleton } from "../ui/trendCard.js"
-
-export function RequestRateCard() {
-    const { requests, isRequestsError } = useData()
-    return <RequestRateTrend requests={requests} failed={isRequestsError} timeWindow={useTimeWindow()} color="var(--chart-1)" />
-}
 
 export type RequestRateTrendProps = {
     requests: RequestTrace[] | null
