@@ -22,7 +22,11 @@ pub enum DatabaseCall {
         #[serde(default)]
         immediate: bool,
     },
-    Fields,
+    /// Every stored field, or only `names` when given.
+    Fields {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        names: Option<Vec<String>>,
+    },
     InitializeFields {
         fields: BTreeMap<String, Box<RawValue>>,
     },
@@ -64,7 +68,10 @@ enum DatabaseCallWire {
         #[serde(default)]
         immediate: bool,
     },
-    Fields,
+    Fields {
+        #[serde(default)]
+        names: Option<Vec<String>>,
+    },
     InitializeFields {
         fields: BTreeMap<String, Value>,
     },
@@ -108,7 +115,7 @@ impl<'de> Deserialize<'de> for DatabaseCall {
                 bindings,
                 immediate,
             },
-            DatabaseCallWire::Fields => Self::Fields,
+            DatabaseCallWire::Fields { names } => Self::Fields { names },
             DatabaseCallWire::InitializeFields { fields } => Self::InitializeFields {
                 fields: raw_fields(fields)?,
             },

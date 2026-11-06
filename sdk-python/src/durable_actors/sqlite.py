@@ -61,8 +61,15 @@ class DatabaseProxy:
     async def fields(self) -> Document:
         return cast(Document, expect(await self.call({"op": "fields"}), "fields")["fields"])
 
-    async def replace_fields(self, fields: Document) -> None:
-        await self.call({"op": "replace_fields", "fields": fields})
+    async def update_fields(self, stored: Document, fields: Document) -> None:
+        """Writes the fields that differ from `stored` and deletes the ones `fields` dropped."""
+        for name, value in fields.items():
+            if name not in stored or stored[name] != value:
+                await self.call(
+                    {"op": "persist_field", "name": name, "value": value, "immediate": False}
+                )
+        for name in stored.keys() - fields.keys():
+            await self.call({"op": "delete_field", "name": name, "immediate": False})
 
     async def begin(self) -> None:
         await self.call({"op": "exec", "sql": "BEGIN", "bindings": [], "immediate": False})

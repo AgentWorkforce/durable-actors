@@ -195,7 +195,7 @@ async def test_a_pending_sql_statement_does_not_block_other_completions():
             if call["op"] == "exec" and call["sql"].startswith("CREATE TABLE"):
                 entered.set()
                 await release.wait()
-            if call["op"] == "replace_fields":
+            if call["op"] == "persist_field":
                 persisting.set()
             return await super().call(call)
 

@@ -73,8 +73,6 @@ impl Engine {
             "PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;
             PRAGMA wal_autocheckpoint = 0; PRAGMA synchronous = FULL",
         )?;
-        let check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        anyhow::ensure!(check == "ok", "invalid actor SQLite database");
         let committed = Arc::new(AtomicBool::new(false));
         let commit = committed.clone();
         connection.commit_hook(Some(move || {
@@ -93,7 +91,7 @@ impl Engine {
         let result = match call {
             DatabaseCall::Commit => self.finish("COMMIT"),
             DatabaseCall::Rollback => self.finish("ROLLBACK"),
-            DatabaseCall::Fields => self.fields(),
+            DatabaseCall::Fields { names } => self.fields(names.as_deref()),
             DatabaseCall::Alarm
             | DatabaseCall::SetAlarm { .. }
             | DatabaseCall::DeleteAlarm { .. } => {
@@ -114,7 +112,7 @@ impl Engine {
             DatabaseCall::PersistField { name, value, .. } => self.persist(&name, &value)?,
             DatabaseCall::DeleteField { name, .. } => self.delete(&name)?,
             DatabaseCall::ReplaceFields { fields } => self.replace(&fields)?,
-            DatabaseCall::Fields
+            DatabaseCall::Fields { .. }
             | DatabaseCall::Alarm
             | DatabaseCall::SetAlarm { .. }
             | DatabaseCall::DeleteAlarm { .. }
@@ -167,12 +165,14 @@ impl Engine {
         }
     }
 
-    fn fields(&self) -> Result<DatabaseResult> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT name, value FROM __terse_fields")?;
+    fn fields(&self, names: Option<&[String]>) -> Result<DatabaseResult> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, value FROM __terse_fields
+            WHERE ?1 IS NULL OR name IN (SELECT value FROM json_each(?1))",
+        )?;
+        let names = names.map(serde_json::to_string).transpose()?;
         let fields = statement
-            .query_map([], |row| {
+            .query_map([names], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .map(|row| {

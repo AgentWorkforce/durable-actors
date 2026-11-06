@@ -36,6 +36,10 @@ pub(crate) trait ActorStorage: Send + Sync {
         owner_epoch: u64,
         expected_version: u64,
     ) -> Result<WritePlan>;
+    /// How often the captured history needs a full copy; `None` when the store checkpoints.
+    fn full_snapshots(&self) -> Option<std::time::Duration> {
+        Some(crate::litestream::FULL_SNAPSHOT_INTERVAL)
+    }
 }
 
 #[derive(Clone, Debug)]

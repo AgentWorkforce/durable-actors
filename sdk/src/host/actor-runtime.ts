@@ -28,6 +28,7 @@ class ActorRuntime {
     private sequence = 0
     private lastCompletedState: JsonObject | undefined
     private fatal: ActorExecutorReply | undefined
+    private readonly emitted: readonly string[]
 
     constructor(
         private readonly definition: ActorDefinition,
@@ -39,6 +40,7 @@ class ActorRuntime {
         }
     ) {
         this.schemas = { ...definition.schemas, contract: definition.state.contract }
+        this.emitted = emittableFields(definition.state).map(field => field.name)
         if (this.interleaved)
             database.rejectTransactions(
                 `${definition.actorName} uses @Interleave, so overlapping calls cannot share an explicit database transaction`
@@ -112,7 +114,7 @@ class ActorRuntime {
             )
         }
 
-        const before = this.database.fields()
+        const before = this.socketState()
         try {
             this.admitNext(command.method)
             const execution = await runWithActorSockets(
@@ -129,7 +131,7 @@ class ActorRuntime {
             const result: JsonValue = execution.value === undefined ? null : cloneJson(execution.value, "actor result")
             if (this.fatal !== undefined) return this.fatal
             validateActorState(instance, this.definition.state)
-            const state = this.database.fields()
+            const state = this.socketState()
             const effects = [...execution.effects, ...this.stateUpdates(before, state)]
             this.database.commit()
 
@@ -154,7 +156,7 @@ class ActorRuntime {
         const instance = await this.prepare(command)
         const methodName = lifecycleMethod(command)
         const method: unknown = Reflect.get(instance, methodName)
-        const before = this.database.fields()
+        const before = this.socketState()
         try {
             this.admitNext(methodName)
             const execution = await runWithActorSockets(
@@ -179,7 +181,7 @@ class ActorRuntime {
 
             if (this.fatal !== undefined) return this.fatal
             validateActorState(instance, this.definition.state)
-            const state = this.database.fields()
+            const state = this.socketState()
             const effects = [
                 ...execution.effects,
                 ...this.stateUpdates(
@@ -230,14 +232,21 @@ class ActorRuntime {
         this.instance = undefined
     }
 
+    // Socket effects only compare and send emitted fields, so only those are read per call.
+    private socketState(): JsonObject {
+        return this.emitted.length === 0 ? {} : this.database.fields(this.emitted)
+    }
+
     private async createInstance(identity: ActorIdentity, state: JsonValue | null): Promise<AnyActor> {
         const context = RuntimeActorContext.runtime(identity.actor_id, this.database)
         const instance = context.construct(this.definition.actorClass) as AnyActor
         validateActorState(instance, this.definition.state)
-        if (state !== null) hydrateActorState(instance, persistedState(state), this.definition.state)
-        this.database.initializeFields(snapshotActorState(instance, this.definition.state))
+        const stored = state === null ? {} : persistedState(state)
+        if (state !== null) hydrateActorState(instance, stored, this.definition.state)
+        const unsaved = unsavedState(instance, stored, this.definition.state)
+        if (Object.keys(unsaved).length > 0) this.database.initializeFields(unsaved)
         bindPersistedFields(instance, context, this.definition.state, this.database)
-        if (this.interleaved) this.lastCompletedState = this.database.fields()
+        if (this.interleaved) this.lastCompletedState = this.socketState()
         this.instance = instance
 
         const resources = this.definition.state.fields.filter(field => field.resource)
@@ -343,6 +352,23 @@ function persistedState(value: JsonValue): JsonObject {
         throw new ActorProtocolError("persisted actor state must be a JSON object")
     }
     return value
+}
+
+// Fields the database doesn't hold yet, such as a default for a field added since the last write.
+function unsavedState(instance: object, stored: JsonObject, schema: ActorSchema): JsonObject {
+    return cloneJsonObject(
+        Object.fromEntries(
+            schema.fields
+                .filter(
+                    field =>
+                        field.persistence === Persistence.Persisted &&
+                        Object.hasOwn(instance, field.name) &&
+                        !Object.hasOwn(stored, field.name)
+                )
+                .map(field => [field.name, Reflect.get(instance, field.name)])
+        ),
+        "actor state"
+    )
 }
 
 function snapshotActorState(instance: object, schema: ActorSchema): JsonObject {

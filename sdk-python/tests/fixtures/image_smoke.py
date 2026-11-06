@@ -120,8 +120,10 @@ class FieldStore:
         if op == "exec" and call["sql"] == "BEGIN":
             self.pending = self.committed.copy()
             return {"type": "rows", "columns": [], "rows": []}
-        if op == "replace_fields":
-            self.pending = call["fields"]
+        if op == "persist_field":
+            self.pending[call["name"]] = call["value"]
+        elif op == "delete_field":
+            self.pending.pop(call["name"], None)
         elif op == "commit":
             self.committed = self.pending
         elif op == "rollback":

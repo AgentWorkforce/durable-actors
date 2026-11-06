@@ -13,7 +13,7 @@ pub async fn replication() -> Arc<dyn Replicator> {
 }
 
 pub async fn fields(database: &dyn ActorDatabase) -> Result<Value> {
-    match database.call(DatabaseCall::Fields).await? {
+    match database.call(DatabaseCall::Fields { names: None }).await? {
         DatabaseResult::Fields { fields } => Ok(serde_json::to_value(fields)?),
         other => anyhow::bail!("unexpected fields result {other:?}"),
     }

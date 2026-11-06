@@ -2436,7 +2436,10 @@ async fn database_handles_expire_with_their_invocation() -> Result<()> {
     );
     assert_eq!(invoke(&host, "request-1").await?, completed(1));
     let retained = executor.0.lock().unwrap().clone().unwrap();
-    let error = retained.call(DatabaseCall::Fields).await.unwrap_err();
+    let error = retained
+        .call(DatabaseCall::Fields { names: None })
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("no active invocation"));
     host.drain(Duration::from_secs(1)).await?;
     Ok(())

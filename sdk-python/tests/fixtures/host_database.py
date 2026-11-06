@@ -51,6 +51,10 @@ class HostDatabase:
             return self.write(call["immediate"], lambda: self.update_alarm(None))
         if op == "replace_fields":
             return self.write(False, lambda: self.replace(call["fields"]))
+        if op == "persist_field":
+            return self.write(call["immediate"], lambda: self.persist(call["name"], call["value"]))
+        if op == "delete_field":
+            return self.write(call["immediate"], lambda: self.delete(call["name"]))
         if op == "commit":
             self.commit()
             return {"type": "done"}
@@ -110,6 +114,16 @@ class HostDatabase:
             "DELETE FROM __terse_fields WHERE name NOT IN (SELECT value FROM json_each(?))",
             (json.dumps(list(fields)),),
         )
+
+    def persist(self, name, value):
+        self.connection.execute(
+            "INSERT INTO __terse_fields VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",
+            (name, json.dumps(value, separators=(",", ":"))),
+        )
+
+    def delete(self, name):
+        self.connection.execute("DELETE FROM __terse_fields WHERE name = ?", (name,))
 
     def commit(self):
         if self.connection.in_transaction:

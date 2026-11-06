@@ -230,7 +230,8 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
         })
         .sum();
     assert!(sqlite.files[0].data.len() < original_size);
-    let restored = SqliteCapture::restore(replication.clone(), &sqlite.files, sqlite.txid).await?;
+    let restored =
+        SqliteCapture::restore(replication.clone(), &sqlite.files, sqlite.txid, None).await?;
     let db = rusqlite::Connection::open(restored.path())?;
     assert_eq!(
         crate::litestream::storage::read_fields(&db)?,
@@ -402,7 +403,7 @@ async fn write_history(
     use crate::litestream::{Litestream, Replicator, storage::SqliteCapture};
     writer.start(&f.stream).await?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone()).await?;
+    let mut capture = SqliteCapture::new(replication.clone(), None).await?;
     let db = rusqlite::Connection::open(capture.path())?;
     db.execute_batch(
         "CREATE TABLE entries(value INTEGER); INSERT INTO __terse_fields VALUES ('count', '0');",
@@ -595,7 +596,7 @@ async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> 
     };
     let f = Fixture::new()?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone()).await?;
+    let mut capture = SqliteCapture::new(replication.clone(), None).await?;
     let db = rusqlite::Connection::open(capture.path())?;
     db.execute_batch("INSERT INTO __terse_fields VALUES ('count','1'); CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES (1);")?;
     let txid = replication.sync(&capture.path()).await?;
@@ -643,7 +644,7 @@ async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> 
     parent.verify(&parent_bytes)?;
     let mut files = StateSnapshot::decode(&parent_bytes)?.sqlite.files;
     files.extend(second.sqlite.files);
-    let restored = SqliteCapture::restore(replication, &files, txid).await?;
+    let restored = SqliteCapture::restore(replication, &files, txid, None).await?;
     let db = rusqlite::Connection::open(restored.path())?;
     assert_eq!(
         db.query_row(

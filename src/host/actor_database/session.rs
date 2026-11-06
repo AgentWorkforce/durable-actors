@@ -208,7 +208,8 @@ impl DatabaseSession {
             let cached = if activation.state_version == 0 {
                 ResidentDatabase::open(
                     activation.owner_epoch,
-                    SqliteCapture::new(self.replication.clone()).await?,
+                    SqliteCapture::new(self.replication.clone(), self.storage.full_snapshots())
+                        .await?,
                 )
                 .await?
             } else {
@@ -307,7 +308,7 @@ impl DatabaseSession {
             ensure!(loaded.is_empty(), "uninitialized actor has state");
             return ResidentDatabase::open(
                 owner_epoch,
-                SqliteCapture::new(self.replication.clone()).await?,
+                SqliteCapture::new(self.replication.clone(), self.storage.full_snapshots()).await?,
             )
             .await;
         }
@@ -338,8 +339,13 @@ impl DatabaseSession {
         let sqlite = self.storage.read_sqlite(loaded).await?;
         let history_ms = started.elapsed().as_secs_f64() * 1000.0;
         let apply_started = std::time::Instant::now();
-        let capture =
-            SqliteCapture::restore(self.replication.clone(), &sqlite.files, sqlite.txid).await?;
+        let capture = SqliteCapture::restore(
+            self.replication.clone(),
+            &sqlite.files,
+            sqlite.txid,
+            self.storage.full_snapshots(),
+        )
+        .await?;
         tracing::info!(event = "actor_sqlite_restored", host_id = %self.endpoint.id, state_version,
             history_ms, apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0);

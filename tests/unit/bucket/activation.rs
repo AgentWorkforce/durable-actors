@@ -57,8 +57,10 @@ async fn sqlite_dependencies_must_exist_in_the_snapshot_backend_before_publicati
         .prepare_actor_write(&f.actor, &active.placement.lease, 1, 2)
         .await?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone()).await?;
-    let initial = capture.txid();
+    let mut capture = SqliteCapture::new(replication.clone(), None).await?;
+    let database = rusqlite::Connection::open(capture.path())?;
+    database.execute("INSERT INTO __terse_fields VALUES ('seed', '1')", [])?;
+    let initial = replication.sync(&capture.path()).await?;
     let first = StateSnapshot::new(
         1,
         1,
@@ -71,7 +73,6 @@ async fn sqlite_dependencies_must_exist_in_the_snapshot_backend_before_publicati
         serde_json::Value::Null,
     )?;
     let first_bytes = first.encode()?;
-    let database = rusqlite::Connection::open(capture.path())?;
     database.execute("INSERT INTO __terse_fields VALUES ('count', '1')", [])?;
     let changed = replication.sync(&capture.path()).await?;
     let next = StateSnapshot::new(

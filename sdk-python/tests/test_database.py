@@ -39,10 +39,10 @@ async def test_fields_commit_and_rollback_run_on_the_event_loop():
     host = HostDatabase()
     database = DatabaseProxy(host.call, asyncio.get_running_loop())
     await database.begin()
-    await database.replace_fields({"count": 1})
+    await database.update_fields({}, {"count": 1})
     await database.commit()
     await database.begin()
-    await database.replace_fields({"count": 2})
+    await database.update_fields({"count": 1}, {"count": 2})
     await database.rollback()
     assert await database.fields() == {"count": 1}
     assert host.commits == 1

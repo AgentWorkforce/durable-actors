@@ -231,6 +231,14 @@ impl ActorStorage for HostStorage {
         HostStorage::update_alarm(self, timestamp_ms).await
     }
 
+    fn full_snapshots(&self) -> Option<Duration> {
+        // Rapid checkpoints keep restores short, so its write path never carries a full copy.
+        match self.runtime.persistence.rapid_settings() {
+            Some(_) => None,
+            None => Some(crate::litestream::FULL_SNAPSHOT_INTERVAL),
+        }
+    }
+
     fn ensure_authority(&self) -> Result<()> {
         ensure!(
             !self.stop.is_cancelled(),

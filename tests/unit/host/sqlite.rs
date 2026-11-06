@@ -37,7 +37,13 @@ fn raw(value: serde_json::Value) -> Box<serde_json::value::RawValue> {
 }
 
 async fn fields(database: &SqliteDatabase) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(database.call(DatabaseCall::Fields).await?.result?)?["fields"].clone())
+    Ok(serde_json::to_value(
+        database
+            .call(DatabaseCall::Fields { names: None })
+            .await?
+            .result?,
+    )?["fields"]
+        .clone())
 }
 
 #[tokio::test]
@@ -324,7 +330,12 @@ async fn fields_preserve_json_text_and_replacement_removes_missing_names() -> Re
             fields: [("stale".to_string(), raw(json!("ignored")))].into(),
         })
         .await?;
-    let listed = serde_json::to_string(&database.call(DatabaseCall::Fields).await?.result?)?;
+    let listed = serde_json::to_string(
+        &database
+            .call(DatabaseCall::Fields { names: None })
+            .await?
+            .result?,
+    )?;
     assert!(
         listed.contains(r#""nested":{"z":1,"a":[true,null]}"#),
         "{listed}"

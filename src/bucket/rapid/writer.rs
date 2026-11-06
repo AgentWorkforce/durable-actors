@@ -16,6 +16,8 @@ pub(super) struct Session {
     retirement_error: Option<String>,
     latest: Option<(String, Bytes)>,
     version: u64,
+    /// The version the current segment opened after; equal to `version` while it holds no frames.
+    installed_at: u64,
     standard: bool,
     healthy: bool,
     rotated: Instant,
@@ -41,6 +43,7 @@ impl Session {
             retirement_error: None,
             latest: None,
             version,
+            installed_at: version,
             standard: false,
             healthy: true,
             rotated: Instant::now(),
@@ -147,6 +150,7 @@ impl Session {
 
     fn install(&mut self, storage: Arc<LogStorage>, segment: Option<Segment>) {
         self.standard = segment.is_none();
+        self.installed_at = self.version;
         self.archive = segment
             .as_ref()
             .map(|s| Archiver::new(storage, s.manifest.clone(), self.version));
@@ -164,7 +168,7 @@ impl Session {
             || self.standard
             || self.retired.is_some()
             || self.rotated.elapsed() < ROTATION_INTERVAL
-            || self.latest.is_none()
+            || self.version == self.installed_at
         {
             return;
         }

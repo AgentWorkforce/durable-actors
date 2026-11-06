@@ -15,7 +15,7 @@ type DatabaseValue =
 
 type DatabaseCall =
     | { readonly op: "exec"; readonly sql: string; readonly bindings: DatabaseValue[]; readonly immediate: boolean }
-    | { readonly op: "fields" }
+    | { readonly op: "fields"; readonly names?: readonly string[] }
     | { readonly op: "initialize_fields"; readonly fields: JsonObject }
     | { readonly op: "persist_field"; readonly name: string; readonly value: JsonValue; readonly immediate: boolean }
     | { readonly op: "delete_field"; readonly name: string; readonly immediate: boolean }
@@ -85,8 +85,9 @@ class DatabaseProxy implements RuntimeActorDatabase, ActorAlarmStorage {
         this.fieldRestores.set(name, restore)
     }
 
-    fields(): JsonObject {
-        const result = this.transport({ op: "fields" })
+    // With names, only those fields cross from the host: a field read moves its whole value.
+    fields(names?: readonly string[]): JsonObject {
+        const result = this.transport(names === undefined ? { op: "fields" } : { op: "fields", names })
         if (result.type !== "fields") throw unexpected(result)
         return result.fields
     }
