@@ -258,11 +258,8 @@ async fn control_plane_routes(
         stop.child_token(),
         connections.client.clone(),
     )?;
-    let gateway = super::gateway::Gateway::new(
-        &issuer,
-        config.sandbox_provider.public_origin.clone(),
-        socket_gateway,
-    )?;
+    let public_origin = config.sandbox_provider.public_origin.clone();
+    let gateway = super::gateway::Gateway::new(&issuer, public_origin.clone(), socket_gateway)?;
     let mut provisioner = sandbox_provisioner(
         config.sandbox_provider,
         &issuer,
@@ -310,7 +307,7 @@ async fn control_plane_routes(
         Arc::new(service.lifecycle.clone()),
         service.gateway.as_ref().unwrap().connections.clone(),
     ));
-    let discovery = super::discovery::router(&issuer)?;
+    let discovery = super::discovery::router(&issuer, &public_origin)?;
     let admin = super::admin::AdminService::new(config.api_key, registry, issuer)?;
     let inspector =
         super::inspection::ActorInspector::new(inventory, storage.clone(), service.changes.clone())

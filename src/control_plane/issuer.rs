@@ -201,17 +201,6 @@ impl ActorJwtIssuer {
         })?)
     }
 
-    /// OpenID discovery only works when the issuer is the URL that serves this document.
-    pub(crate) fn openid_configuration(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&serde_json::json!({
-            "issuer": self.issuer,
-            "jwks_uri": format!("{}{JWKS_PATH}", self.issuer.trim_end_matches('/')),
-            "response_types_supported": ["id_token"],
-            "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["EdDSA"],
-        }))?)
-    }
-
     pub(crate) fn issue_host(
         &self,
         organization_id: &str,

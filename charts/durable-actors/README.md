@@ -94,7 +94,7 @@ telemetry:
     enabled: true
 ```
 
-The collector accepts only host tokens and replaces any tenant attributes with the token's verified project, actor, host, and session. It fetches the verifying keys from the control plane's `/.well-known/openid-configuration`, so the chart sets the JWT issuer to `publicUrl`. Changing that issuer invalidates tokens held by running sandboxes, so replace them after the upgrade. Sandboxes reach it on port 4317, and sandboxes outside the cluster use the ingress. The control plane creates `otel_traces` and `otel_logs`, and the collector inserts into them with the same ClickHouse user. The old `actor_traces` and `actor_trace_status` tables are no longer written and empty out through their TTL; drop them by hand if you want the space back sooner.
+The collector accepts only host tokens and replaces any tenant attributes with the token's verified project, actor, host, and session. It fetches the verifying keys from `/.well-known/openid-configuration` at `publicUrl` and checks each token's signature and audience but not its issuer, so the control plane keeps its token issuer and tokens held by running sandboxes stay valid. Sandboxes reach it on port 4317, and sandboxes outside the cluster use the ingress. The control plane creates `otel_traces` and `otel_logs`, and the collector inserts into them with the same ClickHouse user. The old `actor_traces` and `actor_trace_status` tables are no longer written and empty out through their TTL; drop them by hand if you want the space back sooner.
 
 ## Usage publishing
 
