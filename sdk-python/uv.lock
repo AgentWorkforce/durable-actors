@@ -133,7 +133,7 @@ wheels = [
 
 [[package]]
 name = "durable-actors"
-version = "0.14.7"
+version = "0.15.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -179,7 +179,7 @@ requires-dist = [
     { name = "anyio", marker = "extra == 'cli'", specifier = ">=4,<5" },
     { name = "click", marker = "extra == 'cli'", specifier = ">=8.1,<9" },
     { name = "datamodel-code-generator", marker = "extra == 'codegen'", specifier = ">=0.83,<0.84" },
-    { name = "durable-actors", extras = ["codegen"], marker = "extra == 'cli'", specifier = "==0.14.7" },
+    { name = "durable-actors", extras = ["codegen"], marker = "extra == 'cli'", specifier = "==0.15.0" },
     { name = "durable-actors-runtime", marker = "extra == 'cli'", directory = "../" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
@@ -209,7 +209,7 @@ dev = [
 
 [[package]]
 name = "durable-actors-runtime"
-version = "0.14.7"
+version = "0.15.0"
 source = { directory = "../" }
 
 [[package]]

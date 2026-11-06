@@ -48,7 +48,7 @@ function releaseBullet(change) {
 function mainFromMain() {
     execFileSync("git", ["fetch", "--quiet", "origin", "main"], { timeout: 60000 })
     const head = execFileSync("git", ["rev-parse", "origin/main"], { encoding: "utf8", timeout: 60000 }).trim()
-    const releases = JSON.parse(execFileSync("gh", ["api", "repos/TerseAI/durable-actors/releases", "--paginate", "--slurp"], { encoding: "utf8", timeout: 60000 })).flat()
+    const releases = JSON.parse(execFileSync("gh", ["api", "repos/TerseAI/durable-actors/releases", "--paginate", "--slurp"], { encoding: "utf8", timeout: 60000, maxBuffer: 64 * 1024 * 1024 })).flat()
     const target = notesTarget({ head, releases })
     process.stdout.write(writeNotes(target.previous, target.tag, target.sha))
 }

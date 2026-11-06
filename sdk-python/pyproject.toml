@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "durable-actors"
-version = "0.14.7"
+version = "0.15.0"
 description = "Typed Python durable actors and generated clients"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,7 +22,7 @@ Documentation = "https://github.com/TerseAI/durable-actors/blob/main/docs/refere
 [project.optional-dependencies]
 codegen = ["datamodel-code-generator>=0.83,<0.84", "mypy>=1.15,<2", "pip>=25,<27"]
 
-cli = ["durable-actors[codegen]==0.14.7", "durable-actors-runtime==0.14.7", "click>=8.1,<9", "python-dotenv>=1,<2", "starlette>=0.47,<2", "uvicorn>=0.35,<1", "anyio>=4,<5"]
+cli = ["durable-actors[codegen]==0.15.0", "durable-actors-runtime==0.15.0", "click>=8.1,<9", "python-dotenv>=1,<2", "starlette>=0.47,<2", "uvicorn>=0.35,<1", "anyio>=4,<5"]
 
 # The native wheel is built from this checkout during repository development.
 # Published package metadata does not contain uv source overrides.
