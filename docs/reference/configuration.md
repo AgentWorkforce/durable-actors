@@ -9,6 +9,7 @@ Configuration uses environment variables. Precedence is to use exported variable
 | `DURABLE_ACTORS_PROJECT_ID`        | `local` on localhost; required remotely | Actor project ID; use the same value in the server registration and backend.                                                |
 | `DURABLE_ACTORS_CONTROL_PLANE_URL` | `http://127.0.0.1:7100`                 | HTTP(S) server origin. Paths, query strings, fragments, and embedded credentials are not allowed.                           |
 | `DURABLE_ACTORS_SECRET`            | Unset                                   | Optional shared secret. Set the same value on the server and backend to enable authentication. Keep it out of browser code. |
+| `DURABLE_ACTORS_INVOKE_API_KEY`    | Unset                                   | Optional long-lived key for backends that only call actors. Accepted solely by `invoke`, `find-actor`, and `find-websocket`; it cannot deploy, issue sessions, read contracts, observe, or publish socket effects, and its invocations are limited to published RPC methods like a session. Must differ from `DURABLE_ACTORS_SECRET`; ignored while that secret is unset. |
 
 ## Diagnostics and runtime overrides
 

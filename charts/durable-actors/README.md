@@ -60,7 +60,7 @@ Every configured copy must durably flush before a Rapid write is acknowledged. W
 
 ## Advanced settings
 
-`credentialsSecret` defaults to `actors-credentials`; it must contain `postgres-url`, `api-key`, and `jwt-signing-key`. For Redis, add the keys named by `redis.urlSecretKey` and, optionally, `redis.caSecretKey`. `nodeSelector` places controllers on ordinary nodes. `networkPolicy.dnsCidrs` permits specific host-networked or link-local DNS endpoints, for example a NodeLocal DNS `/32`. Add only the address your cluster uses.
+`credentialsSecret` defaults to `actors-credentials`; it must contain `postgres-url`, `api-key`, and `jwt-signing-key`. An optional `invoke-api-key` entry sets `DURABLE_ACTORS_INVOKE_API_KEY`, a long-lived key limited to actor invocation, discovery, and WebSocket URLs; the controller does not start if it equals `api-key`. For Redis, add the keys named by `redis.urlSecretKey` and, optionally, `redis.caSecretKey`. `nodeSelector` places controllers on ordinary nodes. `networkPolicy.dnsCidrs` permits specific host-networked or link-local DNS endpoints, for example a NodeLocal DNS `/32`. Add only the address your cluster uses.
 
 See [values.yaml](values.yaml) for the full values reference and [values.schema.json](values.schema.json) for validation. No database, bucket, ingress controller, DNS record, or certificate is provisioned by this chart.
 

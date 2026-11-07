@@ -48,7 +48,7 @@ kubectl -n actors create secret generic actors-credentials \
   --from-file=jwt-signing-key --from-file=api-key
 ```
 
-For more than one replica, also add `--from-literal=redis-url="$REDIS_URL"` and set `redis.urlSecretKey: redis-url`. For a private CA such as Memorystore's, add `--from-file=redis-ca=server-ca.pem` and set `redis.caSecretKey: redis-ca`. Store the generated credentials in your secret manager. Configure your backend with the same API key. Provision your TLS Secret separately in namespace `actors`; its certificate must cover your public hostname.
+To give backends that only call actors a key that cannot deploy or observe, generate a second value with `openssl rand -hex 32 | tr -d '\n' > invoke-api-key` and add `--from-file=invoke-api-key`; the chart exposes it as `DURABLE_ACTORS_INVOKE_API_KEY` only when the Secret contains that key. For more than one replica, also add `--from-literal=redis-url="$REDIS_URL"` and set `redis.urlSecretKey: redis-url`. For a private CA such as Memorystore's, add `--from-file=redis-ca=server-ca.pem` and set `redis.caSecretKey: redis-ca`. Store the generated credentials in your secret manager. Configure your backend with the same API key. Provision your TLS Secret separately in namespace `actors`; its certificate must cover your public hostname.
 
 ## Install
 

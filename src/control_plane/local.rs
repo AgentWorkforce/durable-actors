@@ -41,6 +41,9 @@ pub struct DevOptions {
     pub project_id: String,
     #[arg(long, env = "DURABLE_ACTORS_SECRET")]
     pub api_key: Option<String>,
+    /// Long-lived key accepted only for actor invocation, discovery, and WebSocket URLs.
+    #[arg(long, env = "DURABLE_ACTORS_INVOKE_API_KEY")]
+    pub invoke_api_key: Option<String>,
     #[arg(long, env = "DURABLE_ACTORS_PROJECT", default_value = ".")]
     pub project: PathBuf,
     #[arg(long, env = "DURABLE_ACTORS_PORT", default_value_t = 7100)]
@@ -398,7 +401,8 @@ async fn local_routes(
     service.gateway = Some(gateway);
     service.start_access_reconciliation(stop.clone());
     let telemetry_keys = issuer.verifier_keys_json()?;
-    let admin = AdminService::new(options.api_key.clone(), registry, issuer)?;
+    let admin = AdminService::new(options.api_key.clone(), registry, issuer)?
+        .with_invoke_api_key(options.invoke_api_key.clone())?;
     let inventory = Arc::new(super::socket_inventory::GatewayInventoryReader::new(
         Arc::new(service.lifecycle.clone()),
         service.gateway.as_ref().unwrap().connections.clone(),

@@ -198,6 +198,87 @@ async fn combined_invocation_authenticates_and_validates_requests() -> Result<()
 }
 
 #[tokio::test]
+async fn invoke_api_key_reaches_only_actor_rpc_and_socket_routes() -> Result<()> {
+    let fixture = Fixture::start(vec![(
+        StatusCode::OK,
+        json!({"type":"completed", "result":7}),
+    )])
+    .await?;
+    let request = json!({
+        "requestId": "call-1",
+        "method": "sendMessage",
+        "args": [],
+        "homeRegion": "north-america-east"
+    });
+    let response = fixture.call("invoke-key", request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = fixture.host.requests.lock().unwrap();
+    let principal = fixture
+        .verifier
+        .authenticate_authorization(&requests[0].0)?;
+    drop(requests);
+    let grant = principal.invocation.unwrap().grant.unwrap();
+    assert_eq!(grant.subject, "invoke-api-key");
+    assert!(grant.methods.iter().any(|method| method == "sendMessage"));
+    assert!(!grant.methods.iter().any(|method| method == "onMessage"));
+
+    let reply: Value = fixture
+        .post("find-actor", "invoke-key", json!({}))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(reply, json!({"homeRegion":"north-america-east"}));
+    let socket: Value = fixture
+        .post("find-websocket", "invoke-key", json!({"metadata":{}}))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(socket["websocketUrl"].as_str().is_some());
+    assert_eq!(
+        fixture
+            .post("find-websocket", "wrong-key", json!({"metadata":{}}))
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let response = fixture
+        .post("socket-effects", "invoke-key", broadcast())
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let error: Value = response.json().await?;
+    assert_eq!(error["error"]["code"], "unauthenticated");
+    let client = reqwest::Client::new();
+    for (method, path) in [
+        (reqwest::Method::POST, "/v1/projects/default/sessions"),
+        (reqwest::Method::GET, "/v1/projects/default/deployment"),
+        (reqwest::Method::PUT, "/v1/projects/default/deployment"),
+        (reqwest::Method::DELETE, "/v1/projects/default/deployment"),
+        (
+            reqwest::Method::GET,
+            "/v1/projects/default/deployment/contract",
+        ),
+        (reqwest::Method::PUT, "/v1/organizations/org-test/access"),
+    ] {
+        assert_eq!(
+            client
+                .request(method, format!("{}{path}", fixture.origin))
+                .bearer_auth("invoke-key")
+                .json(&json!({}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+    assert_eq!(fixture.host.calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn combined_invocation_retries_known_non_execution_through_handoff() -> Result<()> {
     for (status, outcome) in [
         (
@@ -419,7 +500,8 @@ impl Fixture {
             Duration::from_secs(60),
         )?;
         let registry = Arc::new(LocalAdminRegistry::default());
-        let admin = AdminService::new(Some("api-key".into()), registry.clone(), issuer.clone())?;
+        let admin = AdminService::new(Some("api-key".into()), registry.clone(), issuer.clone())?
+            .with_invoke_api_key(Some("invoke-key".into()))?;
         let contract =
             super::super::super::contracts::PublicActorContract::new(serde_json::from_str(
                 include_str!("../../../sdk/tests/fixtures/public-contract.json"),

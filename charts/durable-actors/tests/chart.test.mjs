@@ -43,6 +43,12 @@ test("configures ClickHouse analytics with a password from the credentials secre
     assert.match(output, /name: DURABLE_ACTORS_CLICKHOUSE_PASSWORD\n\s+valueFrom:\n\s+secretKeyRef: \{name: "actors-credentials", key: "clickhouse-password"\}/)
 })
 
+test("reads the invoke API key from the credentials secret only when that key exists", () => {
+    const output = manifests()
+    assert.match(output, /name: DURABLE_ACTORS_SECRET\n\s+valueFrom:\n\s+secretKeyRef: \{name: "actors-credentials", key: api-key\}/)
+    assert.match(output, /name: DURABLE_ACTORS_INVOKE_API_KEY\n\s+valueFrom:\n\s+secretKeyRef: \{name: "actors-credentials", key: invoke-api-key, optional: true\}/)
+})
+
 test("starts one controller and one pool manager using one Standard bucket", () => {
     const output = manifests()
     assert.match(output, /replicas: 1\b/)

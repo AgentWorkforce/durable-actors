@@ -184,8 +184,15 @@ async fn observability_requires_admin_credentials() -> Result<()> {
         "/v1/projects/default/observe/websockets",
         "/v1/projects/default/observe/state?actorName=Room&actorId=one",
         "/v1/projects/default/observe/state/history?actorName=Room&actorId=one",
+        "/v1/projects/default/observe/residency",
     ] {
-        for credential in [None, Some(""), Some("wrong"), Some(token.as_str())] {
+        for credential in [
+            None,
+            Some(""),
+            Some("wrong"),
+            Some(token.as_str()),
+            Some("invoke-key"),
+        ] {
             let mut request = fixture.client.get(format!("{}{path}", fixture.origin));
             if let Some(credential) = credential {
                 request = request.bearer_auth(credential);
@@ -239,7 +246,8 @@ impl Fixture {
             Some("api-key".into()),
             Arc::new(super::admin::LocalAdminRegistry::default()),
             issuer.clone(),
-        )?;
+        )?
+        .with_invoke_api_key(Some("invoke-key".into()))?;
         let changes = crate::postgres::notifications::ChangeFeed::default();
         let lifecycle = LifecycleStore::default();
         let inspector =

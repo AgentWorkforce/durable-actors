@@ -255,6 +255,28 @@ fn server_rejects_an_empty_or_untrimmed_shared_secret() {
 }
 
 #[test]
+fn invoke_api_key_is_optional_and_must_differ_from_the_shared_secret() -> Result<()> {
+    let mut values = process_environment();
+    let config = ControlPlaneProcessConfig::from_lookup(|name| {
+        values.get(name).map(|value| (*value).into())
+    })?;
+    assert!(config.invoke_api_key.is_none());
+    values.insert("DURABLE_ACTORS_INVOKE_API_KEY", "invoke-key");
+    let config = ControlPlaneProcessConfig::from_lookup(|name| {
+        values.get(name).map(|value| (*value).into())
+    })?;
+    assert_eq!(config.invoke_api_key.as_deref(), Some("invoke-key"));
+    for invoke_key in ["", " ", " key", "key ", "api-key"] {
+        values.insert("DURABLE_ACTORS_INVOKE_API_KEY", invoke_key);
+        let result = ControlPlaneProcessConfig::from_lookup(|name| {
+            values.get(name).map(|value| (*value).into())
+        });
+        assert!(result.is_err(), "server accepted invoke key {invoke_key:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn authentication_warning_depends_on_the_listening_address_and_secret() -> Result<()> {
     for (bind, exposed) in [
         ("127.0.0.1:7100", false),

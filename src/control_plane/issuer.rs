@@ -114,13 +114,7 @@ impl ActorJwtIssuer {
         deadline_ms: i64,
     ) -> Result<IssuedActorToken> {
         let now = unix_millis()? / 1000;
-        let expires_at = (deadline_ms / 1000).min(
-            now.saturating_add(i64::try_from(
-                self.max_lifetime
-                    .as_secs()
-                    .min(super::session::MAX_SESSION_LIFETIME_SECONDS as u64),
-            )?),
-        );
+        let expires_at = (deadline_ms / 1000).min(self.session_deadline(now)?);
         let session = super::session::ActorSession {
             iss: self.issuer.clone(),
             aud: self.session_audience(),
@@ -139,6 +133,36 @@ impl ActorJwtIssuer {
             token,
             expires_at_ms: expires_at * 1000,
         })
+    }
+
+    // The invoke API key has no session token, so it borrows a maximal session: its tickets
+    // expire like a session's and the host enforces the same published-method allow-list.
+    pub(super) fn invoke_key_session(
+        &self,
+        project_id: String,
+    ) -> Result<super::session::ActorSession> {
+        let now = unix_millis()? / 1000;
+        let session = super::session::ActorSession {
+            iss: self.issuer.clone(),
+            aud: self.session_audience(),
+            subject: super::session::INVOKE_KEY_SUBJECT.into(),
+            jti: uuid::Uuid::new_v4().to_string(),
+            project_id,
+            scope: "actor:session".into(),
+            iat: now,
+            nbf: now,
+            expires_at: self.session_deadline(now)?,
+        };
+        session.validate(now)?;
+        Ok(session)
+    }
+
+    fn session_deadline(&self, now: i64) -> Result<i64> {
+        Ok(now.saturating_add(i64::try_from(
+            self.max_lifetime
+                .as_secs()
+                .min(super::session::MAX_SESSION_LIFETIME_SECONDS as u64),
+        )?))
     }
 
     pub(super) fn issue_socket(&self, grant: SocketGrant) -> Result<(String, i64)> {

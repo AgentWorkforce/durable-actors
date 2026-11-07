@@ -58,6 +58,7 @@ async fn relative_state_directories_are_absolute_in_host_configuration() -> Resu
         watch: false,
         project_id: "default".into(),
         api_key: Some("test-key".into()),
+        invoke_api_key: None,
         project: cwd.clone(),
         port: 0,
         data_dir: Some(relative.into()),

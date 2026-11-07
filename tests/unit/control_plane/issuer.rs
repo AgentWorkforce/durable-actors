@@ -43,6 +43,50 @@ fn socket_tickets_bind_actor_metadata_with_short_admission() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn invoke_key_sessions_are_bounded_like_a_maximal_session() -> Result<()> {
+    let actor = ActorKey {
+        project_id: "default".into(),
+        actor_name: "Counter".into(),
+        actor_id: "one".into(),
+    };
+    for (issuer, lifetime) in [(socket_issuer()?, 300), (short_lived_issuer()?, 60)] {
+        let session = issuer.invoke_key_session("default".into())?;
+        assert_eq!(
+            session.subject,
+            crate::control_plane::session::INVOKE_KEY_SUBJECT
+        );
+        assert_eq!(session.project_id, "default");
+        assert_eq!(session.expires_at - session.iat, lifetime);
+        session.validate(session.iat)?;
+        let grant = session.clone().invocation(&actor, vec!["read".into()])?;
+        assert_eq!(
+            grant.subject,
+            crate::control_plane::session::INVOKE_KEY_SUBJECT
+        );
+        assert_eq!(grant.grant_id, session.jti);
+        assert_eq!(grant.expires_at, session.expires_at);
+        assert!(session.invocation(&actor, vec![]).is_err());
+    }
+    assert_ne!(
+        socket_issuer()?.invoke_key_session("default".into())?.jti,
+        socket_issuer()?.invoke_key_session("default".into())?.jti
+    );
+    Ok(())
+}
+
+fn short_lived_issuer() -> Result<ActorJwtIssuer> {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
+    ActorJwtIssuer::from_base64_pkcs8(
+        &STANDARD.encode(pkcs8.as_ref()),
+        "key",
+        "issuer",
+        "authority",
+        "invocation",
+        Duration::from_secs(60),
+    )
+}
+
 fn socket_issuer() -> Result<ActorJwtIssuer> {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())?;
     ActorJwtIssuer::from_base64_pkcs8(

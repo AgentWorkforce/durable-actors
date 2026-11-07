@@ -6,6 +6,8 @@ info:
         Manage durable-actors deployments, invoke actors, find actor hosts, and inspect activity.
         When DURABLE_ACTORS_SECRET is set on the server, authenticate backend requests
         with that bearer API key; never expose it to browsers. When unset, no API key is required.
+        DURABLE_ACTORS_INVOKE_API_KEY optionally adds a long-lived key that only findActor,
+        invokeActor, and findWebSocket accept; its invocations are limited to published RPC methods.
         Project-scoped actor routes work in development and production. Run `durable-actors dev`
         and copy the printed connection settings into your backend's environment. The default
         local project ID is `local`; use it as `project_id` in requests.
@@ -194,8 +196,8 @@ paths:
             operationId: findActor
             tags: [Actors]
             summary: Find an actor host
-            security: [{ ApiKey: [] }, { ActorSession: [] }, {}]
-            description: Resolves placement, starts a host if needed, and issues credentials for direct HTTP calls. Requires an active deployment. Accepts the administrative secret or a runtime-issued actor:session credential for this project. Sessions produce actor-specific tickets containing all of the actor's published RPC methods. These tickets cannot outlive the session.
+            security: [{ ApiKey: [] }, { InvokeApiKey: [] }, { ActorSession: [] }, {}]
+            description: Resolves placement, starts a host if needed, and issues credentials for direct HTTP calls. Requires an active deployment. Accepts the administrative secret, the invoke API key, or a runtime-issued actor:session credential for this project. Sessions and the invoke API key produce actor-specific tickets containing all of the actor's published RPC methods. These tickets cannot outlive the session.
             requestBody: { $ref: "#/components/requestBodies/FindActor" }
             responses:
                 "200": { $ref: "#/components/responses/ActorTarget" }
@@ -235,7 +237,7 @@ paths:
                   description: Cached invocation through the gateway (or local host) with a signed ticket and ownership epoch.
                   variables:
                       actorHost: { default: "http://127.0.0.1:7101" }
-            security: [{ ApiKey: [] }, { ActorSession: [] }, { ActorTicket: [] }, {}]
+            security: [{ ApiKey: [] }, { InvokeApiKey: [] }, { ActorSession: [] }, { ActorTicket: [] }, {}]
             description: |
                 Without a valid cached target, the SDK sends requestId, method, args and an optional homeRegion to the control plane.
                 The control plane resolves placement, forwards one call and returns its outcome together with a scoped host target.
@@ -343,7 +345,8 @@ paths:
             operationId: findWebSocket
             tags: [Actors]
             summary: Find an authorized WebSocket URL
-            description: Issues a fresh connection URL. Authorize the application user before requesting it. Requires an active deployment.
+            security: [{ ApiKey: [] }, { InvokeApiKey: [] }, {}]
+            description: Issues a fresh connection URL. Authorize the application user before requesting it. Requires an active deployment. Accepts the administrative secret or the invoke API key.
             requestBody: { $ref: "#/components/requestBodies/FindWebSocket" }
             responses:
                 "200": { $ref: "#/components/responses/WebSocketGrant" }
@@ -771,6 +774,10 @@ components:
             type: http
             scheme: bearer
             description: Required when DURABLE_ACTORS_SECRET is set on the server. Never send it to browsers.
+        InvokeApiKey:
+            type: http
+            scheme: bearer
+            description: Long-lived key set by DURABLE_ACTORS_INVOKE_API_KEY. Accepted only by findActor, invokeActor, and findWebSocket; invocations are limited to published RPC methods. Never send it to browsers.
         ActorTicket:
             type: http
             scheme: bearer
