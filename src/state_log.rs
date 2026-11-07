@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub(crate) mod binary;
 mod legacy;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,17 +97,26 @@ impl StateSnapshot {
         Ok(snapshot)
     }
 
+    /// Reads binary snapshots and the JSON ones written before them.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let snapshot: Self = serde_json::from_slice(bytes)
-            .or_else(|_| legacy::decode(bytes))
-            .context("decode actor SQLite commit")?;
-        snapshot.validate()?;
+        let snapshot = if binary::is_binary(bytes) {
+            let (mut snapshot, files): (Self, _) = binary::decode(bytes)?;
+            ensure!(snapshot.sqlite.files.is_empty(), "duplicate LTX files");
+            snapshot.sqlite.files = files;
+            snapshot
+        } else {
+            serde_json::from_slice(bytes).or_else(|_| legacy::decode(bytes))?
+        };
+        snapshot.validate().context("decode actor SQLite commit")?;
         Ok(snapshot)
     }
 
+    // Object names keep their .json suffix, which every reader parses, for binary content too.
     pub fn encode(&self) -> Result<bytes::Bytes> {
         self.validate()?;
-        crate::payload::encode(self)
+        let mut header = self.clone();
+        let files = std::mem::take(&mut header.sqlite.files);
+        binary::encode(&header, &files)
     }
 
     pub(crate) fn validate_object(&self, object: &str) -> Result<()> {

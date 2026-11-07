@@ -1,6 +1,6 @@
 use super::{DatabaseRestore, Replicator};
 use anyhow::{Context, Result, ensure};
-use base64::engine::general_purpose::STANDARD;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -13,7 +13,25 @@ pub struct LtxFile {
     pub level: u8,
     pub first: u64,
     pub last: u64,
-    pub data: crate::payload::Text,
+    /// Raw LTX bytes; JSON state, written before binary snapshots, carries them as base64.
+    #[serde(with = "base64_data")]
+    pub data: Bytes,
+}
+
+mod base64_data {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(data: &Bytes, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Bytes, D::Error> {
+        let text = crate::payload::Text::deserialize(deserializer)?;
+        crate::payload::copy(base64::read::DecoderReader::new(text.as_ref(), &STANDARD))
+            .map_err(D::Error::custom)
+    }
 }
 
 impl LtxFile {
@@ -24,26 +42,10 @@ impl LtxFile {
             "invalid LTX transaction range"
         );
         ensure!(self.level != 9 || self.first == 1, "invalid LTX snapshot");
-        // Only the shape is checked: snapshots are validated on every encode and decode, and a
-        // full decode here made each of those another pass over the database.
-        let encoded = self.data.as_ref();
-        ensure!(
-            !encoded.is_empty() && encoded.len() % 4 == 0,
-            "malformed LTX file"
-        );
+        // Only the header magic is checked: snapshots are validated on every encode and decode,
+        // and a full LTX decode here made each of those another pass over the database.
+        ensure!(self.data.starts_with(b"LTX1"), "malformed LTX file");
         Ok(())
-    }
-
-    pub(crate) fn decode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut self.reader(), &mut bytes)?;
-        ensure!(!bytes.is_empty(), "empty LTX file");
-        Ok(bytes)
-    }
-
-    pub(crate) fn reader(&self) -> impl std::io::Read {
-        base64::read::DecoderReader::new(self.data.as_ref(), &STANDARD)
     }
 
     #[cfg(test)]
@@ -69,18 +71,27 @@ impl SqliteCapture {
         replication: Arc<dyn Replicator>,
         full_snapshots: Option<Duration>,
     ) -> Result<Self> {
-        Self::open(replication, tempfile::tempdir()?, full_snapshots).await
+        Self::open(replication, tempfile::tempdir()?, full_snapshots, None).await
     }
 
+    /// With `resume`, capture continues the restored history, so the next commit is a delta at
+    /// `txid + 1`; otherwise it starts a new history whose first commit holds every page.
     pub(crate) async fn restore(
         replication: Arc<dyn Replicator>,
         files: &[LtxFile],
         txid: u64,
         full_snapshots: Option<Duration>,
+        resume: bool,
     ) -> Result<Self> {
         let directory = tempfile::tempdir()?;
         restore_database(replication.as_ref(), directory.path(), files, txid).await?;
-        Self::open(replication, directory, full_snapshots).await
+        Self::open(
+            replication,
+            directory,
+            full_snapshots,
+            resume.then_some(txid),
+        )
+        .await
     }
 
     pub(crate) fn path(&self) -> PathBuf {
@@ -126,14 +137,15 @@ impl SqliteCapture {
         .await?
     }
 
-    // Litestream captures every page at the first write rather than here, so an activation that
-    // only reads never pays for it.
+    // A new history captures every page at the first write rather than here, so an activation
+    // that only reads never pays for it.
     async fn open(
         replication: Arc<dyn Replicator>,
         directory: tempfile::TempDir,
         full_snapshots: Option<Duration>,
+        resume_at: Option<u64>,
     ) -> Result<Self> {
-        let capture = Self {
+        let mut capture = Self {
             replication,
             directory: Some(directory),
             txid: 0,
@@ -146,10 +158,17 @@ impl SqliteCapture {
                 CREATE TABLE IF NOT EXISTS __terse_fields (name TEXT PRIMARY KEY, value TEXT NOT NULL CHECK(json_valid(value)))")?;
             Ok(())
         }).await??;
-        capture
+        let position = capture
             .replication
-            .register(&capture.path(), &capture.replica(), full_snapshots)
+            .register(
+                &capture.path(),
+                &capture.replica(),
+                full_snapshots,
+                resume_at,
+            )
             .await?;
+        capture.txid = position;
+        capture.published = position;
         Ok(capture)
     }
 }
@@ -237,17 +256,11 @@ async fn read_ltx_files(path: &Path, after: u64, level: u8, through: u64) -> Res
 
 async fn read_ltx(level: u8, first: u64, last: u64, path: PathBuf) -> Result<LtxFile> {
     tokio::task::spawn_blocking(move || {
-        let mut input = std::fs::File::open(path)?;
-        let mut spool = crate::payload::Spool::new();
-        let mut encoder = base64::write::EncoderWriter::new(&mut spool, &STANDARD);
-        std::io::copy(&mut input, &mut encoder)?;
-        encoder.finish()?;
-        drop(encoder);
         Ok(LtxFile {
             level,
             first,
             last,
-            data: crate::payload::Text::from_bytes(spool.finish()?)?,
+            data: crate::payload::copy(std::fs::File::open(path)?)?,
         })
     })
     .await?

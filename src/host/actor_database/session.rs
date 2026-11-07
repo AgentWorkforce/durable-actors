@@ -339,17 +339,20 @@ impl DatabaseSession {
         let sqlite = self.storage.read_sqlite(loaded).await?;
         let history_ms = started.elapsed().as_secs_f64() * 1000.0;
         let apply_started = std::time::Instant::now();
+        let parent = self.storage.resume_parent(&snapshot, loaded)?;
         let capture = SqliteCapture::restore(
             self.replication.clone(),
             &sqlite.files,
             sqlite.txid,
             self.storage.full_snapshots(),
+            parent.is_some(),
         )
         .await?;
         tracing::info!(event = "actor_sqlite_restored", host_id = %self.endpoint.id, state_version,
             history_ms, apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0);
         let mut cached = ResidentDatabase::open(owner_epoch, capture).await?;
+        cached.sqlite_head = parent.filter(|_| cached.synced > 0);
         cached.state_version = state_version;
         cached.published = Some(cached.synced);
         cached.set_completion(snapshot.request_id, snapshot.completion);

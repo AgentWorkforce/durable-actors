@@ -102,7 +102,6 @@ async fn transactional_sqlite_and_object_fields_survive_runtime_restart_together
         );
         runtime.stop().await?;
     }
-    use base64::Engine;
     use durable_actors::bucket::{Bucket, FileBucket};
     use durable_actors::state_log::StateSnapshot;
     let bucket = FileBucket::new(project.path().join(".durable-actors/objects"))?;
@@ -124,13 +123,7 @@ async fn transactional_sqlite_and_object_fields_survive_runtime_restart_together
             .sqlite
             .files
             .iter()
-            .map(|file| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(&file.data)
-                    .map(|bytes| bytes.len())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
+            .map(|file| file.data.len())
             .sum::<usize>();
         segment_sizes.push(size);
     }

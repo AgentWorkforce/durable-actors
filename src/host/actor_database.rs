@@ -40,6 +40,15 @@ pub(crate) trait ActorStorage: Send + Sync {
     fn full_snapshots(&self) -> Option<std::time::Duration> {
         Some(crate::litestream::FULL_SNAPSHOT_INTERVAL)
     }
+    /// The restored snapshot that the next write builds on, when the store keeps one history
+    /// across activations; `None` starts a new history with a full copy.
+    fn resume_parent(
+        &self,
+        _snapshot: &crate::state_log::StateSnapshot,
+        _bytes: &[u8],
+    ) -> Result<Option<crate::storage::SnapshotRef>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]

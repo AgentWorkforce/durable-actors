@@ -239,6 +239,25 @@ impl ActorStorage for HostStorage {
         }
     }
 
+    // Only Rapid checkpoints bound a history that crosses activations.
+    fn resume_parent(
+        &self,
+        snapshot: &crate::state_log::StateSnapshot,
+        bytes: &[u8],
+    ) -> Result<Option<crate::storage::SnapshotRef>> {
+        if self.runtime.persistence.rapid_settings().is_none() {
+            return Ok(None);
+        }
+        let object = crate::storage::snapshot_object_name(
+            &self.actor,
+            snapshot.state_version,
+            &format!("{:032x}", snapshot.owner_epoch),
+        )?;
+        Ok(Some(crate::storage::SnapshotRef::new(
+            object, snapshot, bytes,
+        )))
+    }
+
     fn ensure_authority(&self) -> Result<()> {
         ensure!(
             !self.stop.is_cancelled(),

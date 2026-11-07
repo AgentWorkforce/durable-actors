@@ -15,7 +15,7 @@ fn reads_legacy_results_and_encodes_only_the_current_format() -> Result<()> {
         let stored = legacy_record(result.clone())?;
         let snapshot = StateSnapshot::decode(&serde_json::to_vec(&stored)?)?;
         assert_eq!(snapshot.completion.as_ref().unwrap().result, result);
-        let encoded: Value = serde_json::from_slice(&snapshot.encode()?)?;
+        let encoded = serde_json::to_value(StateSnapshot::decode(&snapshot.encode()?)?)?;
         let mut expected = stored;
         expected.as_object_mut().unwrap().remove("result");
         expected["completion"] = json!({"result": result});

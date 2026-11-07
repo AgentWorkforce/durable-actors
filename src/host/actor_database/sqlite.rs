@@ -69,9 +69,10 @@ struct Engine {
 impl Engine {
     fn open(path: PathBuf) -> Result<Self> {
         let connection = Connection::open(path)?;
+        // Commits are durable once replicated, so the local WAL need not fsync each one.
         connection.execute_batch(
             "PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;
-            PRAGMA wal_autocheckpoint = 0; PRAGMA synchronous = FULL",
+            PRAGMA wal_autocheckpoint = 0; PRAGMA synchronous = NORMAL",
         )?;
         let committed = Arc::new(AtomicBool::new(false));
         let commit = committed.clone();

@@ -13,7 +13,7 @@ pub(crate) struct PrefetchedCheckpoint {
     pub bytes: Option<Bytes>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
     pub source: SnapshotRef,
     pub sqlite: SqliteSnapshot,
@@ -30,6 +30,9 @@ pub(crate) struct ResolvedSqlite {
     pub checkpoint_version: u64,
     pub checkpoint: bool,
     pub parents: usize,
+    /// LTX bytes of the full copy the history starts from, and of the deltas after it.
+    pub base_bytes: u64,
+    pub log_bytes: u64,
 }
 
 pub(crate) async fn resolve(
@@ -87,10 +90,17 @@ pub(crate) async fn resolve(
         reference = parent;
         parents += 1;
     }
+    let size = |files: &Vec<crate::litestream::storage::LtxFile>| {
+        files.iter().map(|file| file.data.len() as u64).sum::<u64>()
+    };
+    let base_bytes = segments.last().map_or(0, size);
+    let log_bytes = segments.iter().map(size).sum::<u64>() - base_bytes;
     Ok(ResolvedSqlite {
         checkpoint_version: reference.state_version,
         checkpoint,
         parents,
+        base_bytes,
+        log_bytes,
         sqlite: SqliteSnapshot {
             txid,
             parent: None,
@@ -100,8 +110,22 @@ pub(crate) async fn resolve(
 }
 
 impl Checkpoint {
+    pub fn encode(&self) -> Result<Bytes> {
+        let mut header = self.clone();
+        let files = std::mem::take(&mut header.sqlite.files);
+        crate::state_log::binary::encode(&header, &files)
+    }
+
+    /// Reads binary checkpoints and the JSON ones written before them.
     pub fn decode(bytes: &[u8], source: &SnapshotRef, txid: u64) -> Result<SqliteSnapshot> {
-        let checkpoint: Self = serde_json::from_slice(bytes)?;
+        let checkpoint: Self = if crate::state_log::binary::is_binary(bytes) {
+            let (mut checkpoint, files): (Self, _) = crate::state_log::binary::decode(bytes)?;
+            ensure!(checkpoint.sqlite.files.is_empty(), "duplicate LTX files");
+            checkpoint.sqlite.files = files;
+            checkpoint
+        } else {
+            serde_json::from_slice(bytes)?
+        };
         ensure!(&checkpoint.source == source, "checkpoint source mismatch");
         checkpoint.sqlite.validate(source.state_version)?;
         ensure!(

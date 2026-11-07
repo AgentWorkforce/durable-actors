@@ -3,7 +3,11 @@ use crate::bucket::recovery::{Checkpoint, ResolvedSqlite, SnapshotHistory, resol
 use crate::state_log::{SqliteSnapshot, StateSnapshot};
 use crate::storage::SnapshotRef;
 
-pub(super) const CHECKPOINT_INTERVAL: u64 = 32;
+// Below this a checkpoint saves less than its own upload costs.
+const MIN_LOG_BYTES: u64 = 1024 * 1024;
+// Bounds the history a restore replays when commits are tiny. Tests write tiny commits, so they
+// exercise this bound.
+const MAX_LOG_VERSIONS: u64 = if cfg!(test) { 32 } else { 256 };
 
 impl LogStorage {
     pub async fn restore(
@@ -35,7 +39,7 @@ impl LogStorage {
             dependency_gets = history.reads,
             checkpoint_gets = history.probes,
             files = resolved.sqlite.files.len(),
-            ltx_base64_bytes = resolved
+            ltx_bytes = resolved
                 .sqlite
                 .files
                 .iter()
@@ -46,7 +50,8 @@ impl LogStorage {
         Ok(resolved)
     }
 
-    pub async fn checkpoint(&self, object: &str, bytes: Bytes) -> Result<()> {
+    /// Returns the LTX bytes of the full copy that now ends the history at `object`, if any.
+    pub async fn checkpoint(&self, object: &str, bytes: Bytes) -> Result<Option<u64>> {
         let started = std::time::Instant::now();
         let snapshot = StateSnapshot::decode(&bytes)?;
         if snapshot.sqlite.parent.is_none() {
@@ -57,11 +62,12 @@ impl LogStorage {
                 outcome = "full_snapshot",
                 duration_ms = started.elapsed().as_secs_f64() * 1000.0
             );
-            return Ok(());
+            return Ok(Some(sqlite_bytes(&snapshot.sqlite.files)));
         }
         let source = SnapshotRef::new(object.into(), &snapshot, &bytes);
-        if let Some(bytes) = self.snapshots.get(&format!("{object}.checkpoint")).await? {
-            Checkpoint::decode(&bytes, &source, snapshot.sqlite.txid)?;
+        let key = format!("{object}.checkpoint");
+        if let Some(stored) = self.snapshots.get(&key).await? {
+            let sqlite = Checkpoint::decode(&stored, &source, snapshot.sqlite.txid)?;
             tracing::info!(
                 event = "sqlite_checkpoint",
                 object,
@@ -69,7 +75,7 @@ impl LogStorage {
                 outcome = "existing",
                 duration_ms = started.elapsed().as_secs_f64() * 1000.0
             );
-            return Ok(());
+            return Ok(Some(sqlite_bytes(&sqlite.files)));
         }
         let sqlite = self
             .restore(object, bytes, None)
@@ -79,30 +85,31 @@ impl LogStorage {
         let history_ms = started.elapsed().as_secs_f64() * 1000.0;
         let input_files = sqlite.files.len();
         let compaction_started = std::time::Instant::now();
-        let file = self
-            .compactor
-            .compact(&sqlite.files)
-            .await
-            .context("compact SQLite checkpoint")?;
+        let file = match sqlite.files.as_slice() {
+            [file] if file.level == 9 => file.clone(),
+            files => self
+                .compactor
+                .compact(files)
+                .await
+                .context("compact SQLite checkpoint")?,
+        };
         let compaction_ms = compaction_started.elapsed().as_secs_f64() * 1000.0;
+        let checkpoint_files = vec![file];
         let checkpoint = Checkpoint {
             source,
             sqlite: SqliteSnapshot {
                 txid: sqlite.txid,
                 parent: None,
-                files: vec![file],
+                files: checkpoint_files.clone(),
             },
         };
-        let bytes =
-            tokio::task::spawn_blocking(move || crate::payload::encode(&checkpoint)).await??;
+        let bytes = tokio::task::spawn_blocking(move || checkpoint.encode()).await??;
         let size = bytes.len();
+        let checkpoint_bytes = sqlite_bytes(&checkpoint_files);
         let upload_started = std::time::Instant::now();
-        bounded(
-            self.snapshots
-                .put(&format!("{object}.checkpoint"), bytes.into()),
-        )
-        .await
-        .context("upload SQLite checkpoint")?;
+        bounded(self.snapshots.put(&key, bytes))
+            .await
+            .context("upload SQLite checkpoint")?;
         tracing::info!(
             event = "sqlite_checkpoint",
             object,
@@ -115,8 +122,12 @@ impl LogStorage {
             bytes = size,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0
         );
-        Ok(())
+        Ok(Some(checkpoint_bytes))
     }
+}
+
+fn sqlite_bytes(files: &[crate::litestream::storage::LtxFile]) -> u64 {
+    files.iter().map(|file| file.data.len() as u64).sum()
 }
 
 struct LogHistory<'a> {
@@ -226,16 +237,28 @@ impl SnapshotHistory for LogHistory<'_> {
     }
 }
 
+/// Writes a checkpoint once the deltas since the last one outweigh the full copy it would write.
 #[derive(Default)]
 pub(super) struct Progress {
     completed: u64,
-    task: Option<(u64, AbortOnDropHandle<Result<()>>)>,
+    base_bytes: u64,
+    /// LTX bytes of each version logged after `completed`.
+    logged: std::collections::VecDeque<(u64, u64)>,
+    task: Option<(u64, AbortOnDropHandle<Result<Option<u64>>>)>,
     retry_at: Option<tokio::time::Instant>,
 }
 
 impl Progress {
-    pub fn restored(&mut self, version: u64) {
-        self.completed = self.completed.max(version);
+    pub fn restored(&mut self, restored: &ResolvedSqlite, version: u64) {
+        self.completed = self.completed.max(restored.checkpoint_version);
+        self.base_bytes = restored.base_bytes;
+        if version > self.completed {
+            self.logged.push_back((version, restored.log_bytes));
+        }
+    }
+
+    pub fn logged(&mut self, version: u64, bytes: u64) {
+        self.logged.push_back((version, bytes));
     }
 
     pub async fn schedule(
@@ -246,7 +269,7 @@ impl Progress {
     ) {
         self.collect().await;
         if self.task.is_some()
-            || version.saturating_sub(self.completed) < CHECKPOINT_INTERVAL
+            || !self.due(version)
             || self
                 .retry_at
                 .is_some_and(|retry| tokio::time::Instant::now() < retry)
@@ -261,6 +284,29 @@ impl Progress {
                 version,
                 "background",
             );
+        }
+    }
+
+    fn due(&self, version: u64) -> bool {
+        let logged: u64 = self.logged.iter().map(|(_, bytes)| bytes).sum();
+        version.saturating_sub(self.completed) >= MAX_LOG_VERSIONS
+            || (version > self.completed && logged >= self.base_bytes.max(MIN_LOG_BYTES))
+    }
+
+    fn completed(&mut self, version: u64, base_bytes: Option<u64>) {
+        if version <= self.completed {
+            return;
+        }
+        self.completed = version;
+        if let Some(bytes) = base_bytes {
+            self.base_bytes = bytes;
+        }
+        while self
+            .logged
+            .front()
+            .is_some_and(|(logged, _)| *logged <= version)
+        {
+            self.logged.pop_front();
         }
     }
 
@@ -295,7 +341,7 @@ impl Progress {
         }
         let (version, task) = self.task.take().unwrap();
         match tokio::time::timeout_at(deadline, task).await {
-            Ok(Ok(Ok(()))) => self.completed = version,
+            Ok(Ok(Ok(base_bytes))) => self.completed(version, base_bytes),
             result => {
                 tracing::warn!(event = "sqlite_checkpoint_deferred", object, state_version = version,
                 error = ?result, "checkpoint incomplete; archived history remains recoverable")
@@ -347,8 +393,8 @@ impl Progress {
         }
         let (version, task) = self.task.take().unwrap();
         match task.await {
-            Ok(Ok(())) => {
-                self.completed = self.completed.max(version);
+            Ok(Ok(base_bytes)) => {
+                self.completed(version, base_bytes);
                 self.retry_at = None;
             }
             error => {

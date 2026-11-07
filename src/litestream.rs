@@ -7,8 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 use terse_litestream::{
-    Database, Durability, FileStore, Options, ReplicaStore, Segment, SegmentWriter,
+    CheckpointMode, Database, Durability, FileStore, Options, ReplicaStore, Segment, SegmentWriter,
 };
+use tokio::sync::watch;
+use tokio_util::task::AbortOnDropHandle;
 
 use storage::LtxFile;
 
@@ -18,15 +20,20 @@ pub(crate) mod storage;
 /// How often a database whose store has no checkpoints of its own writes a full copy, which
 /// keeps restores from walking an ever longer chain of deltas.
 pub(crate) const FULL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
+const CHECKPOINT_IDLE: Duration = Duration::from_secs(1);
+const CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(10);
 
 #[async_trait]
 pub(crate) trait Replicator: DatabaseRestore {
+    /// Starts capture and returns its position: `resume_at` continues a restored history, or
+    /// 0 when capture starts a new one.
     async fn register(
         &self,
         path: &Path,
         replica: &Path,
         full_snapshots: Option<Duration>,
-    ) -> Result<()>;
+        resume_at: Option<u64>,
+    ) -> Result<u64>;
     async fn sync(&self, path: &Path) -> Result<u64>;
     async fn unregister(&self, path: &Path) -> Result<()>;
 }
@@ -41,6 +48,7 @@ pub(crate) struct EmbeddedRestore;
 #[derive(Default)]
 pub(crate) struct Litestream {
     registry: Arc<Registry>,
+    checkpoints: Mutex<HashMap<PathBuf, IdleCheckpoint>>,
 }
 
 #[async_trait]
@@ -50,21 +58,99 @@ impl Replicator for Litestream {
         path: &Path,
         replica: &Path,
         full_snapshots: Option<Duration>,
-    ) -> Result<()> {
-        let (registry, path, replica) =
+        resume_at: Option<u64>,
+    ) -> Result<u64> {
+        let (registry, owned, replica) =
             (self.registry.clone(), path.to_owned(), replica.to_owned());
-        tokio::task::spawn_blocking(move || registry.register(path, replica, full_snapshots))
-            .await?
+        let position = tokio::task::spawn_blocking(move || {
+            registry.register(owned, replica, full_snapshots, resume_at)
+        })
+        .await??;
+        let checkpoint = IdleCheckpoint::start(self.registry.clone(), path.to_owned());
+        self.checkpoints()?.insert(path.to_owned(), checkpoint);
+        Ok(position)
     }
 
     async fn sync(&self, path: &Path) -> Result<u64> {
-        let (registry, path) = (self.registry.clone(), path.to_owned());
-        tokio::task::spawn_blocking(move || registry.sync(&path)).await?
+        let (registry, owned) = (self.registry.clone(), path.to_owned());
+        let (position, advanced) =
+            tokio::task::spawn_blocking(move || registry.sync(&owned)).await??;
+        if advanced && let Some(checkpoint) = self.checkpoints()?.get(path) {
+            checkpoint.committed();
+        }
+        Ok(position)
     }
 
     async fn unregister(&self, path: &Path) -> Result<()> {
+        self.checkpoints()?.remove(path);
         let (registry, path) = (self.registry.clone(), path.to_owned());
         tokio::task::spawn_blocking(move || registry.unregister(&path)).await?
+    }
+}
+
+impl Litestream {
+    fn checkpoints(&self) -> Result<std::sync::MutexGuard<'_, HashMap<PathBuf, IdleCheckpoint>>> {
+        self.checkpoints
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQLite checkpoints poisoned"))
+    }
+}
+
+/// Runs the WAL checkpoint once commits pause, so commits rarely wait on one.
+struct IdleCheckpoint {
+    commits: watch::Sender<()>,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl IdleCheckpoint {
+    fn start(registry: Arc<Registry>, path: PathBuf) -> Self {
+        let (commits, receiver) = watch::channel(());
+        Self {
+            commits,
+            _task: AbortOnDropHandle::new(tokio::spawn(checkpoint_when_idle(
+                registry, path, receiver,
+            ))),
+        }
+    }
+
+    fn committed(&self) {
+        self.commits.send_replace(());
+    }
+}
+
+async fn checkpoint_when_idle(
+    registry: Arc<Registry>,
+    path: PathBuf,
+    mut commits: watch::Receiver<()>,
+) {
+    while commits.changed().await.is_ok() {
+        if !wait_for_idle(&mut commits).await {
+            return;
+        }
+        let (registry, owned) = (registry.clone(), path.clone());
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || registry.checkpoint(&owned))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+        let duration_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        match result {
+            Ok(()) => tracing::debug!(event = "sqlite_wal_checkpoint", duration_ms),
+            Err(error) => tracing::warn!(event = "sqlite_wal_checkpoint_failed", duration_ms,
+                error = %format!("{error:#}")),
+        }
+    }
+}
+
+/// Waits until no commit arrives for `CHECKPOINT_IDLE`, or `CHECKPOINT_MAX_DELAY` passes.
+async fn wait_for_idle(commits: &mut watch::Receiver<()>) -> bool {
+    let deadline = tokio::time::Instant::now() + CHECKPOINT_MAX_DELAY;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(CHECKPOINT_IDLE) => return true,
+            () = tokio::time::sleep_until(deadline) => return true,
+            changed = commits.changed() => if changed.is_err() { return false },
+        }
     }
 }
 
@@ -89,16 +175,17 @@ impl DatabaseRestore for EmbeddedRestore {
     }
 }
 
-/// Restores read the decoded LTX files from memory instead of writing them to disk first.
-struct MemoryReplica(Vec<(Segment, Arc<[u8]>)>);
+/// Restores read the LTX files from memory instead of writing them to disk first.
+struct MemoryReplica(Vec<(Segment, bytes::Bytes)>);
 
 impl MemoryReplica {
     fn decode(files: &[LtxFile]) -> Result<Self> {
         files
             .iter()
             .map(|file| {
+                file.validate()?;
                 let segment = Segment::new(file.level, file.first, file.last)?;
-                Ok((segment, Arc::from(file.decode()?)))
+                Ok((segment, file.data.clone()))
             })
             .collect::<Result<_>>()
             .map(Self)
@@ -144,7 +231,8 @@ impl Registry {
         path: PathBuf,
         replica: PathBuf,
         full_snapshots: Option<Duration>,
-    ) -> Result<()> {
+        resume_at: Option<u64>,
+    ) -> Result<u64> {
         let mut databases = self
             .databases
             .lock()
@@ -153,13 +241,8 @@ impl Registry {
             !databases.contains_key(&path),
             "SQLite database already registered"
         );
-        // The local replica only stages files until their commit is uploaded, so it skips fsync,
-        // and its base snapshot waits for the first write.
-        let options = Options {
-            defer_base_snapshot: true,
-            ..Options::default()
-        };
-        let database = Database::with_store(&path, options, Arc::new(FileStore::scratch(replica)))?;
+        let database = open_capture(&path, replica, resume_at)?;
+        let position = database.position();
         databases.insert(
             path,
             Arc::new(Mutex::new(Some(Capture {
@@ -168,10 +251,30 @@ impl Registry {
                 snapshot_at: Instant::now(),
             }))),
         );
-        Ok(())
+        Ok(position)
     }
 
-    fn sync(&self, path: &Path) -> Result<u64> {
+    /// Returns the capture position and whether this sync captured anything.
+    fn sync(&self, path: &Path) -> Result<(u64, bool)> {
+        self.with_capture(path, |capture| {
+            let before = capture.database.position();
+            let position = capture.sync()?;
+            Ok((position, position != before))
+        })
+    }
+
+    fn checkpoint(&self, path: &Path) -> Result<()> {
+        self.with_capture(path, |capture| {
+            capture.database.checkpoint(CheckpointMode::Passive)?;
+            Ok(())
+        })
+    }
+
+    fn with_capture<T>(
+        &self,
+        path: &Path,
+        run: impl FnOnce(&mut Capture) -> Result<T>,
+    ) -> Result<T> {
         let database = self
             .databases
             .lock()
@@ -182,10 +285,9 @@ impl Registry {
         let mut capture = database
             .lock()
             .map_err(|_| anyhow::anyhow!("SQLite capture poisoned"))?;
-        capture
+        run(capture
             .as_mut()
-            .context("SQLite database was unregistered")?
-            .sync()
+            .context("SQLite database was unregistered")?)
     }
 
     fn unregister(&self, path: &Path) -> Result<()> {
@@ -203,6 +305,26 @@ impl Registry {
             .context("SQLite database was unregistered")?;
         Ok(())
     }
+}
+
+/// The local replica only stages files until their commit is uploaded, so it skips fsync. A new
+/// history's base snapshot waits for the first write, and WAL checkpoints run between commits.
+fn open_capture(path: &Path, replica: PathBuf, resume_at: Option<u64>) -> Result<Database> {
+    let options = Options {
+        defer_base_snapshot: true,
+        min_checkpoint_pages: 0,
+        checkpoint_interval: Duration::ZERO,
+        ..Options::default()
+    };
+    let store = Arc::new(FileStore::scratch(replica));
+    if let Some(txid) = resume_at {
+        match Database::resume(path, options.clone(), store.clone(), txid) {
+            Ok(database) => return Ok(database),
+            Err(error) => tracing::warn!(event = "sqlite_resume_failed", txid,
+                error = %format!("{error:#}"), "SQLite capture starts a new history"),
+        }
+    }
+    Database::with_store(path, options, store)
 }
 
 struct Capture {

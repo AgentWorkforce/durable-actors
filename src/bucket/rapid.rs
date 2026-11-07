@@ -212,12 +212,7 @@ impl SnapshotStore for RapidSnapshots {
             .await?;
         if let Some(session) = self.session.lock().await.as_mut() {
             session
-                .restored(
-                    self.storage.clone(),
-                    object,
-                    bytes,
-                    restored.checkpoint_version,
-                )
+                .restored(self.storage.clone(), object, bytes, &restored)
                 .await?;
         }
         Ok(restored.sqlite)

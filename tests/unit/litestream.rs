@@ -8,8 +8,13 @@ async fn registered_databases_sync_restore_and_unregister() -> Result<()> {
     let replica = directory.path().join("replica");
     let sql = rusqlite::Connection::open(&path)?;
     sql.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE data(value)")?;
-    replication.register(&path, &replica, None).await?;
-    assert!(replication.register(&path, &replica, None).await.is_err());
+    replication.register(&path, &replica, None, None).await?;
+    assert!(
+        replication
+            .register(&path, &replica, None, None)
+            .await
+            .is_err()
+    );
     sql.execute("INSERT INTO data VALUES(1)", [])?;
     let first = replication.sync(&path).await?;
     sql.execute("INSERT INTO data VALUES(2)", [])?;
@@ -36,7 +41,7 @@ async fn failed_publication_cannot_acknowledge_a_write() -> Result<()> {
     let replica = directory.path().join("replica");
     let sql = rusqlite::Connection::open(&path)?;
     sql.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE data(value)")?;
-    replication.register(&path, &replica, None).await?;
+    replication.register(&path, &replica, None, None).await?;
     sql.execute("INSERT INTO data VALUES(1)", [])?;
     replication.sync(&path).await?;
     std::fs::rename(replica.join("ltx/0"), replica.join("retained"))?;

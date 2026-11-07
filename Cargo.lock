@@ -4546,7 +4546,7 @@ dependencies = [
 [[package]]
 name = "terse-litestream"
 version = "0.1.0"
-source = "git+https://github.com/TerseAI/terse-litestream?rev=aef50e63bbb6cf868fea766af6dad6707b5f1cac#aef50e63bbb6cf868fea766af6dad6707b5f1cac"
+source = "git+https://github.com/TerseAI/terse-litestream?rev=f0b35ba2b2f320493ceb6bf7e9dd99cbfb6e1c33#f0b35ba2b2f320493ceb6bf7e9dd99cbfb6e1c33"
 dependencies = [
  "anyhow",
  "crc",

@@ -106,6 +106,7 @@ impl Session {
                 .append(frame, reference.state_version);
         }
         self.version = reference.state_version;
+        self.checkpoint.logged(self.version, bytes.len() as u64);
         self.latest = Some((object.into(), bytes));
         self.healthy = true;
         self.checkpoint
@@ -130,7 +131,7 @@ impl Session {
         storage: Arc<LogStorage>,
         object: &str,
         bytes: Bytes,
-        checkpoint_version: u64,
+        restored: &crate::bucket::recovery::ResolvedSqlite,
     ) -> Result<()> {
         let snapshot = crate::state_log::StateSnapshot::decode(&bytes)?;
         if self.latest.is_some()
@@ -141,7 +142,7 @@ impl Session {
             return Ok(());
         }
         self.latest = Some((object.into(), bytes));
-        self.checkpoint.restored(checkpoint_version);
+        self.checkpoint.restored(restored, self.version);
         self.checkpoint
             .schedule(storage, self.latest.as_ref(), self.version)
             .await;

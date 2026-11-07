@@ -299,6 +299,14 @@ impl RuntimeStorage {
     fn remember(&self, record: Ownership, snapshot: Option<LoadedSnapshot>) -> LoadedActor {
         let mut placement = record.placement();
         apply_snapshot(&mut placement, snapshot.as_ref().map(|s| &s.reference));
+        if let Some(snapshot) = &snapshot {
+            self.uploaded
+                .lock()
+                .unwrap()
+                .entry(record.lease.session_id.clone())
+                .or_default()
+                .latest = Some(snapshot.reference.clone());
+        }
         self.owned
             .lock()
             .unwrap()
@@ -505,7 +513,8 @@ impl crate::state_transport::SnapshotWriter for RuntimeStorage {
 }
 
 impl RuntimeStorage {
-    /// A parent this session uploaded itself is already verified, so it needs no download.
+    /// A parent this session restored or uploaded itself is already verified, so it needs no
+    /// download.
     fn uploaded_latest(&self, session: &str, parent: &SnapshotRef) -> bool {
         self.uploaded
             .lock()

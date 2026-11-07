@@ -205,10 +205,16 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     assert_eq!(prepared.txid, sqlite.txid);
     assert_eq!(prepared.files.len(), 1);
     let mut corrupt = reader.prefetch_checkpoint(&source).await?.unwrap();
-    let mut checkpoint: crate::bucket::recovery::Checkpoint =
-        serde_json::from_slice(corrupt.bytes.as_ref().unwrap())?;
+    let mut checkpoint = crate::bucket::recovery::Checkpoint {
+        source: source.clone(),
+        sqlite: crate::bucket::recovery::Checkpoint::decode(
+            corrupt.bytes.as_ref().unwrap(),
+            &source,
+            sqlite.txid,
+        )?,
+    };
     checkpoint.source.digest = "incorrect".into();
-    corrupt.bytes = Some(crate::payload::encode(&checkpoint)?);
+    corrupt.bytes = Some(checkpoint.encode()?);
     assert!(
         reader
             .restore_prefetched(&source.object, history[34].clone(), Some(corrupt))
@@ -231,7 +237,8 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
         .sum();
     assert!(sqlite.files[0].data.len() < original_size);
     let restored =
-        SqliteCapture::restore(replication.clone(), &sqlite.files, sqlite.txid, None).await?;
+        SqliteCapture::restore(replication.clone(), &sqlite.files, sqlite.txid, None, false)
+            .await?;
     let db = rusqlite::Connection::open(restored.path())?;
     assert_eq!(
         crate::litestream::storage::read_fields(&db)?,
@@ -282,8 +289,11 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     );
     let key = format!("{}.checkpoint", f.stream.object(35));
     let stored = f.archive.get(&key).await?.unwrap();
-    let mut checkpoint: crate::bucket::recovery::Checkpoint =
-        serde_json::from_slice(&stored.bytes)?;
+    let source = f.stream.snapshot(&history[34])?;
+    let mut checkpoint = crate::bucket::recovery::Checkpoint {
+        sqlite: crate::bucket::recovery::Checkpoint::decode(&stored.bytes, &source, sqlite.txid)?,
+        source,
+    };
     checkpoint.source.digest = "wrong-source".into();
     assert!(
         f.archive
@@ -644,7 +654,7 @@ async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> 
     parent.verify(&parent_bytes)?;
     let mut files = StateSnapshot::decode(&parent_bytes)?.sqlite.files;
     files.extend(second.sqlite.files);
-    let restored = SqliteCapture::restore(replication, &files, txid, None).await?;
+    let restored = SqliteCapture::restore(replication, &files, txid, None, false).await?;
     let db = rusqlite::Connection::open(restored.path())?;
     assert_eq!(
         db.query_row(

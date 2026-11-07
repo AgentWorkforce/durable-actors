@@ -95,12 +95,6 @@ pub(crate) fn copy(mut reader: impl Read) -> Result<Bytes> {
 #[derive(Clone, Debug)]
 pub struct Text(Bytes);
 
-impl Text {
-    pub(crate) fn from_bytes(bytes: Bytes) -> Result<Self> {
-        std::str::from_utf8(&bytes)?;
-        Ok(Self(bytes))
-    }
-}
 impl Deref for Text {
     type Target = str;
     fn deref(&self) -> &str {
