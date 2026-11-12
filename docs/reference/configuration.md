@@ -115,6 +115,7 @@ Use the [self-hosting guide](../self-hosting.md) and [Helm chart](../../charts/d
 | `DURABLE_ACTORS_GATEWAY_ACCEPT_CONNECTIONS` | Whether this process accepts browser WebSockets; defaults to `true`. |
 | `DURABLE_ACTORS_PUBLIC_URL` | Public HTTPS origin for client invocation and socket routing. |
 | `DURABLE_ACTORS_POSTGRES_URL` | Registry, trace, and spare bookkeeping database; the user needs migration privileges. |
+| `PGSSLROOTCERT` | Optional path to a PEM CA bundle for PostgreSQL, such as the Amazon RDS global bundle. When set, or when the URL carries `sslrootcert=<path>` (which takes precedence), only the bundle's certificates are trusted; `sslrootcert=system` keeps the platform roots. In `DURABLE_ACTORS_POSTGRES_URL`, `sslmode=verify-full` verifies the chain and the server hostname and `sslmode=verify-ca` the chain only; `require` and `prefer` also verify the chain and hostname whenever TLS is used. Each of `sslmode` and `sslrootcert` may appear once. The bundle is read at startup. |
 | `DURABLE_ACTORS_ANALYTICS_BACKEND` | Telemetry backend: `postgres` (default) or `clickhouse`. ClickHouse supplies request analytics and actor inventory. PostgreSQL remains required for control-plane bookkeeping. |
 | `DURABLE_ACTORS_CLICKHOUSE_URL` | ClickHouse HTTP(S) endpoint, required for the ClickHouse backend. |
 | `DURABLE_ACTORS_CLICKHOUSE_DATABASE` | Existing ClickHouse database. The application user needs SELECT, INSERT, CREATE TABLE, CREATE VIEW, and ALTER TABLE privileges in it. |

@@ -371,3 +371,282 @@ async fn reset_first_connection(
         tokio_util::task::AbortOnDropHandle::new(task),
     ))
 }
+
+#[test]
+fn libpq_tls_params_are_taken_out_of_url_connection_strings() -> Result<()> {
+    let (url, verify, root) = take_libpq_tls_params(
+        "postgres://u:p@db.example:5432/app?sslmode=verify-full&sslrootcert=%2Fetc%2Fpostgres-ca%2Fca.crt&application_name=x",
+    )?;
+    assert_eq!(
+        url,
+        "postgres://u:p@db.example:5432/app?sslmode=require&application_name=x"
+    );
+    assert_eq!(verify, Verify::ChainAndHostname);
+    assert_eq!(root.as_deref(), Some("/etc/postgres-ca/ca.crt"));
+
+    let (url, verify, root) =
+        take_libpq_tls_params("postgresql://db/app?sslrootcert=/ca.pem&sslmode=verify-ca")?;
+    assert_eq!(url, "postgresql://db/app?sslmode=require");
+    assert_eq!(verify, Verify::Chain);
+    assert_eq!(root.as_deref(), Some("/ca.pem"));
+
+    let (url, _, root) = take_libpq_tls_params("postgres://db/app?sslrootcert=/ca.pem")?;
+    assert_eq!(url, "postgres://db/app");
+    assert_eq!(root.as_deref(), Some("/ca.pem"));
+
+    for repeated in [
+        "postgres://db/app?sslmode=verify-ca&sslmode=verify-full",
+        "postgres://db/app?sslmode=verify-full&sslmode=disable",
+        "postgres://db/app?sslrootcert=/a.pem&sslrootcert=/b.pem",
+    ] {
+        let error = take_libpq_tls_params(repeated)
+            .err()
+            .expect("a repeated TLS parameter must be rejected");
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
+
+    for unchanged in [
+        "postgres://db/app",
+        "postgres://db/app?sslmode=disable",
+        "host=db sslmode=require",
+    ] {
+        assert_eq!(take_libpq_tls_params(unchanged)?.0, unchanged);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_full_settings_require_tls_and_read_the_ca_bundle() -> Result<()> {
+    let tls = TestTls::new(&["localhost"])?;
+    let settings = ConnectionSettings::parse(
+        &format!(
+            "postgres://u@localhost/app?sslmode=verify-full&sslrootcert={}",
+            tls.ca_path.display()
+        ),
+        None,
+    )?;
+    assert_eq!(settings.config.get_ssl_mode(), SslMode::Require);
+    assert!(settings.tls.is_some());
+
+    let plaintext = ConnectionSettings::parse(
+        "postgres://u@localhost/app?sslmode=disable",
+        Some(tls.ca_path.display().to_string()),
+    )?;
+    assert!(plaintext.tls.is_none());
+
+    let missing = ConnectionSettings::parse(
+        "postgres://u@localhost/app?sslmode=verify-full&sslrootcert=/nonexistent/ca.crt",
+        None,
+    )
+    .err()
+    .expect("a missing CA bundle must fail");
+    assert!(format!("{missing:#}").contains("/nonexistent/ca.crt"));
+
+    let empty = tls.dir.path().join("empty.crt");
+    std::fs::write(&empty, "")?;
+    assert!(
+        ConnectionSettings::parse(
+            &format!("postgres://u@localhost/app?sslrootcert={}", empty.display()),
+            None
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn verify_full_accepts_the_configured_ca_and_matching_hostname() -> Result<()> {
+    let tls = TestTls::new(&["localhost"])?;
+    let url = |path: &std::path::Path| {
+        format!(
+            "postgres://u@localhost:{{port}}/app?sslmode=verify-full&sslrootcert={}",
+            path.display()
+        )
+    };
+    assert!(handshake(&tls, &url(&tls.ca_path), None).await?);
+
+    // PGSSLROOTCERT is honoured when the URL does not name a bundle.
+    assert!(
+        handshake(
+            &tls,
+            "postgres://u@localhost:{port}/app?sslmode=verify-full",
+            Some(tls.ca_path.display().to_string()),
+        )
+        .await?
+    );
+
+    // A bundle from another CA is rejected, and without a bundle the platform roots do not
+    // trust the private CA.
+    let other = TestTls::new(&["localhost"])?;
+    assert!(!handshake(&tls, &url(&other.ca_path), None).await?);
+    assert!(
+        !handshake(
+            &tls,
+            "postgres://u@localhost:{port}/app?sslmode=verify-full",
+            None
+        )
+        .await?
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn verify_full_rejects_a_hostname_mismatch_that_verify_ca_allows() -> Result<()> {
+    let tls = TestTls::new(&["db.example.internal"])?;
+    let ca = tls.ca_path.display().to_string();
+    assert!(
+        !handshake(
+            &tls,
+            &format!("postgres://u@localhost:{{port}}/app?sslmode=verify-full&sslrootcert={ca}"),
+            None,
+        )
+        .await?
+    );
+    assert!(
+        handshake(
+            &tls,
+            &format!("postgres://u@localhost:{{port}}/app?sslmode=verify-ca&sslrootcert={ca}"),
+            None,
+        )
+        .await?
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct TestTls {
+    dir: tempfile::TempDir,
+    ca_path: std::path::PathBuf,
+    identity: native_tls::Identity,
+}
+
+#[cfg(target_os = "linux")]
+impl TestTls {
+    /// A fresh CA and a server certificate it signed for `server_names`, valid for one day.
+    fn new(server_names: &[&str]) -> Result<Self> {
+        use openssl::{
+            asn1::Asn1Time,
+            bn::BigNum,
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::{PKey, Private},
+            x509::{
+                X509, X509Name,
+                extension::{BasicConstraints, SubjectAlternativeName},
+            },
+        };
+
+        fn key() -> Result<PKey<Private>> {
+            let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+            Ok(PKey::from_ec_key(EcKey::generate(&group)?)?)
+        }
+        fn name(common_name: &str) -> Result<X509Name> {
+            let mut name = X509Name::builder()?;
+            name.append_entry_by_nid(Nid::COMMONNAME, common_name)?;
+            Ok(name.build())
+        }
+        fn certificate(
+            subject: &X509Name,
+            issuer: &X509Name,
+            public: &PKey<Private>,
+            signer: &PKey<Private>,
+            serial: u32,
+            extend: impl FnOnce(&mut openssl::x509::X509Builder) -> Result<()>,
+        ) -> Result<X509> {
+            let mut builder = X509::builder()?;
+            builder.set_version(2)?;
+            let serial = BigNum::from_u32(serial)?.to_asn1_integer()?;
+            builder.set_serial_number(&serial)?;
+            builder.set_subject_name(subject)?;
+            builder.set_issuer_name(issuer)?;
+            builder.set_pubkey(public)?;
+            let not_before = Asn1Time::days_from_now(0)?;
+            builder.set_not_before(&not_before)?;
+            let not_after = Asn1Time::days_from_now(1)?;
+            builder.set_not_after(&not_after)?;
+            extend(&mut builder)?;
+            builder.sign(signer, MessageDigest::sha256())?;
+            Ok(builder.build())
+        }
+
+        let ca_key = key()?;
+        let ca_name = name("durable-actors test CA")?;
+        let ca = certificate(&ca_name, &ca_name, &ca_key, &ca_key, 1, |builder| {
+            builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
+            Ok(())
+        })?;
+        let server_key = key()?;
+        let server = certificate(
+            &name(server_names[0])?,
+            &ca_name,
+            &server_key,
+            &ca_key,
+            2,
+            |builder| {
+                let mut names = SubjectAlternativeName::new();
+                for server_name in server_names {
+                    names.dns(server_name);
+                }
+                let names = names.build(&builder.x509v3_context(Some(&ca), None))?;
+                builder.append_extension(names)?;
+                Ok(())
+            },
+        )?;
+        let dir = tempfile::tempdir()?;
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, ca.to_pem()?)?;
+        let identity = native_tls::Identity::from_pkcs8(
+            &server.to_pem()?,
+            &server_key.private_key_to_pem_pkcs8()?,
+        )?;
+        Ok(Self {
+            dir,
+            ca_path,
+            identity,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Answers one PostgreSQL SSLRequest with TLS and reports whether the client completed the
+/// handshake. `{port}` in `url` is replaced by the listener port; `url` must have a query.
+async fn handshake(tls: &TestTls, url: &str, root_cert_env: Option<String>) -> Result<bool> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    // Verify against the URL's host name but dial only the listener: `localhost` may also resolve to
+    // ::1, and tokio-postgres reports the last address's error.
+    let url = format!(
+        "{}&hostaddr=127.0.0.1",
+        url.replace("{port}", &port.to_string())
+    );
+    let settings = ConnectionSettings::parse(&url, root_cert_env)?;
+    let mut config = settings.config;
+    config.connect_timeout(Duration::from_secs(5));
+    let acceptor =
+        tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(tls.identity.clone())?);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let mut request = [0_u8; 8];
+        socket.read_exact(&mut request).await?;
+        anyhow::ensure!(
+            request == [0, 0, 0, 8, 4, 210, 22, 47],
+            "expected an SSLRequest"
+        );
+        socket.write_all(b"S").await?;
+        anyhow::Ok(acceptor.accept(socket).await.is_ok())
+    });
+    let client = config.connect(settings.tls.expect("TLS is enabled")).await;
+    // The fake server never speaks the PostgreSQL protocol after TLS, so the client always fails.
+    let error = client.err().expect("the fake server never authenticates");
+    let accepted = tokio::time::timeout(Duration::from_secs(10), server).await???;
+    if !accepted {
+        assert!(error.to_string().contains("TLS"), "{error}");
+    }
+    Ok(accepted)
+}
