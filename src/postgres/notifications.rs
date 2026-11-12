@@ -1,8 +1,8 @@
-use super::{MakeTlsConnector, PostgresDatabase, TlsConnector};
+use super::{ConnectionSettings, PostgresDatabase};
 use anyhow::{Context, Result};
-use std::{str::FromStr, time::Duration};
+use std::time::Duration;
 use tokio::sync::{oneshot, watch};
-use tokio_postgres::{AsyncMessage, Config, Connection, NoTls, Socket, config::SslMode};
+use tokio_postgres::{AsyncMessage, Connection, NoTls, Socket};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 #[derive(Clone)]
@@ -26,7 +26,7 @@ impl ChangeFeed {
         url: &str,
         stop: CancellationToken,
     ) -> Result<Self> {
-        let config = Config::from_str(url)?;
+        let settings = ConnectionSettings::from_url(url)?;
         let stop = stop.child_token();
         let startup = stop.clone().drop_guard();
         let changes = watch::channel(()).0;
@@ -40,10 +40,13 @@ impl ChangeFeed {
             loop {
                 let result = tokio::select! {
                     _ = stop.cancelled() => return,
-                    result = connect(&config, changes.clone(), &mut ready, stop.clone()) => result,
+                    result = connect(&settings, changes.clone(), &mut ready, stop.clone()) => result,
                 };
                 if let Err(error) = result {
-                    tracing::warn!(%error, "PostgreSQL change listener disconnected; polling remains active");
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "PostgreSQL change listener disconnected; polling remains active"
+                    );
                 }
                 tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
             }
@@ -73,19 +76,18 @@ impl ChangeFeed {
 }
 
 async fn connect(
-    config: &Config,
+    settings: &ConnectionSettings,
     changes: watch::Sender<()>,
     ready: &mut Option<oneshot::Sender<()>>,
     stop: CancellationToken,
 ) -> Result<()> {
-    match config.get_ssl_mode() {
-        SslMode::Disable => {
-            let (client, connection) = config.connect(NoTls).await?;
+    match &settings.tls {
+        None => {
+            let (client, connection) = settings.config.connect(NoTls).await?;
             listen(client, connection, changes, ready, stop).await
         }
-        _ => {
-            let tls = MakeTlsConnector::new(TlsConnector::builder().build()?);
-            let (client, connection) = config.connect(tls).await?;
+        Some(tls) => {
+            let (client, connection) = settings.config.connect(tls.clone()).await?;
             listen(client, connection, changes, ready, stop).await
         }
     }
