@@ -196,6 +196,40 @@ fn pool_drain_rates_are_configurable_and_validated() -> Result<()> {
 }
 
 #[test]
+fn host_bun_options_are_optional_and_bind_the_inspector_to_loopback() -> Result<()> {
+    let mut values = process_environment();
+    values.insert("DURABLE_ACTORS_SANDBOX_PROVIDER", "gke");
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))
+    };
+    assert_eq!(gke(&parse(&values)?).bun_options, None);
+    for unset in ["", "   "] {
+        values.insert("DURABLE_ACTORS_HOST_BUN_OPTIONS", unset);
+        assert_eq!(gke(&parse(&values)?).bun_options, None, "{unset:?}");
+    }
+    for options in [
+        "--cpu-prof --cpu-prof-dir=/tmp",
+        "--inspect",
+        "--inspect=6499",
+        "--inspect=127.0.0.1:6499/debug",
+        "--inspect-wait=localhost:6499",
+    ] {
+        values.insert("DURABLE_ACTORS_HOST_BUN_OPTIONS", options);
+        assert_eq!(gke(&parse(&values)?).bun_options.as_deref(), Some(options));
+    }
+    for options in [
+        "--inspect=0.0.0.0:6499",
+        "--inspect=ws://10.0.0.1:6499/debug",
+        "--inspect=[::]:6499",
+        "--cpu-prof\n--inspect",
+    ] {
+        values.insert("DURABLE_ACTORS_HOST_BUN_OPTIONS", options);
+        assert!(parse(&values).is_err(), "{options}");
+    }
+    Ok(())
+}
+
+#[test]
 fn host_idle_timeout_is_configurable_and_bounded() -> Result<()> {
     for value in ["1", "120000", "86400000"] {
         let mut values = process_environment();

@@ -23,6 +23,7 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
             "us-west4-c".into(),
         ],
         "test-token",
+        None,
     )?;
     assert_eq!(
         pod.metadata
@@ -78,6 +79,36 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
             .unwrap()
             .allow_privilege_escalation,
         Some(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn spare_pod_forwards_bun_options_only_when_configured() -> Result<()> {
+    let zones = ["us-west4-a".into()];
+    let bun_options = |pod: Pod| {
+        pod.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|var| var.name == "BUN_OPTIONS")
+            .and_then(|var| var.value)
+    };
+    let request = spare_request("warm-one");
+    assert_eq!(
+        bun_options(spare_pod(&request, &zones, "test-token", None)?),
+        None
+    );
+    assert_eq!(
+        bun_options(spare_pod(
+            &request,
+            &zones,
+            "test-token",
+            Some("--cpu-prof --cpu-prof-dir=/tmp")
+        )?)
+        .as_deref(),
+        Some("--cpu-prof --cpu-prof-dir=/tmp")
     );
     Ok(())
 }
@@ -305,6 +336,7 @@ async fn fake_cluster(
             namespace: "sandboxes".into(),
             zones: BTreeMap::from([("north-america-west".into(), vec!["us-west4-a".into()])]),
             reap_concurrency: 4,
+            bun_options: None,
         },
     );
     Ok((cluster, server))
