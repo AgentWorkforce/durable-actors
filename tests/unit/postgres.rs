@@ -602,14 +602,19 @@ impl TestTls {
 
 #[cfg(target_os = "linux")]
 /// Answers one PostgreSQL SSLRequest with TLS and reports whether the client completed the
-/// handshake. `{port}` in `url` is replaced by the listener port.
+/// handshake. `{port}` in `url` is replaced by the listener port; `url` must have a query.
 async fn handshake(tls: &TestTls, url: &str, root_cert_env: Option<String>) -> Result<bool> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let settings =
-        ConnectionSettings::parse(&url.replace("{port}", &port.to_string()), root_cert_env)?;
+    // Verify against the URL's host name but dial only the listener: `localhost` may also resolve to
+    // ::1, and tokio-postgres reports the last address's error.
+    let url = format!(
+        "{}&hostaddr=127.0.0.1",
+        url.replace("{port}", &port.to_string())
+    );
+    let settings = ConnectionSettings::parse(&url, root_cert_env)?;
     let mut config = settings.config;
     config.connect_timeout(Duration::from_secs(5));
     let acceptor =
