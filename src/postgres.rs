@@ -200,7 +200,9 @@ enum Verify {
 }
 
 /// Removes `sslrootcert` and rewrites `sslmode=verify-ca|verify-full` to `require` in a URL-form
-/// connection string. Key/value connection strings are returned unchanged.
+/// connection string. Key/value connection strings are returned unchanged. Values are
+/// percent-decoded exactly as `tokio-postgres` decodes the rest of the query. A repeated `sslmode`
+/// or `sslrootcert` is rejected, so the effective mode and the verification policy cannot differ.
 fn take_libpq_tls_params(url: &str) -> Result<(String, Verify, Option<String>)> {
     let mut verify = Verify::ChainAndHostname;
     let mut root_cert = None;
@@ -209,6 +211,7 @@ fn take_libpq_tls_params(url: &str) -> Result<(String, Verify, Option<String>)> 
         return Ok((url.to_owned(), verify, root_cert));
     };
     let mut kept = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let decode = |part: &str| -> Result<String> {
@@ -217,7 +220,14 @@ fn take_libpq_tls_params(url: &str) -> Result<(String, Verify, Option<String>)> 
                 .context("decode PostgreSQL connection URL parameter")?
                 .into_owned())
         };
-        match (decode(key)?.as_str(), decode(value)?.as_str()) {
+        let key = decode(key)?;
+        if matches!(key.as_str(), "sslmode" | "sslrootcert") {
+            anyhow::ensure!(
+                seen.insert(key.clone()),
+                "PostgreSQL connection URL sets {key} more than once"
+            );
+        }
+        match (key.as_str(), decode(value)?.as_str()) {
             ("sslrootcert", path) => root_cert = Some(path.to_owned()),
             ("sslmode", "verify-full") => kept.push("sslmode=require".to_owned()),
             ("sslmode", "verify-ca") => {

@@ -394,6 +394,17 @@ fn libpq_tls_params_are_taken_out_of_url_connection_strings() -> Result<()> {
     assert_eq!(url, "postgres://db/app");
     assert_eq!(root.as_deref(), Some("/ca.pem"));
 
+    for repeated in [
+        "postgres://db/app?sslmode=verify-ca&sslmode=verify-full",
+        "postgres://db/app?sslmode=verify-full&sslmode=disable",
+        "postgres://db/app?sslrootcert=/a.pem&sslrootcert=/b.pem",
+    ] {
+        let error = take_libpq_tls_params(repeated)
+            .err()
+            .expect("a repeated TLS parameter must be rejected");
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
+
     for unchanged in [
         "postgres://db/app",
         "postgres://db/app?sslmode=disable",
