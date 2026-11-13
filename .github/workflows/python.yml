@@ -9,7 +9,7 @@ permissions:
 jobs:
     python:
         name: Python ${{ matrix.python }}
-        runs-on: blacksmith-4vcpu-ubuntu-2404
+        runs-on: ubuntu-24.04
         strategy:
             fail-fast: false
             matrix:

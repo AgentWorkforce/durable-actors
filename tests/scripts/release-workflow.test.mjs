@@ -36,10 +36,9 @@ test("macOS Intel publishes on its own path that primary publishing never waits 
 })
 
 test("primary Python wheels cover every primary runner and leave Intel to its own job", () => {
-    const pattern = releaseJob("python-runtime").match(/pattern: (\S+)/)[1]
-    const included = runner => new RegExp(`^${pattern.replaceAll("*", ".*")}$`).test(`python-runtime-${runner}`)
-    assert.ok(nativeRunners("native").every(included), `${pattern} must match every primary runner`)
-    assert.ok(!nativeRunners("native-intel").some(included), `${pattern} must exclude Intel`)
+    const downloads = [...releaseJob("python-runtime").matchAll(/name: (python-runtime-\S+)/g)].map(match => match[1])
+    assert.deepEqual(downloads.sort(), nativeRunners("native").map(runner => `python-runtime-${runner}`).sort())
+    assert.ok(!nativeRunners("native-intel").some(runner => downloads.includes(`python-runtime-${runner}`)))
     assert.match(releaseJob("python-runtime-intel"), /name: python-runtime-macos-15-intel/)
 })
 
