@@ -6,7 +6,7 @@ export const actorsKey = (baseUrl: string) => ["actors", baseUrl] as const
 
 export const requestsKey = (baseUrl: string) => ["requests", baseUrl] as const
 
-export const residencyKey = (baseUrl: string, actorName: string) => ["residency", baseUrl, actorName] as const
+export const residencyKey = (baseUrl: string, actorName: string, actorId?: string) => ["residency", baseUrl, actorName, actorId] as const
 
 export const webSocketsKey = (baseUrl: string) => ["websockets", baseUrl] as const
 

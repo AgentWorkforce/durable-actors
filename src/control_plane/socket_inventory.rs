@@ -42,13 +42,9 @@ impl ActorInventoryReader for ConnectionInventoryReader {
     async fn residency_history(
         &self,
         project: &str,
-        actor_name: &str,
-        from_ms: u64,
-        to_ms: u64,
+        query: &crate::placement::ResidencyQuery,
     ) -> Result<crate::placement::ResidencyHistory> {
-        self.actors
-            .residency_history(project, actor_name, from_ms, to_ms)
-            .await
+        self.actors.residency_history(project, query).await
     }
 }
 

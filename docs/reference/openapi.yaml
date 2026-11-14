@@ -383,17 +383,21 @@ paths:
             operationId: listActorResidency
             tags: [Observability]
             summary: Get instance residency over time
-            description: Lifecycle periods clipped to the selected range. Missing reports become unknown after 35 seconds. Stops remain dormant until reactivation. Reads at most the latest 10000 reports, including the last report before the range for each instance. Time before retained evidence is omitted.
+            description: Lifecycle periods in the range, built from reports in it and the 35 seconds before. An instance turns unknown 35 seconds after its last report, or stays dormant after a stop. Keeps the newest 100000 stretches of unchanged status.
             parameters:
                 - name: actorName
                   in: query
                   required: true
                   schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,48}$" }
+                - name: actorId
+                  in: query
+                  description: Only this instance.
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
                 - { $ref: "#/components/parameters/FromMs" }
                 - { $ref: "#/components/parameters/ToMs" }
             responses:
                 "200":
-                    description: Residency periods and whether the report limit was reached.
+                    description: Residency periods, and whether older ones were left out to stay within the limit.
                     headers:
                         Cache-Control: { $ref: "#/components/headers/NoStore" }
                     content:

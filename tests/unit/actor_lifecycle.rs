@@ -282,7 +282,7 @@ async fn residency_tracks_eviction_reactivation_gaps_and_range_boundaries() -> R
         }
     }
     let history = store
-        .residency_history("project", "Room", 15_000, 105_000)
+        .residency_history("project", &rooms(15_000, 105_000))
         .await?;
     assert!(!history.truncated);
     let periods: Vec<_> = history
@@ -303,19 +303,101 @@ async fn residency_tracks_eviction_reactivation_gaps_and_range_boundaries() -> R
     );
     assert!(
         store
-            .residency_history("absent", "Room", 0, 105_000)
+            .residency_history("absent", &rooms(0, 105_000))
             .await?
             .periods
             .is_empty()
     );
     let historical = store
-        .residency_history("project", "Room", 45_000, 50_000)
+        .residency_history("project", &rooms(45_000, 50_000))
         .await?;
     assert_eq!(historical.periods.len(), 1);
     assert_eq!(historical.periods[0].status, ActorResidency::Dormant);
     assert_eq!(
         store.actor_inventory("project").await?.actors[0].instances[0].last_active_at_ms,
         Some(500)
+    );
+    Ok(())
+}
+
+fn rooms(from_ms: u64, to_ms: u64) -> ResidencyQuery {
+    ResidencyQuery {
+        actor_name: "Room".into(),
+        actor_id: None,
+        from_ms,
+        to_ms,
+    }
+}
+
+#[tokio::test]
+async fn residency_reads_only_reports_that_can_reach_the_window() -> Result<()> {
+    use testing::report;
+    let store = LifecycleStore::default();
+    for event in [
+        report(
+            "project",
+            0,
+            1,
+            1,
+            10_000,
+            LifecycleKind::Stopped,
+            Some(false),
+        ),
+        report(
+            "project",
+            1,
+            1,
+            1,
+            70_000,
+            LifecycleKind::Heartbeat,
+            Some(true),
+        ),
+        report(
+            "project",
+            2,
+            1,
+            1,
+            10_000,
+            LifecycleKind::Heartbeat,
+            Some(true),
+        ),
+        report(
+            "project",
+            2,
+            1,
+            2,
+            120_000,
+            LifecycleKind::Heartbeat,
+            Some(true),
+        ),
+    ] {
+        store.record(event).await?;
+    }
+    let periods = |history: ResidencyHistory| -> Vec<_> {
+        history
+            .periods
+            .into_iter()
+            .map(|period| (period.actor_id, period.status, period.from_ms, period.to_ms))
+            .collect()
+    };
+    let class = store
+        .residency_history("project", &rooms(100_000, 130_000))
+        .await?;
+    assert_eq!(
+        periods(class),
+        [
+            ("room-1".into(), ActorResidency::Live, 100_000, 105_000),
+            ("room-1".into(), ActorResidency::Unknown, 105_000, 130_000),
+            ("room-2".into(), ActorResidency::Live, 120_000, 130_000),
+        ]
+    );
+    let one = ResidencyQuery {
+        actor_id: Some("room-2".into()),
+        ..rooms(100_000, 130_000)
+    };
+    assert_eq!(
+        periods(store.residency_history("project", &one).await?),
+        [("room-2".into(), ActorResidency::Live, 120_000, 130_000)]
     );
     Ok(())
 }

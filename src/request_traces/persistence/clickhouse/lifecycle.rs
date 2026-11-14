@@ -1,5 +1,11 @@
 use super::*;
-use crate::actor_lifecycle::{LifecycleEvent, LifecyclePersistence};
+use crate::{
+    actor_lifecycle::{
+        LifecycleEvent, LifecyclePersistence, STALE_AFTER_MS,
+        residency::{RUN_LIMIT, ResidencyRun},
+    },
+    placement::{ActorResidency, ResidencyQuery},
+};
 
 #[async_trait]
 impl LifecyclePersistence for ClickHouseTracePersistence {
@@ -26,31 +32,60 @@ impl LifecyclePersistence for ClickHouseTracePersistence {
             .collect()
     }
 
-    async fn history(
+    /// One more run than the limit keeps, so truncation shows.
+    async fn residency_runs(
         &self,
         project: &str,
-        actor_name: &str,
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<LifecycleEvent>> {
+        query: &ResidencyQuery,
+    ) -> Result<Vec<ResidencyRun>> {
         let rows = tokio::time::timeout(
             Duration::from_secs(15),
             self.client
                 .query(include_str!("residency.sql"))
                 .param("project", project)
-                .param("actor_name", actor_name)
-                .param("from", from)
-                .param("to", to)
-                .fetch_all::<InventoryRow>(),
+                .param("actor_name", &query.actor_name)
+                .param("actor_id", query.actor_id.as_deref().unwrap_or_default())
+                .param("from", query.from_ms)
+                .param("to", query.to_ms)
+                .param("stale", STALE_AFTER_MS)
+                .param("limit", RUN_LIMIT + 1)
+                .fetch_all::<RunRow>(),
         )
         .await??;
-        rows.into_iter()
-            .map(|row| Ok(serde_json::from_str(&row.event_json)?))
-            .collect()
+        Ok(rows.into_iter().map(ResidencyRun::from).collect())
     }
 }
 
 #[derive(Row, Deserialize)]
 struct InventoryRow {
     event_json: String,
+}
+
+#[derive(Row, Deserialize)]
+struct RunRow {
+    actor_id: String,
+    first_epoch: u64,
+    first_sequence: u64,
+    run_status: u8,
+    started_at_ms: u64,
+    last_at_ms: u64,
+    last_stopped: bool,
+}
+
+impl From<RunRow> for ResidencyRun {
+    fn from(row: RunRow) -> Self {
+        Self {
+            actor_id: row.actor_id,
+            owner_epoch: row.first_epoch,
+            sequence: row.first_sequence,
+            status: match row.run_status {
+                1 => ActorResidency::Live,
+                2 => ActorResidency::Dormant,
+                _ => ActorResidency::Unknown,
+            },
+            started_at_ms: row.started_at_ms,
+            last_at_ms: row.last_at_ms,
+            stopped: row.last_stopped,
+        }
+    }
 }

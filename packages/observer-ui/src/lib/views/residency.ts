@@ -2,13 +2,17 @@ import type { ApplyEvents } from "../../hooks/useLiveView.js"
 import type { ObserveEvent } from "../../types/Events.js"
 import type { ResidencyHistory, ResidencyPeriod } from "../../types/Residency.js"
 
-/** Extends each instance's timeline with the class's lifecycle reports, as the server builds it. */
-export function applyResidencyEvents(actorName: string): ApplyEvents<ResidencyHistory> {
+/** Extends each instance's timeline with its lifecycle reports, as the server builds it. */
+export function applyResidencyEvents(actorName: string, actorId?: string): ApplyEvents<ResidencyHistory> {
     return (history, events) => {
         const periods = [...history.periods]
-        for (const event of events) if (event.type === "instance" && event.item.actorName === actorName) applyReport(periods, event)
+        for (const event of events) if (event.type === "instance" && reportsFor(event, actorName, actorId)) applyReport(periods, event)
         return { ...history, periods }
     }
+}
+
+function reportsFor({ item }: Extract<ObserveEvent, { type: "instance" }>, actorName: string, actorId: string | undefined): boolean {
+    return item.actorName === actorName && (actorId === undefined || item.actorId === actorId)
 }
 
 function applyReport(periods: ResidencyPeriod[], { item }: Extract<ObserveEvent, { type: "instance" }>) {

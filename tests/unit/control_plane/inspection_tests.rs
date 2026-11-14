@@ -1042,10 +1042,22 @@ async fn residency_api_filters_projects_and_actors_and_validates_ranges() -> Res
         .json()
         .await?;
     assert_eq!(empty["periods"], json!([]));
+    for (actor_id, periods) in [("one", 1), ("two", 0)] {
+        let instance: Value = fixture
+            .get(&format!(
+                "{base}?actorName=Room.with.dots&actorId={actor_id}&toMs=9007199254740991"
+            ))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(instance["periods"].as_array().unwrap().len(), periods);
+    }
     for query in [
         "",
         "?actorName=Room&fromMs=20&toMs=10",
         "?actorName=Room&fromMs=-1",
+        "?actorName=Room&actorId=",
         "?actorName=Room&extra=1",
     ] {
         assert_eq!(

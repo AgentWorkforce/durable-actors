@@ -167,6 +167,7 @@ async fn project_events(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResidencyQuery {
     actor_name: String,
+    actor_id: Option<String>,
     from_ms: Option<u64>,
     to_ms: Option<u64>,
 }
@@ -181,6 +182,7 @@ async fn residency_history(
     let Query(query) = query.map_err(ApiError::bad_request)?;
     crate::request_traces::history::HistoryQuery {
         actor_name: Some(query.actor_name.clone()),
+        actor_id: query.actor_id.clone(),
         from_ms: query.from_ms,
         to_ms: query.to_ms,
         ..Default::default()
@@ -194,9 +196,12 @@ async fn residency_history(
         Duration::from_secs(25),
         state.inspector.inventory.residency_history(
             &project,
-            &query.actor_name,
-            query.from_ms.unwrap_or(0),
-            to,
+            &crate::placement::ResidencyQuery {
+                actor_name: query.actor_name,
+                actor_id: query.actor_id,
+                from_ms: query.from_ms.unwrap_or(0),
+                to_ms: to,
+            },
         ),
     )
     .await

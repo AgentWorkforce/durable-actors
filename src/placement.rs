@@ -101,12 +101,19 @@ pub trait ActorInventoryReader: Send + Sync {
     async fn residency_history(
         &self,
         _project_id: &str,
-        _actor_name: &str,
-        _from_ms: u64,
-        _to_ms: u64,
+        _query: &ResidencyQuery,
     ) -> Result<ResidencyHistory> {
         Ok(ResidencyHistory::default())
     }
+}
+
+/// One actor class's instances, or one instance when `actor_id` is set, over `[from_ms, to_ms]`.
+#[derive(Clone, Debug)]
+pub struct ResidencyQuery {
+    pub actor_name: String,
+    pub actor_id: Option<String>,
+    pub from_ms: u64,
+    pub to_ms: u64,
 }
 
 #[derive(Default, Serialize)]

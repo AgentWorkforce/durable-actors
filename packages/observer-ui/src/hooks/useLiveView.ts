@@ -14,18 +14,27 @@ export type ApplyEvents<T> = (data: T, events: ObserveEvent[]) => T
 export function useLiveView<T>(key: Key, read: () => Promise<T>, apply: ApplyEvents<T>, bus: EventBus | null, config?: SWRConfiguration<T>) {
     const applyRef = useRef(apply)
     applyRef.current = apply
+    const reading = useRef(0)
     const view = useSWR<T>(
         key,
         async () => {
-            const data = await read()
-            return bus ? applyRef.current(data, bus.recentEvents()) : data
+            reading.current++
+            try {
+                const data = await read()
+                return bus ? applyRef.current(data, bus.recentEvents()) : data
+            } finally {
+                reading.current--
+            }
         },
         config
     )
     const { mutate } = view
     useEffect(() => {
         if (!bus) return
-        const unsubscribe = bus.subscribe(events => void mutate(data => (data === undefined ? data : applyRef.current(data, events)), { revalidate: false }))
+        // SWR discards a read that any mutation overlaps, and the read applies recent events itself.
+        const unsubscribe = bus.subscribe(events => {
+            if (reading.current === 0) void mutate(data => (data === undefined ? data : applyRef.current(data, events)), { revalidate: false })
+        })
         const unwatch = bus.onReconnect(() => void mutate())
         return () => {
             unsubscribe()

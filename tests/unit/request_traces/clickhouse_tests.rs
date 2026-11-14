@@ -104,8 +104,14 @@ async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Resul
     collect(&persistence, &event).await?;
     wait_lifecycle(&persistence, &project, &event.event_id).await?;
     assert_eq!(reader.actor_inventory(&project).await?.actors[0].live, 1);
+    let counters = |from_ms, to_ms| crate::placement::ResidencyQuery {
+        actor_name: "Counter".into(),
+        actor_id: None,
+        from_ms,
+        to_ms,
+    };
     let history = reader
-        .residency_history(&project, "Counter", 1500, 4500)
+        .residency_history(&project, &counters(1500, 4500))
         .await?;
     let periods: Vec<_> = history
         .periods
@@ -123,7 +129,7 @@ async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Resul
     assert!(!history.truncated);
     assert!(
         reader
-            .residency_history("different-project", "Counter", 0, 4500)
+            .residency_history("different-project", &counters(0, 4500))
             .await?
             .periods
             .is_empty()
@@ -136,6 +142,78 @@ async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Resul
             .is_empty()
     );
     read_collector_rows(&persistence, &project).await
+}
+
+#[tokio::test]
+async fn residency_runs_from_sql_match_the_rust_reference() -> Result<()> {
+    use crate::{
+        actor_lifecycle::{
+            LifecyclePersistence, reports_within, residency::runs, testing::random_events,
+        },
+        placement::ResidencyQuery,
+    };
+    let Ok(url) = std::env::var("DURABLE_ACTORS_TEST_CLICKHOUSE_URL") else {
+        return Ok(());
+    };
+    let stop = CancellationToken::new();
+    let _guard = stop.clone().drop_guard();
+    let store = ClickHouseTracePersistence::start(config(url), Duration::from_secs(86400), stop)?;
+    schema::initialize(&store.client, 86400).await?;
+    let prefix = format!("residency-{}", uuid::Uuid::new_v4());
+    let fixtures: Vec<_> = (0..40)
+        .map(|seed| {
+            let project = format!("{prefix}-{seed}");
+            let events = random_events(seed, &project);
+            (project, events)
+        })
+        .collect();
+    for (_, events) in &fixtures {
+        collect_all(&store, events).await?;
+        collect_all(&store, events).await?;
+    }
+    for (seed, (project, events)) in (0u64..).zip(&fixtures) {
+        let first = events
+            .iter()
+            .map(|e| e.report.occurred_at_ms)
+            .min()
+            .unwrap();
+        let last = events
+            .iter()
+            .map(|e| e.report.occurred_at_ms)
+            .max()
+            .unwrap();
+        for window in 0..10 {
+            let pick = (seed * 31 + window) * 2_654_435_761;
+            let from_ms = first - 60_000 + pick % (last - first + 60_000);
+            let to_ms = from_ms + (pick >> 7) % (last - from_ms + 60_000);
+            for actor_id in [None, Some("room-1".to_owned())] {
+                let query = ResidencyQuery {
+                    actor_name: "Room".into(),
+                    actor_id,
+                    from_ms,
+                    to_ms,
+                };
+                let mut stored = store.residency_runs(project, &query).await?;
+                stored.sort_by_key(|run| (run.actor_id.clone(), run.owner_epoch, run.sequence));
+                assert_eq!(
+                    stored,
+                    runs(reports_within(events, &query)),
+                    "{project} {query:?}"
+                );
+            }
+        }
+    }
+    let oldest: u32 = store
+        .client
+        .query(
+            "SELECT toUInt32(min(received_at)) FROM actor_residency_reports \
+             WHERE startsWith(project_id, ?)",
+        )
+        .bind(&prefix)
+        .fetch_one()
+        .await?;
+    assert!(oldest > 1_700_000_000, "received_at is the insert time");
+    Ok(())
 }
 
 // Inserts with the exporter's column lists, so the schema stays compatible with the collector.
@@ -276,28 +354,36 @@ fn ids(page: &TracePage) -> Vec<&str> {
         .collect()
 }
 
-/// Inserts the report as the collector's platform pipeline does.
 async fn collect(
     store: &ClickHouseTracePersistence,
     event: &crate::actor_lifecycle::LifecycleEvent,
 ) -> Result<()> {
+    collect_all(store, std::slice::from_ref(event)).await
+}
+
+/// Inserts the reports as the collector's platform pipeline does.
+async fn collect_all(
+    store: &ClickHouseTracePersistence,
+    events: &[crate::actor_lifecycle::LifecycleEvent],
+) -> Result<()> {
     use crate::platform_events::PlatformEvent;
-    let record = event.to_record();
-    store
-        .client
-        .query(
-            "INSERT INTO platform_events (Timestamp, EventName, LogAttributes, Body) VALUES \
-             (fromUnixTimestamp64Milli(?), ?, map('durable_actors.project_id', ?, \
-             'durable_actors.actor_name', ?, 'durable_actors.actor_id', ?), ?)",
-        )
-        .bind(record.at_ms)
-        .bind(record.name)
-        .bind(&event.actor.project_id)
-        .bind(&event.actor.actor_name)
-        .bind(&event.actor.actor_id)
-        .bind(record.body.unwrap_or_default())
-        .execute()
-        .await?;
+    let row = "(fromUnixTimestamp64Milli(?), ?, map('durable_actors.project_id', ?, \
+               'durable_actors.actor_name', ?, 'durable_actors.actor_id', ?), ?)";
+    let mut query = store.client.query(&format!(
+        "INSERT INTO platform_events (Timestamp, EventName, LogAttributes, Body) VALUES {}",
+        vec![row; events.len()].join(", ")
+    ));
+    for event in events {
+        let record = event.to_record();
+        query = query
+            .bind(record.at_ms)
+            .bind(record.name)
+            .bind(&event.actor.project_id)
+            .bind(&event.actor.actor_name)
+            .bind(&event.actor.actor_id)
+            .bind(record.body.unwrap_or_default());
+    }
+    query.execute().await?;
     Ok(())
 }
 

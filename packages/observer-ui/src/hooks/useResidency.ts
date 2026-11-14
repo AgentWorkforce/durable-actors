@@ -7,12 +7,13 @@ import type { TimeWindow } from "../types/TimeRange.js"
 
 import { useLiveView } from "./useLiveView.js"
 
-export function useResidency(actorName: string, timeWindow: TimeWindow) {
+/** One instance's residency when `actorId` is set, otherwise the whole class's. */
+export function useResidency(actorName: string, timeWindow: TimeWindow, actorId?: string) {
     const { baseUrl, events } = useData()
     const { data, error, isLoading } = useLiveView(
-        [...residencyKey(baseUrl, actorName), ...windowKey(timeWindow)],
-        () => new HttpObserverClient(baseUrl).listResidency(actorName, currentBounds(timeWindow)),
-        applyResidencyEvents(actorName),
+        [...residencyKey(baseUrl, actorName, actorId), ...windowKey(timeWindow)],
+        () => new HttpObserverClient(baseUrl).listResidency(actorName, currentBounds(timeWindow), actorId),
+        applyResidencyEvents(actorName, actorId),
         timeWindow.live ? events : null
     )
     return {

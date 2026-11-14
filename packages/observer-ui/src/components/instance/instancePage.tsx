@@ -32,7 +32,7 @@ export function InstancePage() {
     const { actorTypes, isError, sessions, isSocketsError } = useData()
     const timeWindow = useTimeWindow()
     const { requests: ownRequests, isError: isRequestsError } = useInstanceRequests(actorName, actorId)
-    const { residency, isError: isResidencyError } = useResidency(actorName, timeWindow)
+    const { residency, isError: isResidencyError } = useResidency(actorName, timeWindow, actorId)
     const instance = actorTypes?.actors.find(type => type.actorName === actorName)?.instances.find(candidate => candidate.actorId === actorId) ?? null
     const ownSessions = sessions?.filter(session => session.actorName === actorName && session.actorId === actorId) ?? null
     const livePeriods = residency && (groupLivePeriods(residency).get(actorId) ?? [])

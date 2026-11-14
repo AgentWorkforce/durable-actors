@@ -151,6 +151,33 @@ GROUP BY project_id, actor_name, actor_id;
 
 ALTER TABLE actor_lifecycle MODIFY TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
 
+-- Residency reads one time range of a class, so time leads the key. Rows written before this
+-- table existed come from scripts/backfill-residency-reports.sh.
+CREATE TABLE IF NOT EXISTS actor_residency_reports (
+    project_id String,
+    actor_name String,
+    actor_id String,
+    event_id String,
+    owner_epoch UInt64,
+    sequence UInt64,
+    occurred_at_ms UInt64,
+    kind LowCardinality(String),
+    resident Nullable(Bool),
+    received_at DateTime
+) ENGINE = ReplacingMergeTree
+ORDER BY (project_id, actor_name, occurred_at_ms, actor_id, event_id)
+TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS actor_residency_report_updates TO actor_residency_reports AS
+SELECT project_id, actor_name, actor_id, event_id, owner_epoch, sequence,
+       JSONExtractUInt(event_json, 'occurredAtMs') AS occurred_at_ms,
+       JSONExtractString(event_json, 'kind') AS kind,
+       JSONExtract(event_json, 'resident', 'Nullable(Bool)') AS resident,
+       received_at
+FROM actor_lifecycle;
+
+ALTER TABLE actor_residency_reports MODIFY TTL received_at + INTERVAL RETENTION_SECONDS SECOND;
+
 -- Lifecycle reports arrive as platform events, and the inventory view above follows from here.
 CREATE MATERIALIZED VIEW IF NOT EXISTS actor_lifecycle_reports TO actor_lifecycle AS
 SELECT LogAttributes['durable_actors.project_id'] AS project_id,
