@@ -29,10 +29,9 @@ fn owner_rules_allow_read_list_and_replace_of_one_prefix() -> Result<()> {
     assert_eq!(
         statements,
         vec![
-            json!({"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::state/durable-actors/v3/owners/abc.json*"}),
+            json!({"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::state/durable-actors/v3/owners/abc.json*"}),
             json!({"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::state",
                 "Condition":{"StringLike":{"s3:prefix":"durable-actors/v3/owners/abc.json*"}}}),
-            json!({"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::state/durable-actors/v3/owners/abc.json*"}),
         ]
     );
     Ok(())
@@ -150,5 +149,114 @@ fn tokens_carry_expiring_session_credentials() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
     assert!(static_keys.expires_at_ms > now && static_keys.expires_at_ms <= now + 900_000);
+    Ok(())
+}
+
+#[test]
+fn directory_buckets_get_one_create_session_grant_instead_of_object_actions() -> Result<()> {
+    let express = "actors--usw2-az1--x-s3";
+    let owner = "durable-actors/v3/owners/abc.json";
+    let ownership = statements(&session_policy(
+        &[
+            rule(express, owner, Permissions::OBJECT_USER),
+            rule("checkpoint", owner, Permissions::OBJECT_USER),
+        ],
+        true,
+    )?);
+    assert!(
+        ownership.iter().all(|statement| !statement["Resource"]
+            .as_str()
+            .unwrap()
+            .contains(express)
+            || statement["Action"] == "s3express:CreateSession"),
+        "no s3:* actions on the directory bucket: {ownership:?}"
+    );
+    assert_eq!(
+        ownership.last().unwrap(),
+        &json!({"Effect":"Allow","Action":"s3express:CreateSession",
+            "Resource":"arn:aws:s3express:*:*:bucket/actors--usw2-az1--x-s3"})
+    );
+    // The regional checkpoint copy keeps its prefix-scoped object grants.
+    assert!(ownership.iter().any(|statement| statement["Resource"]
+        == "arn:aws:s3:::checkpoint/durable-actors/v3/owners/abc.json*"
+        && statement["Action"] == json!(["s3:GetObject", "s3:PutObject"])));
+
+    let snapshots = "durable-actors/v3/snapshots/x/";
+    let state = statements(&session_policy(
+        &[
+            rule(
+                express,
+                snapshots,
+                Permissions::OBJECT_VIEWER | Permissions::OBJECT_CREATOR,
+            ),
+            rule(
+                express,
+                "durable-actors/v3/snapshots/y/",
+                Permissions::OBJECT_VIEWER,
+            ),
+        ],
+        true,
+    )?);
+    assert_eq!(state.len(), 1, "one grant per directory bucket: {state:?}");
+    assert!(state[0].get("Condition").is_none(), "writes need ReadWrite");
+    Ok(())
+}
+
+#[test]
+fn read_only_rules_on_a_directory_bucket_allow_only_read_only_sessions() -> Result<()> {
+    let policy = statements(&session_policy(
+        &[rule(
+            "code--use1-az4--x-s3",
+            "durable-actors/v3/artifacts/d/",
+            Permissions::OBJECT_VIEWER,
+        )],
+        true,
+    )?);
+    assert_eq!(
+        policy,
+        vec![json!({"Effect":"Allow","Action":"s3express:CreateSession",
+            "Resource":"arn:aws:s3express:*:*:bucket/code--use1-az4--x-s3",
+            "Condition":{"StringEquals":{"s3express:SessionMode":"ReadOnly"}}})]
+    );
+    Ok(())
+}
+
+#[test]
+fn checkpointed_express_policies_fit_the_sts_limit() -> Result<()> {
+    let actor = crate::actor::ActorKey {
+        project_id: "p".repeat(64),
+        actor_name: "n".repeat(48),
+        actor_id: "i".repeat(128),
+    };
+    let express = format!("{}--usw2-az1--x-s3", "e".repeat(45));
+    let checkpoint = "c".repeat(63);
+    let owner = crate::storage_paths::owner(&actor.storage_key())?;
+    let snapshots = crate::storage_paths::snapshots(&actor)?;
+    for rules in [
+        vec![
+            rule(&express, &owner, Permissions::OBJECT_USER),
+            rule(
+                &checkpoint,
+                "durable-actors/v3/artifacts/12345678-1234-4234-8234-123456789012/",
+                Permissions::OBJECT_VIEWER,
+            ),
+            rule(&checkpoint, &owner, Permissions::OBJECT_USER),
+        ],
+        vec![
+            rule(
+                &express,
+                &snapshots,
+                Permissions::OBJECT_VIEWER | Permissions::OBJECT_CREATOR,
+            ),
+            rule(
+                &checkpoint,
+                &snapshots,
+                Permissions::OBJECT_VIEWER | Permissions::OBJECT_CREATOR,
+            ),
+        ],
+    ] {
+        let policy = session_policy(&rules, true)?;
+        assert!(policy.len() <= MAX_POLICY_BYTES, "{}", policy.len());
+    }
     Ok(())
 }

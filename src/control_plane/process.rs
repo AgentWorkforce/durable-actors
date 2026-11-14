@@ -63,6 +63,8 @@ pub enum StorageProvider {
     S3 {
         endpoint: crate::bucket::S3Endpoint,
         actor_credentials: crate::bucket::S3ActorCredentials,
+        /// Regional bucket that asynchronously checkpoints a single-zone (S3 Express) bucket.
+        checkpoint: Option<crate::bucket::access::CheckpointLocation>,
     },
 }
 
@@ -345,14 +347,27 @@ async fn object_storage(
             let snapshots = snapshot_store(authority.clone(), &config.persistence, stop).await?;
             Ok((authority, snapshots))
         }
-        StorageProvider::S3 { endpoint, .. } => {
+        StorageProvider::S3 {
+            endpoint,
+            checkpoint,
+            ..
+        } => {
             ensure!(
                 config.persistence.rapid_settings().is_none(),
                 "Rapid persistence requires GCS"
             );
-            let authority: Arc<dyn crate::bucket::Bucket> = Arc::new(
+            let mut authority: Arc<dyn crate::bucket::Bucket> = Arc::new(
                 crate::bucket::S3Bucket::from_environment(&config.bucket, endpoint).await?,
             );
+            if let Some(checkpoint) = checkpoint {
+                use crate::bucket::checkpoint::{CheckpointedBucket, Checkpointer};
+                let copy = Arc::new(
+                    crate::bucket::S3Bucket::from_environment(&checkpoint.bucket, endpoint).await?,
+                );
+                let checkpointer =
+                    Checkpointer::spawn(authority.clone(), copy, checkpoint.config(), &stop);
+                authority = Arc::new(CheckpointedBucket::new(authority, checkpointer));
+            }
             Ok((
                 authority.clone(),
                 Arc::new(crate::bucket::BucketSnapshots(authority)),
@@ -377,12 +392,14 @@ async fn runtime_access(
         StorageProvider::S3 {
             endpoint,
             actor_credentials,
+            checkpoint,
         } => {
             RuntimeAccess::s3(
                 BucketLocation::S3 {
                     artifact_bucket: config.artifact_bucket.clone(),
                     bucket: config.bucket.clone(),
                     s3: endpoint.clone(),
+                    checkpoint: checkpoint.clone(),
                 },
                 persistence,
                 actor_credentials,
@@ -668,12 +685,14 @@ impl ControlPlaneProcessConfig {
 }
 
 fn storage_provider(get: &mut impl FnMut(&str) -> Option<String>) -> Result<StorageProvider> {
-    const S3_ONLY: [&str; 5] = [
+    const S3_ONLY: [&str; 7] = [
         "DURABLE_ACTORS_S3_ACTOR_CREDENTIALS",
         "DURABLE_ACTORS_S3_REGION",
         "DURABLE_ACTORS_S3_ENDPOINT",
         "DURABLE_ACTORS_S3_FORCE_PATH_STYLE",
         "DURABLE_ACTORS_S3_ACTOR_ROLE_ARN",
+        "DURABLE_ACTORS_S3_CHECKPOINT_BUCKET",
+        "DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS",
     ];
     match get("DURABLE_ACTORS_STORAGE_PROVIDER")
         .as_deref()
@@ -713,10 +732,44 @@ fn storage_provider(get: &mut impl FnMut(&str) -> Option<String>) -> Result<Stor
                     force_path_style,
                 },
                 actor_credentials: actor_credentials(get)?,
+                checkpoint: checkpoint_location(get)?,
             })
         }
         provider => anyhow::bail!("unsupported DURABLE_ACTORS_STORAGE_PROVIDER {provider:?}"),
     }
+}
+
+const DEFAULT_CHECKPOINT_MAX_LAG_MS: u64 = 5_000;
+
+fn checkpoint_location(
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Option<crate::bucket::access::CheckpointLocation>> {
+    let bucket = get("DURABLE_ACTORS_S3_CHECKPOINT_BUCKET").filter(|value| !value.is_empty());
+    let max_lag = get("DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS");
+    let Some(bucket) = bucket else {
+        ensure!(
+            max_lag.is_none(),
+            "DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS requires DURABLE_ACTORS_S3_CHECKPOINT_BUCKET"
+        );
+        return Ok(None);
+    };
+    ensure!(
+        !crate::bucket::is_directory_bucket(&bucket),
+        "DURABLE_ACTORS_S3_CHECKPOINT_BUCKET must be a regional (S3 Standard) bucket, not a directory bucket"
+    );
+    let max_lag_ms = max_lag
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .context("DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS must be an integer")?
+        .unwrap_or(DEFAULT_CHECKPOINT_MAX_LAG_MS);
+    ensure!(
+        max_lag_ms > 0,
+        "DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS must be positive"
+    );
+    Ok(Some(crate::bucket::access::CheckpointLocation {
+        bucket,
+        max_lag_ms,
+    }))
 }
 
 fn actor_credentials(

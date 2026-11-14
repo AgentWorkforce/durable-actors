@@ -168,31 +168,58 @@ fn session_name() -> String {
 
 /// The inline policy granting exactly `rules`. Create-only grants (GCS `objectCreator`) require
 /// `If-None-Match: *` through the `s3:if-none-match` condition key, so a host cannot overwrite an
-/// immutable snapshot or artifact.
+/// immutable snapshot or artifact. Rules on S3 Express directory buckets become one
+/// `s3express:CreateSession` grant per bucket instead (see [`create_session`]).
 pub(super) fn session_policy(rules: &[Rule], create_only: bool) -> Result<String> {
     ensure!(!rules.is_empty(), "credential boundary has no rules");
     let mut statements = Vec::new();
+    let mut directory_buckets: Vec<(&str, bool)> = Vec::new();
     for rule in rules {
+        if super::is_directory_bucket(&rule.bucket) {
+            let writes = rule.permissions.contains(Permissions::OBJECT_USER)
+                || rule.permissions.contains(Permissions::OBJECT_CREATOR);
+            match directory_buckets
+                .iter_mut()
+                .find(|(bucket, _)| *bucket == rule.bucket)
+            {
+                Some((_, write)) => *write |= writes,
+                None => directory_buckets.push((&rule.bucket, writes)),
+            }
+            continue;
+        }
         let objects = format!("arn:aws:s3:::{}/{}*", rule.bucket, rule.prefix);
         let can_read = rule.permissions.contains(Permissions::OBJECT_VIEWER)
             || rule.permissions.contains(Permissions::OBJECT_USER);
         let can_replace = rule.permissions.contains(Permissions::OBJECT_USER);
         let can_create = rule.permissions.contains(Permissions::OBJECT_CREATOR);
+        let can_write = can_replace || (can_create && !create_only);
+        // Reads and unconditional writes share one statement: the policy limit is tight once
+        // identifiers are long, and each statement repeats the prefix.
+        match (can_read, can_write) {
+            (true, true) => statements.push(
+                json!({"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":objects}),
+            ),
+            (true, false) => statements
+                .push(json!({"Effect":"Allow","Action":"s3:GetObject","Resource":objects})),
+            (false, true) => statements
+                .push(json!({"Effect":"Allow","Action":"s3:PutObject","Resource":objects})),
+            (false, false) => {}
+        }
         if can_read {
-            statements.push(json!({"Effect":"Allow","Action":"s3:GetObject","Resource":objects}));
             statements.push(json!({
                 "Effect":"Allow","Action":"s3:ListBucket","Resource":format!("arn:aws:s3:::{}", rule.bucket),
                 "Condition":{"StringLike":{"s3:prefix":format!("{}*", rule.prefix)}}
             }));
         }
-        if can_replace || (can_create && !create_only) {
-            statements.push(json!({"Effect":"Allow","Action":"s3:PutObject","Resource":objects}));
-        } else if can_create {
+        if can_create && !can_write {
             statements.push(json!({
                 "Effect":"Allow","Action":"s3:PutObject","Resource":objects,
                 "Condition":{"StringEquals":{"s3:if-none-match":"*"}}
             }));
         }
+    }
+    for (bucket, writes) in directory_buckets {
+        statements.push(create_session(bucket, writes));
     }
     let policy = serde_json::to_string(&Value::Object(
         [
@@ -204,9 +231,28 @@ pub(super) fn session_policy(rules: &[Rule], create_only: bool) -> Result<String
     ))?;
     ensure!(
         policy.len() <= MAX_POLICY_BYTES,
-        "S3 session policy exceeds {MAX_POLICY_BYTES} bytes"
+        "S3 session policy exceeds {MAX_POLICY_BYTES} bytes ({})",
+        policy.len()
     );
     Ok(policy)
+}
+
+/// S3 Express directory buckets do not evaluate `s3:*` object actions: a host calls
+/// `s3express:CreateSession` once and the session token authorizes every object operation in the
+/// bucket. IAM has no prefix condition for `CreateSession`, so on a directory bucket the session
+/// policy can narrow a host to the bucket and to read-only sessions, but not to its actor's prefix.
+/// Region and account are wildcards here because a session policy only narrows the actor role,
+/// whose own policy names the exact bucket ARN.
+fn create_session(bucket: &str, writes: bool) -> Value {
+    let resource = format!("arn:aws:s3express:*:*:bucket/{bucket}");
+    if writes {
+        json!({"Effect":"Allow","Action":"s3express:CreateSession","Resource":resource})
+    } else {
+        json!({
+            "Effect":"Allow","Action":"s3express:CreateSession","Resource":resource,
+            "Condition":{"StringEquals":{"s3express:SessionMode":"ReadOnly"}}
+        })
+    }
 }
 
 #[cfg(test)]

@@ -17,9 +17,10 @@ use super::{
 use crate::{
     actor::ActorKey,
     bucket::{
-        BucketSnapshots, GcsBucket, RapidSnapshots, RuntimeStorage, S3Bucket, SnapshotStore,
-        WarmStorage,
-        access::{HostStorageConfig, StorageToken, StorageTokens},
+        Bucket, BucketObject, BucketSnapshots, GcsBucket, RapidSnapshots, RuntimeStorage, S3Bucket,
+        SnapshotStore, WarmStorage,
+        access::{CheckpointLocation, HostStorageConfig, StorageToken, StorageTokens},
+        checkpoint::{CheckpointedBucket, Checkpointer, Mirror},
     },
     clock::{Clock, SystemClock},
     control_plane::{ControlPlaneClient, LeaseFence},
@@ -30,6 +31,8 @@ use crate::{
 pub(crate) struct HostStorage {
     pub runtime: Arc<RuntimeStorage>,
     objects: Option<CodeObjects>,
+    /// Copies this actor's writes to the regional checkpoint bucket, when one is configured.
+    checkpointer: Option<Arc<Checkpointer>>,
     pub(super) stop: CancellationToken,
     observer: Arc<ControlPlaneClient>,
     host: HostId,
@@ -56,6 +59,7 @@ impl HostStorage {
         actor: ActorKey,
     ) -> Result<Self> {
         let credentials = HostCredentials::new(config.tokens, client.clone(), stop.clone());
+        let mut checkpointer = None;
         let (runtime, objects) = match config.bucket {
             crate::bucket::access::BucketLocation::Gcs { bucket, .. } => {
                 Self::open_gcs(
@@ -72,18 +76,24 @@ impl HostStorage {
                 bucket,
                 artifact_bucket,
                 s3,
+                checkpoint,
             } => {
                 ensure!(
                     config.persistence.rapid_settings().is_none(),
                     "Rapid persistence requires GCS"
                 );
-                Self::open_s3(
+                let (runtime, objects, checkpoints) = Self::open_s3(
                     &bucket,
                     &artifact_bucket,
                     &s3,
+                    checkpoint.as_ref(),
                     config.persistence,
                     credentials,
-                )?
+                    &stop,
+                    &actor,
+                )?;
+                checkpointer = checkpoints;
+                (runtime, objects)
             }
             crate::bucket::access::BucketLocation::File { directory } => {
                 ensure!(
@@ -96,6 +106,7 @@ impl HostStorage {
         };
         Ok(Self {
             objects,
+            checkpointer,
             observer: client,
             stop,
             runtime: Arc::new(runtime),
@@ -148,30 +159,84 @@ impl HostStorage {
         Ok((runtime, Some(CodeObjects::Gcs(Box::new(objects)))))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_s3(
         bucket: &str,
         artifact_bucket: &str,
         endpoint: &crate::bucket::S3Endpoint,
+        checkpoint: Option<&CheckpointLocation>,
         persistence: crate::bucket::SnapshotStoreConfig,
         credentials: HostCredentials,
-    ) -> Result<(RuntimeStorage, Option<CodeObjects>)> {
+        stop: &CancellationToken,
+        actor: &ActorKey,
+    ) -> Result<(
+        RuntimeStorage,
+        Option<CodeObjects>,
+        Option<Arc<Checkpointer>>,
+    )> {
         let ownership = credentials.aws_scoped(|tokens| &tokens.ownership);
         let state = credentials.aws_scoped(|tokens| &tokens.state);
-        let authority = Arc::new(S3Bucket::with_credentials(
-            bucket,
-            endpoint,
-            ownership.clone(),
-        )?);
-        let state: Arc<dyn crate::bucket::Bucket> =
-            Arc::new(S3Bucket::with_credentials(bucket, endpoint, state)?);
+        let primary = Arc::new(ByScope {
+            snapshots: crate::storage_paths::snapshots(actor)?,
+            ownership: Arc::new(S3Bucket::with_credentials(
+                bucket,
+                endpoint,
+                ownership.clone(),
+            )?),
+            state: Arc::new(S3Bucket::with_credentials(bucket, endpoint, state.clone())?),
+        });
         let code = Arc::new(S3Bucket::with_credentials(
             artifact_bucket,
             endpoint,
-            ownership,
+            ownership.clone(),
         )?);
+        let (authority, state, checkpointer): (Arc<dyn Bucket>, Arc<dyn Bucket>, _) =
+            match checkpoint {
+                None => (primary.ownership.clone(), primary.state.clone(), None),
+                Some(checkpoint) => {
+                    // One queue for both scopes keeps snapshots ahead of the owner records that
+                    // point at them; each object is copied with the credentials of its scope.
+                    let copy = Arc::new(ByScope {
+                        snapshots: primary.snapshots.clone(),
+                        ownership: Arc::new(S3Bucket::with_credentials(
+                            &checkpoint.bucket,
+                            endpoint,
+                            ownership,
+                        )?),
+                        state: Arc::new(S3Bucket::with_credentials(
+                            &checkpoint.bucket,
+                            endpoint,
+                            state,
+                        )?),
+                    });
+                    let checkpointer =
+                        Checkpointer::spawn(primary.clone(), copy, checkpoint.config(), stop);
+                    let reconcile = checkpointer.clone();
+                    let snapshots = primary.snapshots.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = reconcile.reconcile(&snapshots).await {
+                            tracing::warn!(
+                                event = "storage_checkpoint_reconcile_failed",
+                                error = format!("{error:#}"),
+                            );
+                        }
+                    });
+                    (
+                        Arc::new(CheckpointedBucket::new(
+                            primary.ownership.clone(),
+                            checkpointer.clone(),
+                        )),
+                        Arc::new(CheckpointedBucket::new(
+                            primary.state.clone(),
+                            checkpointer.clone(),
+                        )),
+                        Some(checkpointer),
+                    )
+                }
+            };
         let runtime = RuntimeStorage::new(authority, Arc::new(SystemClock))?
             .with_persistence(persistence, Arc::new(BucketSnapshots(state)))?;
-        Ok((runtime, Some(CodeObjects::Bucket(code))))
+        Ok((runtime, Some(CodeObjects::Bucket(code)), checkpointer))
     }
 
     pub(crate) async fn install_code(&self, artifact: &crate::bundle::ActorBundle) -> Result<()> {
@@ -248,8 +313,13 @@ impl HostStorage {
         .await
         .context("ownership release timed out")
         .and_then(|result| result);
+        let checkpointed = match &self.checkpointer {
+            Some(checkpointer) => Some(checkpointer.flush(deadline).await),
+            None => None,
+        };
         tracing::info!(
             event = "host_storage_shutdown",
+            checkpointed,
             sealed = sealed && released.is_ok(),
             released = released.is_ok(),
             error = released.as_ref().err().map(|error| format!("{error:#}")),
@@ -552,6 +622,57 @@ impl CredentialsProvider for HostCredentials {
     }
     async fn universe_domain(&self) -> Option<String> {
         Some("googleapis.com".into())
+    }
+}
+
+/// Routes each key to the client whose scoped credentials cover it: the actor's snapshots to the
+/// state client, everything else (the owner record) to the ownership client.
+struct ByScope<B> {
+    snapshots: String,
+    ownership: Arc<B>,
+    state: Arc<B>,
+}
+
+impl<B> ByScope<B> {
+    fn client(&self, key: &str) -> &Arc<B> {
+        if key.starts_with(&self.snapshots) {
+            &self.state
+        } else {
+            &self.ownership
+        }
+    }
+}
+
+#[async_trait]
+impl<B: Bucket + 'static> Bucket for ByScope<B> {
+    async fn get(&self, key: &str) -> Result<Option<BucketObject>> {
+        self.client(key).get(key).await
+    }
+
+    async fn range(&self, key: &str, start: u64, length: u64) -> Result<Option<BucketObject>> {
+        self.client(key).range(key, start, length).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        generation: Option<i64>,
+        bytes: bytes::Bytes,
+    ) -> Result<bool> {
+        self.client(key)
+            .compare_and_swap(key, generation, bytes)
+            .await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.client(prefix).list(prefix).await
+    }
+}
+
+#[async_trait]
+impl<B: Mirror + 'static> Mirror for ByScope<B> {
+    async fn mirror(&self, key: &str, generation: i64, bytes: bytes::Bytes) -> Result<()> {
+        self.client(key).mirror(key, generation, bytes).await
     }
 }
 
