@@ -429,3 +429,29 @@ async fn ownership_fences_a_second_host() -> Result<()> {
     }
     Ok(())
 }
+
+/// The checkpoint copy's write: an exact generation, never moving an object backwards, and leaving
+/// the object ready for the runtime's next compare-and-swap.
+#[tokio::test]
+async fn s3_mirror_writes_exact_generations_and_never_regresses() -> Result<()> {
+    use super::checkpoint::Mirror;
+    let Ok(bucket) = std::env::var("DURABLE_ACTORS_TEST_S3_BUCKET") else {
+        return Ok(());
+    };
+    let endpoint = S3Endpoint {
+        region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        endpoint: std::env::var("DURABLE_ACTORS_TEST_S3_ENDPOINT").ok(),
+        force_path_style: std::env::var("DURABLE_ACTORS_TEST_S3_ENDPOINT").is_ok(),
+    };
+    let s3 = S3Bucket::from_environment(&bucket, &endpoint).await?;
+    let key = format!("conformance/{}/mirrored", uuid::Uuid::new_v4().simple());
+    s3.mirror(&key, 3, Bytes::from_static(b"three")).await?;
+    assert_eq!(s3.get(&key).await?.unwrap().generation, 3);
+    s3.mirror(&key, 2, Bytes::from_static(b"two")).await?;
+    let object = s3.get(&key).await?.unwrap();
+    assert_eq!((object.generation, &object.bytes[..]), (3, &b"three"[..]));
+    s3.mirror(&key, 5, Bytes::from_static(b"five")).await?;
+    assert!(s3.compare_and_swap(&key, Some(5), unique("six")).await?);
+    assert_eq!(s3.get(&key).await?.unwrap().generation, 6);
+    Ok(())
+}

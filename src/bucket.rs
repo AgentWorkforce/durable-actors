@@ -1,4 +1,5 @@
 pub(crate) mod access;
+pub mod checkpoint;
 mod file;
 mod gcs;
 mod rapid;
@@ -19,7 +20,7 @@ pub use gcs::GcsBucket;
 pub(crate) use gcs::WarmStorage;
 pub(crate) use runtime::ActorStateReader;
 pub use runtime::{LoadedActor, OwnershipHint, RuntimeStorage, RuntimeStorageReader};
-pub use s3::{S3Bucket, S3Endpoint};
+pub use s3::{S3Bucket, S3Endpoint, is_directory_bucket};
 pub use s3_access::S3ActorCredentials;
 
 #[derive(Clone, Debug)]

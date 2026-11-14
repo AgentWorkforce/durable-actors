@@ -770,6 +770,7 @@ fn s3_storage_with_aws_placement_and_runc_actor_nodes() -> Result<()> {
             actor_credentials: crate::bucket::S3ActorCredentials::AssumeRole {
                 role_arn: "arn:aws:iam::123456789012:role/actor-storage".into()
             },
+            checkpoint: None,
         }
     );
     assert_eq!(config.region.as_deref(), Some("north-america-west"));
@@ -891,4 +892,42 @@ fn sandbox_scheduling_is_validated() {
     let mut values = aws_environment();
     values.insert("DURABLE_ACTORS_SANDBOX_RUNTIME_CLASS", "gvisor");
     assert!(parse(&values).is_ok());
+}
+
+#[test]
+fn s3_checkpoint_bucket_is_optional_regional_and_validated() -> Result<()> {
+    let mut values = aws_environment();
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))
+    };
+    values.insert("DURABLE_ACTORS_BUCKET", "actors--usw2-az1--x-s3");
+    values.insert("DURABLE_ACTORS_S3_CHECKPOINT_BUCKET", "actors-checkpoint");
+    let StorageProvider::S3 { checkpoint, .. } = parse(&values)?.storage.provider else {
+        panic!("expected S3 storage");
+    };
+    assert_eq!(
+        checkpoint,
+        Some(crate::bucket::access::CheckpointLocation {
+            bucket: "actors-checkpoint".into(),
+            max_lag_ms: 5_000,
+        })
+    );
+    values.insert("DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS", "250");
+    let StorageProvider::S3 { checkpoint, .. } = parse(&values)?.storage.provider else {
+        panic!("expected S3 storage");
+    };
+    assert_eq!(checkpoint.unwrap().max_lag_ms, 250);
+    values.insert("DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS", "0");
+    assert!(parse(&values).is_err(), "zero lag bound");
+    values.insert("DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS", "soon");
+    assert!(parse(&values).is_err(), "non-integer lag bound");
+    values.insert("DURABLE_ACTORS_S3_CHECKPOINT_MAX_LAG_MS", "250");
+    values.insert(
+        "DURABLE_ACTORS_S3_CHECKPOINT_BUCKET",
+        "copy--usw2-az1--x-s3",
+    );
+    assert!(parse(&values).is_err(), "a single-zone checkpoint bucket");
+    values.remove("DURABLE_ACTORS_S3_CHECKPOINT_BUCKET");
+    assert!(parse(&values).is_err(), "a lag bound without a bucket");
+    Ok(())
 }

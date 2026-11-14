@@ -258,3 +258,58 @@ async fn each_token_fits_the_boundary_limit_at_the_longest_identifiers() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn checkpoint_rules_mirror_the_primary_prefixes_on_the_regional_bucket() -> Result<()> {
+    let actor = actor();
+    let local = super::super::SnapshotStoreConfig::Local;
+    let express = "actors--usw2-az1--x-s3";
+    let base = scopes(express, &local, Some("code"), &actor, None)?;
+    let scoped = with_checkpoint(base.clone(), "checkpoint", &local, &actor)?;
+    let owner = crate::storage_paths::owner(&actor.storage_key())?;
+    let snapshots = crate::storage_paths::snapshots(&actor)?;
+    assert_eq!(
+        scoped.ownership,
+        vec![
+            rule(express, owner.clone(), Permissions::OBJECT_USER),
+            rule("checkpoint", owner, Permissions::OBJECT_USER),
+        ]
+    );
+    assert_eq!(
+        scoped.state,
+        vec![
+            rule(
+                express,
+                snapshots.clone(),
+                Permissions::OBJECT_VIEWER | Permissions::OBJECT_CREATOR
+            ),
+            rule(
+                "checkpoint",
+                snapshots,
+                Permissions::OBJECT_VIEWER | Permissions::OBJECT_CREATOR
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn s3_locations_without_a_checkpoint_keep_their_wire_format() -> Result<()> {
+    let location = BucketLocation::S3 {
+        bucket: "actors".into(),
+        artifact_bucket: "code".into(),
+        s3: super::super::S3Endpoint {
+            region: "us-west-2".into(),
+            endpoint: None,
+            force_path_style: false,
+        },
+        checkpoint: None,
+    };
+    let encoded = serde_json::to_value(&location)?;
+    assert!(encoded.get("checkpoint").is_none());
+    let BucketLocation::S3 { checkpoint, .. } = serde_json::from_value(encoded)? else {
+        panic!("expected S3");
+    };
+    assert_eq!(checkpoint, None);
+    Ok(())
+}
