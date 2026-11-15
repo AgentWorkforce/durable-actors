@@ -7,7 +7,8 @@
 # - Runtime images (control-plane, typescript, python) go to the same Artifact
 #   Registry repository as release.yml, tagged fast-<sha>-<target> (and
 #   fast-<sha>-<target>-<arch>). It never pushes a version or latest-* tag;
-#   deployments pin the digests printed in the run summary.
+#   deployments pin the digests printed in the run summary. No GitHub
+#   attestation is issued: it would name the dispatch commit, not the built ref.
 # - npm, crates.io and PyPI are not published (npm and PyPI use trusted
 #   publishing bound to release.yml). The npm tarballs, the .crate file, the
 #   Python SDK and runtime wheels, the native runtime bundles and the Helm
@@ -434,7 +435,6 @@ jobs:
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 10
         permissions:
-            attestations: write
             contents: read
             id-token: write
         outputs:
@@ -469,25 +469,29 @@ jobs:
                       fi
                       echo "${target}-digest=${digest}" >> "$GITHUB_OUTPUT"
                   done
-            - name: Attest control-plane image provenance
-              uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-              with:
-                  subject-name: ${{ env.IMAGE }}
-                  subject-digest: ${{ steps.manifest.outputs.control-plane-digest }}
-            - name: Attest typescript image provenance
-              uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-              with:
-                  subject-name: ${{ env.IMAGE }}
-                  subject-digest: ${{ steps.manifest.outputs.typescript-digest }}
-            - name: Attest python image provenance
-              uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-              with:
-                  subject-name: ${{ env.IMAGE }}
-                  subject-digest: ${{ steps.manifest.outputs.python-digest }}
+            - name: Summary
+              env:
+                  REF: ${{ inputs.ref }}
+                  SHA: ${{ needs.gate.outputs.sha }}
+                  REASON: ${{ inputs.reason }}
+                  CONTROL_PLANE_DIGEST: ${{ steps.manifest.outputs.control-plane-digest }}
+                  TYPESCRIPT_DIGEST: ${{ steps.manifest.outputs.typescript-digest }}
+                  PYTHON_DIGEST: ${{ steps.manifest.outputs.python-digest }}
+              run: |
+                  {
+                      echo "### durable-actors fast path: runtime images"
+                      echo "- ref: \`$REF\` at \`$SHA\`"
+                      echo "- reason: $REASON"
+                      echo "- tag \`fast-$SHA-<target>\`:"
+                      echo "  - \`${IMAGE}@${CONTROL_PLANE_DIGEST}\` (control-plane)"
+                      echo "  - \`${IMAGE}@${TYPESCRIPT_DIGEST}\` (typescript)"
+                      echo "  - \`${IMAGE}@${PYTHON_DIGEST}\` (python)"
+                  } >> "$GITHUB_STEP_SUMMARY"
 
     summary:
         name: Summary
-        needs: [gate, rust, npm, helm, python, native, image]
+        needs: [gate, rust, npm, helm, python, native, image-push, image]
+        if: always() && needs.gate.result == 'success'
         runs-on: blacksmith-2vcpu-ubuntu-2404
         steps:
             - name: Summary
@@ -496,19 +500,16 @@ jobs:
                   SHA: ${{ needs.gate.outputs.sha }}
                   REASON: ${{ inputs.reason }}
                   VERSION: ${{ needs.gate.outputs.version }}
-                  CONTROL_PLANE_DIGEST: ${{ needs.image.outputs.control-plane-digest }}
-                  TYPESCRIPT_DIGEST: ${{ needs.image.outputs.typescript-digest }}
-                  PYTHON_DIGEST: ${{ needs.image.outputs.python-digest }}
+                  RESULTS: ${{ toJSON(needs) }}
               run: |
                   {
                       echo "### durable-actors fast path"
                       echo "- ref: \`$REF\` at \`$SHA\` (manifest version $VERSION)"
                       echo "- reason: $REASON"
-                      echo "- images (tag \`fast-$SHA-<target>\`):"
-                      echo "  - \`${IMAGE}@${CONTROL_PLANE_DIGEST}\` (control-plane)"
-                      echo "  - \`${IMAGE}@${TYPESCRIPT_DIGEST}\` (typescript)"
-                      echo "  - \`${IMAGE}@${PYTHON_DIGEST}\` (python)"
+                      echo "- job results (artifacts exist only for jobs that succeeded):"
+                      jq -r 'to_entries[] | "  - \(.key): \(.value.result)"' <<<"$RESULTS"
+                      echo "- images: see the image job summary for digests (tag \`fast-$SHA-<target>\`)"
                       echo "- artifacts (nothing published to npm, crates.io or PyPI; chart not pushed):"
-                      echo "  - \`npm-packages-$SHA\`, \`crate-$SHA\`, \`python-sdk-$SHA\`, \`helm-chart-$SHA\`"
-                      echo "  - \`native-<runner>-$SHA\`, \`python-runtime-<runner>-$SHA\`"
+                      echo "  - \`npm-packages-$SHA\` (npm), \`crate-$SHA\` (rust), \`python-sdk-$SHA\` (python), \`helm-chart-$SHA\` (helm)"
+                      echo "  - \`native-<runner>-$SHA\`, \`python-runtime-<runner>-$SHA\` (native)"
                   } >> "$GITHUB_STEP_SUMMARY"
