@@ -9,18 +9,22 @@ import type { ActorSchema } from "../actor/schema.js"
 import { Persistence } from "../actor/schema.js"
 import type { ActorSocketScope } from "../actor/socket.js"
 import { decodeSocketMessage, runWithActorSockets } from "../actor/socket.js"
-import type { SocketEffect } from "../actor/socketProtocol.js"
+import type { HostSocketEffect } from "../actor/socketProtocol.js"
 import type { ActorSchemas } from "../actor/socketValidation.js"
 import { ActorDefinitionError, ActorProtocolError, ActorSerializationError, errorMessage } from "../errors.js"
 import type { JsonObject, JsonValue } from "../json.js"
-import { cloneJson, cloneJsonObject, isJsonObject } from "../json.js"
+import { cloneJsonObject, isJsonObject } from "../json.js"
+import type { JsonText } from "../payload/json-text.js"
+import { encodeJson } from "../payload/json-text.js"
 
 import type { DatabaseProxy } from "./database.js"
 import { DatabaseCommitError } from "./database.js"
 import { bindPersistedFields, isPersistedField } from "./persisted-fields.js"
-import type { ActorExecutorReply, ActorWorkerCommand, InvokeCommand, WebSocketEventCommand } from "./protocol.js"
+import type { ActorExecutorReply, AssignedCommand, InvokeCommand, WebSocketEventCommand } from "./protocol.js"
 import { failedReply } from "./protocol.js"
 import type { SocketPublisher, SocketSource } from "./types.js"
+
+const NO_RESULT_JSON = "actor result must be JSON serializable"
 
 class ActorRuntime {
     private instance: AnyActor | undefined
@@ -47,7 +51,7 @@ class ActorRuntime {
             )
     }
 
-    async handle(command: ActorWorkerCommand): Promise<ActorExecutorReply> {
+    async handle(command: AssignedCommand): Promise<ActorExecutorReply> {
         if (this.fatal !== undefined) return this.fatal
         try {
             if (command.type === "hydrate") {
@@ -128,7 +132,7 @@ class ActorRuntime {
                 this.publish,
                 this.schemas
             )
-            const result: JsonValue = execution.value === undefined ? null : cloneJson(execution.value, "actor result")
+            const result = encodeResult(execution.value ?? null)
             if (this.fatal !== undefined) return this.fatal
             validateActorState(instance, this.definition.state)
             const state = this.socketState()
@@ -212,7 +216,7 @@ class ActorRuntime {
         if (this.definition.state.interleaveMethods?.includes(method)) this.allowNextInvocation()
     }
 
-    private async prepare(command: ActorWorkerCommand): Promise<AnyActor> {
+    private async prepare(command: AssignedCommand): Promise<AnyActor> {
         if (this.instance !== undefined) return this.instance
         return await this.createInstance(command.actor, this.database.fields())
     }
@@ -222,7 +226,7 @@ class ActorRuntime {
         await this.createInstance(identity, this.database.fields())
     }
 
-    private stateUpdates(before: JsonObject, state: JsonObject, except?: string): SocketEffect[] {
+    private stateUpdates(before: JsonObject, state: JsonObject, except?: string): HostSocketEffect[] {
         const previous = this.interleaved ? (this.lastCompletedState ?? before) : before
         if (this.interleaved) this.lastCompletedState = state
         return stateUpdates(previous, state, this.definition.state, except)
@@ -243,8 +247,7 @@ class ActorRuntime {
         validateActorState(instance, this.definition.state)
         const stored = state === null ? {} : persistedState(state)
         if (state !== null) hydrateActorState(instance, stored, this.definition.state)
-        const unsaved = unsavedState(instance, stored, this.definition.state)
-        if (Object.keys(unsaved).length > 0) this.database.initializeFields(unsaved)
+        this.database.initializeFields(unsavedState(instance, stored, this.definition.state))
         bindPersistedFields(instance, context, this.definition.state, this.database)
         if (this.interleaved) this.lastCompletedState = this.socketState()
         this.instance = instance
@@ -260,12 +263,23 @@ class ActorRuntime {
     }
 }
 
+function encodeResult(value: unknown): JsonText {
+    let text: JsonText | undefined
+    try {
+        text = encodeJson(value)
+    } catch (error) {
+        throw new ActorSerializationError(NO_RESULT_JSON, { cause: error })
+    }
+    if (text === undefined) throw new ActorSerializationError(NO_RESULT_JSON)
+    return text
+}
+
 function socketEffects(
     command: WebSocketEventCommand,
     state: JsonObject,
-    effects: readonly SocketEffect[],
+    effects: readonly HostSocketEffect[],
     schema: ActorSchema
-): readonly SocketEffect[] {
+): readonly HostSocketEffect[] {
     if (command.event.type !== "connect" || connectionWasRejected(command.event.connection.id, effects)) return effects
     const fields = emittableFields(schema)
     if (fields.length === 0) return effects
@@ -281,7 +295,7 @@ function socketEffects(
     ]
 }
 
-function stateUpdates(before: JsonObject, after: JsonObject, schema: ActorSchema, except?: string): SocketEffect[] {
+function stateUpdates(before: JsonObject, after: JsonObject, schema: ActorSchema, except?: string): HostSocketEffect[] {
     const changed = emittableFields(schema).filter(
         field =>
             Object.hasOwn(before, field.name) !== Object.hasOwn(after, field.name) ||
@@ -306,7 +320,7 @@ function emittableFields(schema: ActorSchema) {
     )
 }
 
-function connectionWasRejected(connectionId: string, effects: readonly SocketEffect[]): boolean {
+function connectionWasRejected(connectionId: string, effects: readonly HostSocketEffect[]): boolean {
     return effects.some(effect => effect.type === "reject" && effect.connection_id === connectionId)
 }
 
@@ -355,19 +369,16 @@ function persistedState(value: JsonValue): JsonObject {
 }
 
 // Fields the database doesn't hold yet, such as a default for a field added since the last write.
-function unsavedState(instance: object, stored: JsonObject, schema: ActorSchema): JsonObject {
-    return cloneJsonObject(
-        Object.fromEntries(
-            schema.fields
-                .filter(
-                    field =>
-                        field.persistence === Persistence.Persisted &&
-                        Object.hasOwn(instance, field.name) &&
-                        !Object.hasOwn(stored, field.name)
-                )
-                .map(field => [field.name, Reflect.get(instance, field.name)])
-        ),
-        "actor state"
+function unsavedState(instance: object, stored: JsonObject, schema: ActorSchema): Record<string, unknown> {
+    return Object.fromEntries(
+        schema.fields
+            .filter(
+                field =>
+                    field.persistence === Persistence.Persisted &&
+                    Object.hasOwn(instance, field.name) &&
+                    !Object.hasOwn(stored, field.name)
+            )
+            .map(field => [field.name, Reflect.get(instance, field.name)])
     )
 }
 
@@ -381,19 +392,14 @@ function snapshotActorState(instance: object, schema: ActorSchema): JsonObject {
     return cloneJsonObject(state, "actor state")
 }
 
+// The stored values are not copied: the caller has read `state` for this instance and keeps nothing of it.
 function hydrateActorState(instance: object, state: JsonObject, schema: ActorSchema): void {
     validateActorState(instance, schema)
-    const restored = cloneJsonObject(
-        Object.fromEntries(
-            schema.fields
-                .filter(field => field.persistence === Persistence.Persisted && Object.hasOwn(state, field.name))
-                .map(field => [field.name, state[field.name]])
-        ),
-        "actor state"
-    )
-    for (const [key, value] of Object.entries(restored)) {
-        if (!Reflect.defineProperty(instance, key, { configurable: true, enumerable: true, writable: true, value }))
-            throw new ActorSerializationError(`actor field ${key} cannot be restored`)
+    for (const { name, persistence } of schema.fields) {
+        if (persistence !== Persistence.Persisted || !Object.hasOwn(state, name)) continue
+        const value = state[name]
+        if (!Reflect.defineProperty(instance, name, { configurable: true, enumerable: true, writable: true, value }))
+            throw new ActorSerializationError(`actor field ${name} cannot be restored`)
     }
 }
 

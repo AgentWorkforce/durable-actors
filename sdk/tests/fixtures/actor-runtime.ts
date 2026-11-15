@@ -3,7 +3,7 @@ import { DatabaseProxy } from "../../src/host/database.js"
 
 import { HostDatabase } from "./host-database.js"
 
-export { DatabaseCommitError, DatabaseProxy } from "../../src/host/database.js"
+export { DatabaseProxy } from "../../src/host/database.js"
 export { hydrateActorState, snapshotActorState } from "../../src/host/actor-runtime.js"
 
 type RuntimeArguments = ConstructorParameters<typeof Runtime>

@@ -1,6 +1,8 @@
 use super::HostEndpoint;
 use crate::{
-    actor::{ActorDatabase, ActorExecutionResult, ActorInvocation, DatabaseCall, DatabaseResult},
+    actor::{
+        ActorDatabase, ActorExecutionResult, ActorInvocation, DatabaseCall, DatabaseResult, RowSink,
+    },
     litestream::Replicator,
     request_tracking::{RequestStage, RequestTracker},
     state_log::SqliteSnapshot,
@@ -292,7 +294,7 @@ impl DatabaseInvocation {
 
 #[async_trait]
 impl ActorDatabase for DatabaseInvocation {
-    async fn call(&self, call: DatabaseCall) -> Result<DatabaseResult> {
+    async fn call(&self, call: DatabaseCall, rows: Box<dyn RowSink>) -> Result<DatabaseResult> {
         ensure!(
             self.scope.active.load(Ordering::Acquire),
             "database call has no active invocation"
@@ -302,6 +304,7 @@ impl ActorDatabase for DatabaseInvocation {
             .send(Command::Call {
                 scope: self.scope.clone(),
                 call,
+                rows,
                 reply,
             })
             .await?;
@@ -361,6 +364,7 @@ enum Command {
     Call {
         scope: Arc<InvocationScope>,
         call: DatabaseCall,
+        rows: Box<dyn RowSink>,
         reply: oneshot::Sender<Result<DatabaseResult>>,
     },
     Activate {
@@ -426,7 +430,12 @@ impl DatabaseService {
                     .await;
                 let _ = reply.send((result, timings));
             }
-            Command::Call { scope, call, reply } => return self.call(scope, call, reply).await,
+            Command::Call {
+                scope,
+                call,
+                rows,
+                reply,
+            } => return self.call(scope, call, rows, reply).await,
             Command::Activate { reply } => {
                 let _ = reply.send(self.session.prepare_activation().await);
             }
@@ -453,6 +462,7 @@ impl DatabaseService {
         &mut self,
         scope: Arc<InvocationScope>,
         call: DatabaseCall,
+        rows: Box<dyn RowSink>,
         reply: oneshot::Sender<Result<DatabaseResult>>,
     ) -> bool {
         if !scope.active.load(Ordering::Acquire) {
@@ -468,6 +478,7 @@ impl DatabaseService {
                 scope.owner_epoch,
                 scope.origin.clone(),
                 call,
+                rows,
             )
             .await;
         match result {

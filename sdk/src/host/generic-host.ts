@@ -4,40 +4,20 @@ import { isAbsolute } from "node:path"
 import { z } from "zod"
 
 import { ActorSession, connectSocket, parseHostSettings } from "./actor-host.js"
-import { ActorWorker, ActorWorkerSupervisor } from "./worker-supervisor.js"
 
+/** Starts before it is known whose code it will run, so that the runtime is already loaded when it is told. */
 async function runGenericHost(): Promise<never> {
-    const worker = new ActorWorker()
-    try {
-        await worker.warm()
-        const settings = parseHostSettings(process.env)
-        const socket = await connectSocket(settings.socketPath)
-        const assignment = readAssignment(socket)
-        socket.write(`${JSON.stringify({ type: "warm", protocol: 32 })}\n`)
-        const { entrypoint, environment } = await assignment
-        await access(entrypoint)
-        let available = true
-        const session = new ActorSession(
-            { ...settings, actorEntrypoint: entrypoint },
-            options =>
-                new ActorWorkerSupervisor({
-                    ...options,
-                    createWorker: (data, onStateChange, database, calls, logs) => {
-                        const assigned = { ...data, environment }
-                        if (!available) return new ActorWorker(assigned, onStateChange, database, calls, logs)
-                        available = false
-                        worker.load(assigned, onStateChange, database, calls, logs)
-                        return worker
-                    }
-                }),
-            socket
-        )
-        await session.start()
-        await session.waitUntilDisconnected()
-        throw new Error("Rust host disconnected")
-    } finally {
-        worker.terminate("generic executor stopped")
-    }
+    const settings = parseHostSettings(process.env)
+    const socket = await connectSocket(settings.socketPath)
+    const assignment = readAssignment(socket)
+    socket.write(`${JSON.stringify({ type: "warm", protocol: 33 })}\n`)
+    const { entrypoint, environment } = await assignment
+    await access(entrypoint)
+    Object.assign(process.env, environment)
+    const session = new ActorSession({ ...settings, actorEntrypoint: entrypoint }, undefined, socket)
+    await session.start()
+    await session.waitUntilDisconnected()
+    throw new Error("Rust host disconnected")
 }
 
 function readAssignment(socket: Socket): Promise<z.infer<typeof assignmentSchema>> {

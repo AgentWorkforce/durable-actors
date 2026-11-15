@@ -3,12 +3,15 @@
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 from durable_actors.build import build_actor
+from durable_actors.executor_wire import attach, serialize
 
 
 def main() -> None:
@@ -36,28 +39,24 @@ class Counter(Actor):
                 )
                 try:
                     connection, _ = listener.accept()
+                    threading.Thread(
+                        target=serve_database, args=(listener, database), daemon=True
+                    ).start()
                     with connection, connection.makefile("rb") as messages:
                         connection.settimeout(10)
 
                         def send(message):
-                            connection.sendall((json.dumps(message) + "\n").encode())
+                            connection.sendall(serialize(message))
 
                         def receive():
                             while True:
-                                message = json.loads(messages.readline())
-                                if message["type"] == "residency":
-                                    continue
-                                if message["type"] != "database_call":
+                                head = json.loads(messages.readline())
+                                parts = [messages.read(size) for size in head.pop("parts", [])]
+                                message = attach(head, parts)
+                                if message["type"] != "residency":
                                     return message
-                                send(
-                                    {
-                                        "type": "database_result",
-                                        "call_id": message["call_id"],
-                                        "result": database.call(message["call"]),
-                                    }
-                                )
 
-                        assert receive() == {"type": "warm", "protocol": 32}
+                        assert receive() == {"type": "warm", "protocol": 33}
                         send(
                             {
                                 "type": "load",
@@ -67,11 +66,11 @@ class Counter(Actor):
                         )
                         assert receive() == {
                             "type": "attach",
-                            "protocol": 32,
+                            "protocol": 33,
                             "actor_names": ["Counter"],
                         }
                         actor = {"project_id": "local", "actor_name": "Counter", "actor_id": "one"}
-                        send({"type": "attached", "protocol": 32, "actor": actor})
+                        send({"type": "attached", "protocol": 33, "actor": actor})
                         send(
                             {
                                 "type": "command",
@@ -106,6 +105,42 @@ class Counter(Actor):
     print("Python image: generic warmup, invocation, and database recovery after restart passed")
 
 
+def serve_database(listener, database):
+    """Answers the worker's database calls, made on the connection after the executor's.
+
+    A call is a size and that much JSON, then the JSON of the field it writes. Its answer is a row
+    for each field it reads, then how the call ended.
+    """
+    connection, _ = listener.accept()
+    with connection, connection.makefile("rwb") as channel:
+        while size := channel.read(4):
+            head = json.loads(channel.read(struct.unpack("<I", size)[0]))
+            values = [json.loads(read_text(channel)) for _ in range(head["bindings"])]
+            channel.write(answer(database.call(head["call"], values)))
+            channel.flush()
+
+
+def read_text(channel):
+    tag, size = struct.unpack("<BI", channel.read(5))
+    assert tag == 3, "these calls only carry text"
+    return channel.read(size)
+
+
+def answer(result):
+    if result["type"] != "fields":
+        return b"\x12" + sized(json.dumps(result))
+    rows = [
+        b"\x11\x03" + sized(name) + b"\x03" + sized(json.dumps(value))
+        for name, value in result["fields"].items()
+    ]
+    columns = struct.pack("<BI", 0x10, 2) + sized("name") + sized("value")
+    return b"".join([columns, *rows, b"\x12", sized('{"type":"rows"}')])
+
+
+def sized(text):
+    return struct.pack("<I", len(text.encode())) + text.encode()
+
+
 class FieldStore:
     """Stands in for the host database; the actor only touches its fields."""
 
@@ -113,7 +148,7 @@ class FieldStore:
         self.committed = {}
         self.pending = {}
 
-    def call(self, call):
+    def call(self, call, values):
         op = call["op"]
         if op == "fields":
             return {"type": "fields", "fields": self.committed}
@@ -121,7 +156,7 @@ class FieldStore:
             self.pending = self.committed.copy()
             return {"type": "rows", "columns": [], "rows": []}
         if op == "persist_field":
-            self.pending[call["name"]] = call["value"]
+            self.pending[call["name"]] = values[0]
         elif op == "delete_field":
             self.pending.pop(call["name"], None)
         elif op == "commit":

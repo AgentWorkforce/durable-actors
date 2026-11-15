@@ -72,8 +72,9 @@ async fn run_activation(
         .token;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let route = format!("http://{}", listener.local_addr()?);
-    let ipc = ActorExecutorListener::bind(&socket).await?;
-    let javascript = Command::new("bun")
+    let mut ipc = ActorExecutorListener::bind(&socket).await?;
+    let mut command = Command::new("bun");
+    command
         .args([
             "--eval",
             "await import(process.env.DURABLE_ACTORS_SDK_HOST).then(m => m.runGenericHost())",
@@ -83,8 +84,9 @@ async fn run_activation(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    ipc.inherit_database_channel(&mut command)?;
+    let javascript = command.spawn()?;
     let executor = tokio::time::timeout(Duration::from_secs(10), ipc.accept_warm()).await??;
     assert!(
         !code.exists(),

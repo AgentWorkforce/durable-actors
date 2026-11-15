@@ -1,4 +1,7 @@
-"""Keep executor communication alive while replaceable processes run actor code."""
+"""Keep executor communication alive while replaceable processes run actor code.
+
+A worker's database calls do not pass through here: it makes them on a connection of its own.
+"""
 
 from __future__ import annotations
 
@@ -52,7 +55,7 @@ class Supervisor(Channel):
 
         try:
             if generic:
-                await self.send({"type": "warm", "protocol": 32})
+                await self.send({"type": "warm", "protocol": 33})
                 load = await self.read()
                 if load.get("type") != "load":
                     raise ValueError("expected actor code assignment")
@@ -65,7 +68,7 @@ class Supervisor(Channel):
             self.entrypoint = entrypoint
             self.worker = await self.create_worker(entrypoint, self.environment)
             self.actor_names = self.worker.actor_names
-            await self.send({"type": "attach", "protocol": 32, "actor_names": self.actor_names})
+            await self.send({"type": "attach", "protocol": 33, "actor_names": self.actor_names})
             self.attached = await self.read()
             attached_actor(self.attached, self.actor_names)
             await self.start_pump()
@@ -105,9 +108,7 @@ class Supervisor(Channel):
             await self.worker.send(message)
 
     async def acknowledge(self, message: Document) -> None:
-        from .host import reply_id
-
-        kind, identifier = message["type"], reply_id(message)
+        kind, identifier = message["type"], message["message_id"]
         pending = self.pending.get(identifier)
         if pending is None or kind not in pending.exchanges:
             raise ValueError("unexpected executor acknowledgment")
@@ -143,9 +144,7 @@ class Supervisor(Channel):
                     pending.reply = reply
                     await self.complete(identifier)
                 else:
-                    if kind == "database_call":
-                        pending.exchanges.add("database_result")
-                    elif kind == "get_connections":
+                    if kind == "get_connections":
                         pending.exchanges.add("socket_connections")
                     elif kind not in {"ready_for_invocation", "socket_effects"}:
                         raise ValueError("unexpected worker message")
@@ -227,7 +226,7 @@ class Worker(Channel):
             worker = cls(reader, writer, process)
             async with asyncio.timeout(60):
                 attach = await worker.read()
-            if attach.get("type") != "attach" or attach.get("protocol") != 32:
+            if attach.get("type") != "attach" or attach.get("protocol") != 33:
                 raise ValueError("worker did not attach")
             worker.actor_names = attach["actor_names"]
             return worker

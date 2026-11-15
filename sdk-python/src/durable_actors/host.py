@@ -8,46 +8,46 @@ import socket
 import sys
 import threading
 import traceback
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from contextlib import suppress
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from .build import load_artifact
 from .client import component
 from .contract import Document
+from .database_channel import DatabaseChannel, DatabaseChannelError
 from .executor_wire import Channel, serialize
 from .host_transport import route_through_host
 from .runtime import ActorRuntime
 from .sqlite import DatabaseProxy
+
+# Names the command a call is made for. Actor code has no database outside one.
+InvocationDatabase = Callable[[Document, int], Document]
 
 message_id: ContextVar[int] = ContextVar("actor_message_id")
 LOG_LIMIT_BYTES = 256 * 1024
 
 
 class Session(Channel):
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        database: InvocationDatabase,
+    ) -> None:
         super().__init__(reader, writer)
-        self.pending: dict[tuple[str, int], asyncio.Future[Any]] = {}
+        self.database = database
+        self.lookups: dict[int, asyncio.Future[list[Document] | int]] = {}
         self.tasks: set[asyncio.Task[None]] = set()
         self.residency: asyncio.Task[None] | None = None
-        self.database_calls = asyncio.Lock()
         self.actor_calls: dict[int, asyncio.Future[Document]] = {}
         self.next_actor_call = 0
         self.loop = asyncio.get_running_loop()
 
-    async def run(self, entrypoint: str | None, generic: bool) -> None:
+    async def run(self, entrypoint: str | None) -> None:
         try:
-            if generic:
-                await self.send({"type": "warm", "protocol": 32})
-                assignment = await self.read()
-                if (
-                    assignment.get("type") != "load"
-                    or not Path(assignment["entrypoint"]).is_absolute()
-                ):
-                    raise ValueError("invalid code assignment")
-                entrypoint = assignment["entrypoint"]
             if not entrypoint:
                 raise ValueError("DURABLE_ACTORS_ENTRYPOINT is required")
             path = Path(entrypoint)
@@ -55,7 +55,7 @@ class Session(Channel):
                 while not path.is_file():
                     await asyncio.sleep(0.01)
             actors = {actor.__name__: actor for actor in load_artifact(path)}
-            await self.send({"type": "attach", "protocol": 32, "actor_names": sorted(actors)})
+            await self.send({"type": "attach", "protocol": 33, "actor_names": sorted(actors)})
             identity = attached_actor(await self.read(), actors)
             capture_output(self)
             database = DatabaseProxy(self.call_database, asyncio.get_running_loop())
@@ -73,18 +73,14 @@ class Session(Channel):
                     call = self.actor_calls.pop(message["call_id"], None)
                     if call is not None and not call.done():
                         call.set_result(message["outcome"])
-                elif message["type"] in {"socket_connections", "database_result"}:
-                    pending = self.pending.pop((message["type"], reply_id(message)))
-                    if pending.cancelled():
+                elif message["type"] == "socket_connections":
+                    lookup = self.lookups.pop(message["message_id"])
+                    if lookup.cancelled():
                         continue
                     if message.get("error"):
-                        pending.set_exception(RuntimeError(message["error"]))
+                        lookup.set_exception(RuntimeError(message["error"]))
                     else:
-                        pending.set_result(
-                            message.get("result")
-                            if message["type"] == "database_result"
-                            else message.get("connections")
-                        )
+                        lookup.set_result(message["connections"])
                 else:
                     raise ValueError("unexpected executor message")
         finally:
@@ -104,15 +100,13 @@ class Session(Channel):
         if not task.cancelled() and task.exception() is not None:
             self.writer.close()
 
-    async def call_database(self, call: Document) -> Document:
-        # The host accepts one outstanding database call per invocation.
-        async with self.database_calls:
-            return cast(
-                Document,
-                await self.exchange(
-                    "database_call", "database_result", call_id=message_id.get(), call=call
-                ),
-            )
+    def call_database(self, call: Document) -> Document:
+        try:
+            return self.database(call, message_id.get())
+        except DatabaseChannelError:
+            # No later call can be answered, so this process ends and its supervisor starts another.
+            self.loop.call_soon_threadsafe(self.writer.close)
+            raise
 
     async def call_actor(self, call: Document) -> Document:
         self.next_actor_call += 1
@@ -132,12 +126,19 @@ class Session(Channel):
     async def get_connections(
         self, tag: str | None = None, count_only: bool = False
     ) -> list[Document] | int:
-        return cast(
-            list[Document] | int,
-            await self.exchange(
-                "get_connections", "socket_connections", query={"tag": tag, "countOnly": count_only}
-            ),
-        )
+        identifier = message_id.get()
+        if identifier in self.lookups:
+            raise ValueError("duplicate executor request")
+        lookup: asyncio.Future[list[Document] | int] = self.loop.create_future()
+        self.lookups[identifier] = lookup
+        try:
+            query = {"tag": tag, "countOnly": count_only}
+            await self.send({"type": "get_connections", "message_id": identifier, "query": query})
+            return await lookup
+        finally:
+            # A canceled lookup still receives its answer from the host.
+            if not lookup.cancelled():
+                self.lookups.pop(identifier, None)
 
     def log(self, level: str, message: str) -> None:
         data = serialize(
@@ -157,20 +158,6 @@ class Session(Channel):
         data = serialize({"type": "ready_for_invocation", "message_id": message_id.get()})
         self.writer.write(data)
 
-    async def exchange(self, kind: str, response: str, **fields: Any) -> Any:
-        key = response, message_id.get()
-        if key in self.pending:
-            raise ValueError("duplicate executor request")
-        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self.pending[key] = future
-        try:
-            await self.send({"type": kind, "message_id": key[1], **fields})
-            return await future
-        finally:
-            # Canceled exchanges still receive acknowledgments from the host.
-            if not future.cancelled():
-                self.pending.pop(key, None)
-
     async def report_residency(self, runtime: ActorRuntime) -> None:
         while True:
             await self.send({"type": "residency", "resident": runtime.instance is not None})
@@ -179,9 +166,10 @@ class Session(Channel):
     async def close(self) -> None:
         if self.residency:
             self.residency.cancel()
-        for future in [*self.pending.values(), *self.actor_calls.values()]:
-            if not future.done():
-                future.cancel()
+        for lookup in self.lookups.values():
+            lookup.cancel()
+        for call in self.actor_calls.values():
+            call.cancel()
         tasks = list(self.tasks)
         for task in tasks:
             task.cancel()
@@ -237,13 +225,8 @@ def running_loop() -> asyncio.AbstractEventLoop | None:
         return None
 
 
-def reply_id(message: Document) -> int:
-    # Python reuses each command's message ID as the ID of its database call.
-    return cast(int, message["call_id" if message["type"] == "database_result" else "message_id"])
-
-
 def attached_actor(message: Document, actor_names: Collection[str]) -> Document:
-    if message.get("type") != "attached" or message.get("protocol") != 32:
+    if message.get("type") != "attached" or message.get("protocol") != 33:
         raise ValueError("unsupported executor protocol")
     actor = cast(Document, message["actor"])
     for field, size in (("project_id", 64), ("actor_name", 255), ("actor_id", 128)):
@@ -271,7 +254,10 @@ async def main() -> None:
         reader, writer = await asyncio.open_connection(sock=channel, limit=sys.maxsize)
         status = 0
         try:
-            await Session(reader, writer).run(os.environ.get("DURABLE_ACTORS_ENTRYPOINT"), False)
+            # The Rust host takes each connection after its supervisor's as a database channel.
+            database = DatabaseChannel.connect(os.environ["DURABLE_ACTORS_EXECUTOR_SOCKET"])
+            session = Session(reader, writer, database.call)
+            await session.run(os.environ.get("DURABLE_ACTORS_ENTRYPOINT"))
         except EOFError:
             pass
         except BaseException:

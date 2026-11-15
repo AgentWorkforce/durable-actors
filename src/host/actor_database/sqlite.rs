@@ -1,5 +1,5 @@
-use crate::actor::{DatabaseCall, DatabaseResult, SqlValue};
-use anyhow::{Result, anyhow, bail};
+use crate::actor::{DatabaseCall, DatabaseResult, RowSink, SqlCell, SqlValue};
+use anyhow::{Result, anyhow, bail, ensure};
 use rusqlite::{
     Connection, ToSql,
     hooks::{AuthAction, AuthContext, Authorization},
@@ -30,6 +30,8 @@ const ALLOWED_PRAGMAS: [&str; 10] = [
     "quick_check",
     "user_version",
 ];
+// What reads stored state parses it with serde_json, which reads this many levels of arrays and objects.
+const MAX_NESTING: usize = 127;
 
 pub(crate) struct SqliteDatabase {
     engine: Arc<Mutex<Engine>>,
@@ -49,13 +51,17 @@ impl SqliteDatabase {
         })
     }
 
-    pub(crate) async fn call(&self, call: DatabaseCall) -> Result<Executed> {
+    pub(crate) async fn call(
+        &self,
+        call: DatabaseCall,
+        mut rows: Box<dyn RowSink>,
+    ) -> Result<Executed> {
         let engine = self.engine.clone();
         tokio::task::spawn_blocking(move || {
             engine
                 .lock()
                 .map_err(|_| anyhow!("actor database is poisoned"))?
-                .call(call)
+                .call(call, rows.as_mut())
         })
         .await?
     }
@@ -88,17 +94,17 @@ impl Engine {
         })
     }
 
-    fn call(&mut self, call: DatabaseCall) -> Result<Executed> {
+    fn call(&mut self, call: DatabaseCall, rows: &mut dyn RowSink) -> Result<Executed> {
         let result = match call {
             DatabaseCall::Commit => self.finish("COMMIT"),
             DatabaseCall::Rollback => self.finish("ROLLBACK"),
-            DatabaseCall::Fields { names } => self.fields(names.as_deref()),
+            DatabaseCall::Fields { names } => self.fields(names.as_deref(), rows),
             DatabaseCall::Alarm
             | DatabaseCall::SetAlarm { .. }
             | DatabaseCall::DeleteAlarm { .. } => {
                 unreachable!("alarm calls are handled by the control plane")
             }
-            call => self.write(call),
+            call => self.write(call, rows),
         };
         // A statement such as INSERT OR FAIL can commit rows even when it returns an error.
         let committed =
@@ -106,13 +112,12 @@ impl Engine {
         Ok(Executed { result, committed })
     }
 
-    fn write(&self, call: DatabaseCall) -> Result<DatabaseResult> {
+    fn write(&self, call: DatabaseCall, rows: &mut dyn RowSink) -> Result<DatabaseResult> {
         match call {
-            DatabaseCall::Exec { sql, bindings, .. } => return self.exec(&sql, &bindings),
+            DatabaseCall::Exec { sql, bindings, .. } => return self.exec(&sql, &bindings, rows),
             DatabaseCall::InitializeFields { fields } => self.initialize(&fields)?,
             DatabaseCall::PersistField { name, value, .. } => self.persist(&name, &value)?,
             DatabaseCall::DeleteField { name, .. } => self.delete(&name)?,
-            DatabaseCall::ReplaceFields { fields } => self.replace(&fields)?,
             DatabaseCall::Fields { .. }
             | DatabaseCall::Alarm
             | DatabaseCall::SetAlarm { .. }
@@ -125,23 +130,14 @@ impl Engine {
         Ok(DatabaseResult::Done)
     }
 
-    fn exec(&self, sql: &str, bindings: &[SqlValue]) -> Result<DatabaseResult> {
-        let mut statement = self.prepare_actor_statement(sql)?;
-        let columns = statement
-            .column_names()
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
-        let mut query = statement.query(rusqlite::params_from_iter(bindings))?;
-        let mut rows = Vec::new();
-        while let Some(row) = query.next()? {
-            rows.push(
-                (0..columns.len())
-                    .map(|index| row.get_ref(index).map(SqlValue::from))
-                    .collect::<rusqlite::Result<_>>()?,
-            );
-        }
-        Ok(DatabaseResult::Rows { columns, rows })
+    fn exec(
+        &self,
+        sql: &str,
+        bindings: &[SqlValue],
+        rows: &mut dyn RowSink,
+    ) -> Result<DatabaseResult> {
+        let statement = self.prepare_actor_statement(sql)?;
+        send_rows(statement, rusqlite::params_from_iter(bindings), rows)
     }
 
     fn prepare_actor_statement(&self, sql: &str) -> Result<rusqlite::Statement<'_>> {
@@ -166,40 +162,55 @@ impl Engine {
         }
     }
 
-    fn fields(&self, names: Option<&[String]>) -> Result<DatabaseResult> {
-        let mut statement = self.connection.prepare(
+    fn fields(&self, names: Option<&[String]>, rows: &mut dyn RowSink) -> Result<DatabaseResult> {
+        let statement = self.connection.prepare(
             "SELECT name, value FROM __terse_fields
             WHERE ?1 IS NULL OR name IN (SELECT value FROM json_each(?1))",
         )?;
         let names = names.map(serde_json::to_string).transpose()?;
-        let fields = statement
-            .query_map([names], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .map(|row| {
-                let (name, value) = row?;
-                Ok((name, RawValue::from_string(value)?))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        Ok(DatabaseResult::Fields { fields })
+        send_rows(statement, [names], rows)
     }
 
     fn initialize(&self, fields: &BTreeMap<String, Box<RawValue>>) -> Result<()> {
-        let mut statement = self.connection.prepare(
-            "INSERT INTO __terse_fields (name, value) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
-        )?;
-        for (name, value) in fields {
-            statement.execute((name, value.get()))?;
-        }
-        Ok(())
+        fields.values().try_for_each(|value| storable(value))?;
+        self.unchecked(|| {
+            let mut statement = self.connection.prepare(
+                "INSERT INTO __terse_fields (name, value) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
+            )?;
+            for (name, value) in fields {
+                statement.execute((name, value.get()))?;
+            }
+            Ok(())
+        })
     }
 
+    // The sizes are compared first because SQLite reads a size without reading the value. Comparing the texts
+    // reads the whole stored value into memory beside the new one.
     fn persist(&self, name: &str, value: &RawValue) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO __terse_fields (name, value) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET value = excluded.value WHERE value <> excluded.value",
-            (name, value.get()),
-        )?;
+        storable(value)?;
+        self.unchecked(|| {
+            self.connection.execute(
+                "INSERT INTO __terse_fields (name, value) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET value = excluded.value
+                WHERE octet_length(value) <> octet_length(excluded.value) OR value <> excluded.value",
+                (name, value.get()),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Writes fields without the table's `json_valid` check. A field's value is JSON by its type, and SQLite
+    /// allocates three times the value to find that out again.
+    fn unchecked(&self, write: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.ignore_checks(true)?;
+        let written = write();
+        self.ignore_checks(false)?;
+        written
+    }
+
+    fn ignore_checks(&self, ignored: bool) -> Result<()> {
+        self.connection
+            .pragma_update(None, "ignore_check_constraints", ignored)?;
         Ok(())
     }
 
@@ -209,23 +220,58 @@ impl Engine {
         Ok(())
     }
 
-    fn replace(&self, fields: &BTreeMap<String, Box<RawValue>>) -> Result<()> {
-        for (name, value) in fields {
-            self.persist(name, value)?;
-        }
-        self.connection.execute(
-            "DELETE FROM __terse_fields WHERE name NOT IN (SELECT value FROM json_each(?))",
-            [serde_json::to_string(&fields.keys().collect::<Vec<_>>())?],
-        )?;
-        Ok(())
-    }
-
     fn finish(&self, sql: &str) -> Result<DatabaseResult> {
         if !self.connection.is_autocommit() {
             self.connection.execute_batch(sql)?;
         }
         Ok(DatabaseResult::Done)
     }
+}
+
+fn storable(value: &RawValue) -> Result<()> {
+    ensure!(
+        nesting(value.get()) <= MAX_NESTING,
+        "actor state nests deeper than {MAX_NESTING} arrays and objects"
+    );
+    Ok(())
+}
+
+/// How deep the arrays and objects of a JSON text nest.
+fn nesting(json: &str) -> usize {
+    let (mut depth, mut deepest) = (0_usize, 0);
+    let (mut string, mut escaped) = (false, false);
+    for byte in json.bytes() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if string => escaped = true,
+            b'"' => string = !string,
+            b'[' | b'{' if !string => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' if !string => depth -= 1,
+            _ => {}
+        }
+    }
+    deepest
+}
+
+fn send_rows(
+    mut statement: rusqlite::Statement<'_>,
+    bindings: impl rusqlite::Params,
+    rows: &mut dyn RowSink,
+) -> Result<DatabaseResult> {
+    rows.columns(&statement.column_names())?;
+    let width = statement.column_count();
+    let mut query = statement.query(bindings)?;
+    while let Some(row) = query.next()? {
+        let cells = (0..width)
+            .map(|index| row.get_ref(index).map(SqlCell::from))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.row(&cells)?;
+    }
+    rows.finish()?;
+    Ok(DatabaseResult::Rows)
 }
 
 fn authorize(
@@ -327,14 +373,14 @@ impl ToSql for SqlValue {
     }
 }
 
-impl From<ValueRef<'_>> for SqlValue {
-    fn from(value: ValueRef<'_>) -> Self {
+impl<'a> From<ValueRef<'a>> for SqlCell<'a> {
+    fn from(value: ValueRef<'a>) -> Self {
         match value {
             ValueRef::Null => Self::Null,
             ValueRef::Integer(value) => Self::Integer(value),
             ValueRef::Real(value) => Self::Real(value),
-            ValueRef::Text(value) => Self::Text(String::from_utf8_lossy(value).into_owned()),
-            ValueRef::Blob(value) => Self::Blob(value.to_vec()),
+            ValueRef::Text(value) => Self::Text(value),
+            ValueRef::Blob(value) => Self::Blob(value),
         }
     }
 }

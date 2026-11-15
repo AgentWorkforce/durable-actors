@@ -25,17 +25,11 @@ async def test_values_keep_their_sqlite_storage_classes():
         {"value": "text", "type": "text"},
         {"value": b"\x00\x01\xff", "type": "blob"},
     ]
-    assert [call["bindings"] for call in host.calls[1:6]] == [
-        [{"type": "null"}],
-        [{"type": "integer", "value": "9223372036854775807"}],
-        [{"type": "real", "value": 1.5}],
-        [{"type": "text", "value": "text"}],
-        [{"type": "blob", "value": "AAH/"}],
-    ]
+    assert [call["bindings"] for call in host.calls[1:6]] == [[value] for value in values]
     host.close()
 
 
-async def test_fields_commit_and_rollback_run_on_the_event_loop():
+async def test_fields_commit_and_rollback_are_awaited_from_the_event_loop():
     host = HostDatabase()
     database = DatabaseProxy(host.call, asyncio.get_running_loop())
     await database.begin()
@@ -56,7 +50,7 @@ async def test_sync_statements_cannot_block_the_event_loop():
 
 
 async def test_host_errors_reach_actor_code_and_commit_failures_are_distinguishable():
-    async def reject(call):
+    def reject(call):
         raise RuntimeError(
             "replication failed"
             if call["op"] == "commit"

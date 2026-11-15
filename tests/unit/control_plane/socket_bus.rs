@@ -38,12 +38,29 @@ fn broadcast(data: &str) -> Vec<ActorSocketEffect> {
     }]
 }
 
-async fn received(receiver: &mut SocketReceiver) -> Result<String> {
-    match tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+fn send(connection_id: &str, data: &str) -> Vec<ActorSocketEffect> {
+    vec![ActorSocketEffect::Send {
+        connection_id: connection_id.into(),
+        message: ActorSocketMessage::Text { data: data.into() },
+    }]
+}
+
+async fn outbound(receiver: &mut SocketReceiver) -> Result<OutboundMessage> {
+    tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await?
-        .context("socket closed")?
-    {
+        .context("socket closed")
+}
+
+async fn received(receiver: &mut SocketReceiver) -> Result<String> {
+    match outbound(receiver).await? {
         OutboundMessage::Message(ActorSocketMessage::Text { data }) => Ok(data),
+        _ => anyhow::bail!("unexpected outbound message"),
+    }
+}
+
+async fn closed(receiver: &mut SocketReceiver) -> Result<u16> {
+    match outbound(receiver).await? {
+        OutboundMessage::Close { code, .. } => Ok(code),
         _ => anyhow::bail!("unexpected outbound message"),
     }
 }
@@ -69,19 +86,26 @@ async fn redis_bus(
     namespace: &str,
     accepts_sockets: bool,
 ) -> Result<Arc<dyn SocketBus>> {
-    let redis = crate::redis_client::Redis::connect(&crate::redis_client::RedisConfig {
-        url: url.to_owned(),
-        ca_cert: None,
-    })?;
     let bus = RedisSocketBus::start(
-        redis,
+        redis(url)?,
         namespace,
         10,
         accepts_sockets,
         CancellationToken::new(),
-    );
+    )?;
     connected(&bus).await?;
     Ok(bus)
+}
+
+fn redis(url: &str) -> Result<crate::redis_client::Redis> {
+    crate::redis_client::Redis::connect(&crate::redis_client::RedisConfig {
+        url: url.to_owned(),
+        ca_cert: None,
+    })
+}
+
+fn actor_channel(namespace: &str, actor: &ActorKey) -> String {
+    format!("{namespace}:actor:{}", actor.storage_key().as_str())
 }
 
 async fn connected(bus: &Arc<dyn SocketBus>) -> Result<u64> {
@@ -191,16 +215,126 @@ async fn redis_questions_fail_when_a_gateway_does_not_answer() -> Result<()> {
     };
     let control = redis_bus(&url, &namespace, false).await?;
     let room = actor("one");
-    let redis = crate::redis_client::Redis::connect(&crate::redis_client::RedisConfig {
-        url,
-        ca_cert: None,
-    })?;
-    let mut silent = redis.pubsub().await?;
+    let mut silent = redis(&url)?.pubsub().await?;
     silent.subscribe(format!("{namespace}:gateways")).await?;
-    silent
-        .subscribe(format!("{namespace}:actor:{}", room.storage_key().as_str()))
-        .await?;
+    silent.subscribe(actor_channel(&namespace, &room)).await?;
     assert!(control.count(&room).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_large_effects_reach_every_gateway_in_order_without_being_published() -> Result<()> {
+    let Some((url, namespace)) = test_redis() else {
+        return Ok(());
+    };
+    let first = redis_bus(&url, &namespace, true).await?;
+    let second = redis_bus(&url, &namespace, true).await?;
+    let room = actor("one");
+    first.watch(&room).await?;
+    second.watch(&room).await?;
+    let mut a = open(first.registry(), &room, "a", &[]).await;
+    let mut b = open(second.registry(), &room, "b", &[]).await;
+    let mut published = redis(&url)?.pubsub().await?;
+    published
+        .subscribe(actor_channel(&namespace, &room))
+        .await?;
+    let mut published = published.into_on_message();
+    let large = "x".repeat(9 * 1024 * 1024);
+
+    for data in ["before", &large, "after"] {
+        first.publish(&room, broadcast(data)).await?;
+    }
+    for socket in [&mut a, &mut b] {
+        assert_eq!(received(socket).await?, "before");
+        assert!(received(socket).await? == large);
+        assert_eq!(received(socket).await?, "after");
+    }
+    for _ in 0..3 {
+        let message = tokio::time::timeout(Duration::from_secs(5), published.next()).await?;
+        let bytes = message.context("published")?.get_payload_bytes().len();
+        assert!(bytes <= PUBLISHED_EFFECTS_BYTES, "published {bytes} bytes");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_large_effects_for_one_socket_are_read_once_by_the_gateway_holding_it() -> Result<()>
+{
+    let Some((url, namespace)) = test_redis() else {
+        return Ok(());
+    };
+    let first = redis_bus(&url, &namespace, true).await?;
+    let second = redis_bus(&url, &namespace, true).await?;
+    let room = actor("one");
+    first.watch(&room).await?;
+    second.watch(&room).await?;
+    let mut a = open(first.registry(), &room, "a", &[]).await;
+    let mut b = open(second.registry(), &room, "b", &[]).await;
+    let large = "x".repeat(PUBLISHED_EFFECTS_BYTES);
+
+    second.publish(&room, send("a", &large)).await?;
+    second.publish(&room, broadcast("after")).await?;
+    assert!(received(&mut a).await? == large);
+    assert_eq!(received(&mut a).await?, "after");
+    assert_eq!(received(&mut b).await?, "after");
+    let mut stored = redis::cmd("KEYS");
+    stored.arg(format!("{namespace}:effects:*"));
+    assert!(redis(&url)?.run::<Vec<String>>(stored).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_stored_effects_that_are_gone_close_only_the_sockets_they_were_for() -> Result<()> {
+    let Some((url, namespace)) = test_redis() else {
+        return Ok(());
+    };
+    let gateway = redis_bus(&url, &namespace, true).await?;
+    let (room, other) = (actor("one"), actor("two"));
+    gateway.watch(&room).await?;
+    gateway.watch(&other).await?;
+    let mut a = open(gateway.registry(), &room, "a", &[]).await;
+    let mut b = open(gateway.registry(), &room, "b", &[]).await;
+    let mut c = open(gateway.registry(), &other, "c", &[]).await;
+    let gone = |connection_ids: Option<&str>| {
+        let mut publish = redis::cmd("PUBLISH");
+        publish
+            .arg(actor_channel(&namespace, &room))
+            .arg(serde_json::to_string(&Envelope::StoredEffects {
+                actor: room.clone(),
+                key: format!("{namespace}:effects:gone"),
+                connection_ids: connection_ids.map(|id| BTreeSet::from([id.to_owned()])),
+            })?);
+        anyhow::Ok(publish)
+    };
+    let redis = redis(&url)?;
+
+    redis.run::<usize>(gone(Some("a"))?).await?;
+    gateway.publish(&room, broadcast("still open")).await?;
+    assert_eq!(closed(&mut a).await?, 1012);
+    assert_eq!(received(&mut b).await?, "still open");
+
+    redis.run::<usize>(gone(None)?).await?;
+    gateway.publish(&other, broadcast("still open")).await?;
+    assert_eq!(closed(&mut b).await?, 1012);
+    assert_eq!(received(&mut c).await?, "still open");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stored_effects_for_several_gateways_are_limited_until_they_expire() -> Result<()> {
+    let stored = StoredEffects::new(&redis("redis://127.0.0.1:1")?, "test")?;
+    let half = "x".repeat(WAITING_EFFECTS_BYTES / 2);
+    let store = |connection_ids| {
+        stored
+            .publication("channel", &actor("one"), half.clone(), connection_ids)
+            .is_ok()
+    };
+
+    assert!(store(None) && store(None));
+    assert!(!store(None));
+    assert!(store(Some(BTreeSet::from(["a".to_owned()]))));
+    tokio::time::sleep(STORED_EFFECTS_TTL + Duration::from_millis(1)).await;
+    assert!(store(None));
     Ok(())
 }
 

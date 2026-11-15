@@ -2,48 +2,58 @@ import { z } from "zod"
 
 import type { ActorIdentity } from "../actor/identity.js"
 import { actorComponentSchema, actorIdentitySchema } from "../actor/identity.js"
-import type { SocketEffect, SocketLookup, SocketQuery } from "../actor/socketProtocol.js"
+import type { HostSocketEffect, SocketQuery } from "../actor/socketProtocol.js"
 import { socketConnectionSchema, socketEventSchema } from "../actor/socketProtocol.js"
 import { ActorProtocolError } from "../errors.js"
 import type { JsonValue } from "../json.js"
-import { jsonValueSchema } from "../json.js"
+import { jsonValueSchema, serializeJson } from "../json.js"
+import type { JsonText } from "../payload/json-text.js"
 
-import type { DatabaseRequest } from "./database-bridge.js"
-import type { DatabaseCall } from "./database.js"
-
-function parseActorSessionServerMessage(document: string): ActorSessionServerMessage {
-    let value: unknown
-    try {
-        value = JSON.parse(document)
-    } catch (error) {
-        throw new ActorProtocolError("actor session message is not valid JSON", { cause: error })
-    }
-    const result = actorSessionServerMessageSchema.safeParse(value)
+function parseActorSessionServerMessage(head: unknown): ActorSessionServerMessage {
+    const result = actorSessionServerMessageSchema.safeParse(head)
     if (!result.success) throw new ActorProtocolError(`actor session message is invalid: ${result.error.message}`)
     return result.data
+}
+
+// What can be large follows a reply's line as parts, so it is never escaped into the line: the result, then the
+// effects.
+function detachReply(reply: ActorExecutorReply): DetachedReply {
+    switch (reply.type) {
+        case "invoked": {
+            const { result, effects = [], ...head } = reply
+            return { ...head, parts: [result, ...detachEffects(effects)] }
+        }
+        case "websocket_handled": {
+            const { effects, ...head } = reply
+            return { ...head, parts: detachEffects(effects) }
+        }
+        default:
+            return reply
+    }
+}
+
+// A text message leaves its text out of the effects. The texts follow as parts of their own, in the same order,
+// so none is escaped into a JSON string.
+function detachEffects(effects: readonly HostSocketEffect[]): SessionPart[] {
+    const texts: JsonText[] = []
+    return [
+        serializeJson(
+            effects.map(effect => detachText(effect, texts)),
+            "socket effects"
+        ),
+        ...texts
+    ]
+}
+
+function detachText(effect: HostSocketEffect, texts: JsonText[]): object {
+    if ((effect.type !== "send" && effect.type !== "broadcast") || effect.message.type !== "text") return effect
+    texts.push(effect.message.data)
+    return { ...effect, message: { type: "text" } }
 }
 
 function failedReply(code: string, message: string): FailedReply {
     return { type: "failed", code, message }
 }
-
-const databaseValueSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("null") }),
-    z.object({ type: z.literal("integer"), value: z.string().regex(/^-?\d+$/) }),
-    z.object({ type: z.literal("real"), value: z.number() }),
-    z.object({ type: z.literal("text"), value: z.string() }),
-    z.object({ type: z.literal("blob"), value: z.base64() })
-])
-
-const databaseResultSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("rows"), columns: z.array(z.string()), rows: z.array(z.array(databaseValueSchema)) }),
-    z.object({ type: z.literal("fields"), fields: z.record(z.string(), jsonValueSchema) }),
-    z.object({
-        type: z.literal("alarm"),
-        timestamp_ms: z.number().int().safe().nullable()
-    }),
-    z.object({ type: z.literal("done") })
-])
 
 const invokeCommandSchema = z.object({
     type: z.literal("invoke"),
@@ -71,15 +81,7 @@ const executorCommandSchema = z.discriminatedUnion("type", [
 ])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z
-        .object({
-            type: z.literal("database_result"),
-            call_id: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-            result: databaseResultSchema.optional(),
-            error: z.string().optional()
-        })
-        .refine(message => (message.result === undefined) !== (message.error === undefined)),
-    z.object({ type: z.literal("attached"), protocol: z.literal(32), actor: actorIdentitySchema }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(33), actor: actorIdentitySchema }),
     z.object({
         type: z.literal("actor_result"),
         call_id: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -102,29 +104,32 @@ type InvokeCommand = z.infer<typeof invokeCommandSchema> & AssignedActor
 type EvictCommand = z.infer<typeof evictCommandSchema>
 type ActorExecutorCommand = z.infer<typeof executorCommandSchema>
 type ActorExecutionCommand = Exclude<ActorExecutorCommand, EvictCommand>
-type ActorWorkerCommand = ActorExecutorCommand & AssignedActor
+/** A command with the actor this process was assigned. */
+type AssignedCommand = ActorExecutorCommand & AssignedActor
 type ActorSessionServerMessage = z.infer<typeof actorSessionServerMessageSchema>
 type ActorExecutorReply =
     InvokedReply | WebSocketHandledReply | FailedReply | EvictedReply | { readonly type: "hydrated" }
+type ReplyHead =
+    | { readonly type: "invoked" | "websocket_handled"; readonly sequence?: number }
+    | FailedReply
+    | EvictedReply
+    | { readonly type: "hydrated" }
+/** What follows a line: a string, or the text of a result or a socket message, which is already UTF-8. */
+type SessionPart = string | JsonText
+type DetachedReply = ReplyHead & { readonly parts?: readonly SessionPart[] }
 type ActorSessionClientMessage =
-    | {
-          readonly type: "database_call"
-          readonly call_id: number
-          readonly message_id?: number
-          readonly call: DatabaseCall
-      }
     | { readonly type: "actor_call"; readonly call_id: number; readonly call: ActorCallRequest }
     | { readonly type: "residency"; readonly resident: boolean }
     | AttachMessage
     | { readonly type: "ready_for_invocation"; readonly message_id: number }
-    | ReplyMessage
     | { readonly type: "get_connections"; readonly message_id: number; readonly query?: SocketQuery }
-    | { readonly type: "socket_effects"; readonly message_id: number; readonly effects: readonly SocketEffect[] }
     | { readonly type: "log"; readonly message_id?: number; readonly level: LogLevel; readonly message: string }
+    | { readonly type: "socket_effects"; readonly message_id: number }
+    | { readonly type: "reply"; readonly message_id: number; readonly reply: ReplyHead }
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 32
+    readonly protocol: 33
     readonly actor_names: readonly string[]
 }
 
@@ -140,23 +145,18 @@ interface AssignedActor {
     readonly actor: ActorIdentity
 }
 
-interface ReplyMessage {
-    readonly type: "reply"
-    readonly message_id: number
-    readonly reply: ActorExecutorReply
-}
-
 interface InvokedReply {
     readonly type: "invoked"
     readonly sequence?: number
-    readonly result: JsonValue
-    readonly effects?: readonly SocketEffect[]
+    /** The result as JSON. It is encoded once, before the commit, so a result that has no JSON fails the call. */
+    readonly result: JsonText
+    readonly effects?: readonly HostSocketEffect[]
 }
 
 interface WebSocketHandledReply {
     readonly type: "websocket_handled"
     readonly sequence?: number
-    readonly effects: readonly SocketEffect[]
+    readonly effects: readonly HostSocketEffect[]
 }
 
 interface FailedReply {
@@ -169,56 +169,18 @@ interface EvictedReply {
     readonly type: "evicted"
 }
 
-interface ActorWorkerData {
-    readonly moduleUrl: string
-    readonly environment?: Readonly<Record<string, string>>
-}
-
-type ActorWorkerRequest =
-    | { readonly type: "load"; readonly data: ActorWorkerData }
-    | {
-          readonly type: "execute"
-          readonly messageId: number
-          readonly command: ActorWorkerCommand
-      }
-    | {
-          readonly type: "socket_connections"
-          readonly messageId: number
-          readonly connections: SocketLookup
-          readonly error?: string
-      }
-    | { readonly type: "actor_result"; readonly callId: number; readonly outcome: JsonValue }
-type ActorWorkerMessage =
-    | {
-          readonly type: "database_call"
-          readonly messageId?: number
-          readonly call: DatabaseCall
-          readonly request: DatabaseRequest
-      }
-    | { readonly type: "actor_call"; readonly callId: number; readonly call: ActorCallRequest }
-    | { readonly type: "warm" }
-    | {
-          readonly type: "ready"
-          readonly actorNames: readonly string[]
-      }
-    | { readonly type: "reply"; readonly messageId: number; readonly reply: ActorExecutorReply }
-    | FailedReply
-    | { readonly type: "ready_for_invocation"; readonly messageId: number }
-    | { readonly type: "socket_effects"; readonly messageId: number; readonly effects: readonly SocketEffect[] }
-    | { readonly type: "get_connections"; readonly messageId: number; readonly query?: SocketQuery }
-    | ActorLog
-
 type LogLevel = "debug" | "info" | "warn" | "error"
 
 interface ActorLog {
-    readonly type: "log"
+    /** The command that wrote the line. Absent for output from outside any command. */
     readonly messageId?: number
     readonly level: LogLevel
     readonly message: string
 }
 
 type WebSocketEventCommand = z.infer<typeof websocketEventCommandSchema> & AssignedActor
-export { failedReply, parseActorSessionServerMessage }
+
+export { detachEffects, detachReply, failedReply, parseActorSessionServerMessage }
 export type {
     ActorCallRequest,
     ActorLog,
@@ -228,11 +190,11 @@ export type {
     ActorExecutorReply,
     ActorSessionClientMessage,
     ActorSessionServerMessage,
-    ActorWorkerData,
-    ActorWorkerCommand,
-    ActorWorkerMessage,
-    ActorWorkerRequest,
+    AssignedCommand,
+    DetachedReply,
     EvictCommand,
+    FailedReply,
     InvokeCommand,
+    SessionPart,
     WebSocketEventCommand
 }

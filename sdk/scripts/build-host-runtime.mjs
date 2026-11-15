@@ -11,8 +11,7 @@ export async function buildHostRuntime(output) {
         index: "src/index.ts",
         backend: "src/backend.ts",
         proxy: "src/proxy.ts",
-        host: "src/host.ts",
-        "actor-worker": "src/host/actor-worker.ts"
+        host: "src/host.ts"
     }
     const result = await build({
         absWorkingDir: sdk,
@@ -20,7 +19,6 @@ export async function buildHostRuntime(output) {
         outdir: output,
         bundle: true,
         splitting: true,
-        // Worker URLs are relative to import.meta.url; keep entries and shared chunks together.
         chunkNames: "chunk-[hash]",
         platform: "node",
         format: "esm",

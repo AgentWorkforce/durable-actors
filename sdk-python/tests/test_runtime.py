@@ -188,16 +188,16 @@ async def test_reentrant_failure_does_not_erase_overlapping_success():
 
 
 async def test_a_pending_sql_statement_does_not_block_other_completions():
-    entered, persisting, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    entered, persisting, release = Event(), Event(), Event()
 
     class ContendedDatabase(HostDatabase):
-        async def call(self, call):
+        def call(self, call):
             if call["op"] == "exec" and call["sql"].startswith("CREATE TABLE"):
                 entered.set()
-                await release.wait()
+                release.wait(5)
             if call["op"] == "persist_field":
                 persisting.set()
-            return await super().call(call)
+            return super().call(call)
 
     class Ledger(Actor):
         count: int = persisted(0)
@@ -213,9 +213,9 @@ async def test_a_pending_sql_statement_does_not_block_other_completions():
     runtime = ActorRuntime(Ledger, Effects(), ContendedDatabase())
     tasks = [asyncio.create_task(runtime.handle(command("record")))]
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        assert await asyncio.to_thread(entered.wait, 1)
         tasks.append(asyncio.create_task(runtime.handle(command())))
-        await asyncio.wait_for(persisting.wait(), 1)
+        assert await asyncio.to_thread(persisting.wait, 1)
         release.set()
         replies = await asyncio.wait_for(asyncio.gather(*tasks), 5)
         assert [reply["type"] for reply in replies] == ["invoked", "invoked"]

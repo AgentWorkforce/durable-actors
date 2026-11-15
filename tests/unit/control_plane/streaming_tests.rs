@@ -879,7 +879,7 @@ export class Counter extends Actor<{{name?:string; notified?:boolean; user?:stri
     );
     let socket_directory = tempfile::tempdir()?;
     let socket = socket_directory.path().join("executor.sock");
-    let listener = ActorExecutorListener::bind(&socket).await?;
+    let mut listener = ActorExecutorListener::bind(&socket).await?;
     let bootstrap = directory.join("host.mjs");
     std::fs::write(
         &bootstrap,
@@ -888,15 +888,17 @@ export class Counter extends Actor<{{name?:string; notified?:boolean; user?:stri
             serde_json::to_string(&format!("file://{}", sdk.join("host.js").display()))?
         ),
     )?;
-    let child = tokio::process::Command::new("bun")
+    let mut command = tokio::process::Command::new("bun");
+    command
         .arg(bootstrap)
         .env("DURABLE_ACTORS_ENTRYPOINT", code.join("actors.mjs"))
         .env("DURABLE_ACTORS_EXECUTOR_SOCKET", socket)
         .env("TEST_ACTOR_SECRET", "injected")
         .kill_on_drop(true)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    listener.inherit_database_channel(&mut command)?;
+    let child = command.spawn()?;
     let connection = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await??;
     Ok((child, connection))
 }

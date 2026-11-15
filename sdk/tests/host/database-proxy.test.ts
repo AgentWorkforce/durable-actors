@@ -20,10 +20,8 @@ test("values keep their SQLite storage classes across the host boundary", () => 
         { value: "text", type: "text" },
         { value: new Uint8Array([0, 1, 255]), type: "blob" }
     ])
-    assert.deepEqual((host.calls[1] as Extract<DatabaseCall, { op: "exec" }>).bindings, [{ type: "null" }])
-    assert.deepEqual((host.calls[2] as Extract<DatabaseCall, { op: "exec" }>).bindings, [
-        { type: "integer", value: "9007199254740993" }
-    ])
+    assert.deepEqual((host.calls[1] as Extract<DatabaseCall, { op: "exec" }>).bindings, [null])
+    assert.deepEqual((host.calls[2] as Extract<DatabaseCall, { op: "exec" }>).bindings, [9007199254740993n])
     host.close()
 })
 

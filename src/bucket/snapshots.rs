@@ -147,13 +147,6 @@ impl SnapshotStoreConfig {
 #[async_trait]
 pub(crate) trait SnapshotStore: Send + Sync {
     async fn get(&self, object: &str) -> Result<Option<Bytes>>;
-    async fn restore(
-        &self,
-        object: &str,
-        bytes: Bytes,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
-        self.restore_prefetched(object, bytes, None).await
-    }
     async fn prefetch_checkpoint(
         &self,
         _source: &crate::storage::SnapshotRef,

@@ -252,7 +252,7 @@ async fn control_plane_routes(
             config.max_socket_connections,
             config.gateway_accept_connections,
             stop.child_token(),
-        ),
+        )?,
         None => super::socket_bus::MemorySocketHub::default().join(config.max_socket_connections),
     };
     // A fresh ID per process: a restarted gateway must not vouch for the connections it lost.

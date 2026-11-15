@@ -4,7 +4,7 @@ use crate::actor::{
 };
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 use tokio::sync::{RwLock, mpsc};
@@ -128,6 +128,38 @@ impl SocketRegistry {
                 });
             }
         }
+    }
+
+    /// Closes the actor's sockets held here: the `only` ones, or all of them.
+    pub(crate) async fn close_actor(
+        &self,
+        actor: &ActorKey,
+        only: Option<&BTreeSet<String>>,
+        code: u16,
+        reason: &str,
+    ) {
+        if let Some(sockets) = self.entries.read().await.get(actor) {
+            for (id, entry) in sockets.iter() {
+                if only.is_none_or(|only| only.contains(id)) {
+                    let _ = entry.outbound.send(OutboundMessage::Close {
+                        code,
+                        reason: reason.into(),
+                    });
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn holds_any(
+        &self,
+        actor: &ActorKey,
+        connection_ids: &BTreeSet<String>,
+    ) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(actor)
+            .is_some_and(|sockets| connection_ids.iter().any(|id| sockets.contains_key(id)))
     }
 
     pub(crate) async fn insert(

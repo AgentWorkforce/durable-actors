@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { once } from "node:events"
+import { closeSync, openSync } from "node:fs"
 import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises"
 import type { Socket } from "node:net"
 import { createServer } from "node:net"
@@ -9,12 +10,14 @@ import { fileURLToPath } from "node:url"
 
 import { buildActor } from "../../src/compiler/actor-build.js"
 import { ActorSession, parseHostSettings } from "../../src/host/actor-host.js"
-import type { DatabaseCall } from "../../src/host/database.js"
-import type { ActorExecutorReply } from "../../src/host/protocol.js"
-import type { DatabaseRequester } from "../../src/host/types.js"
-import { ActorWorkerSupervisor } from "../../src/host/worker-supervisor.js"
+import { ResidentActor } from "../../src/host/resident-actor.js"
+import type { InvocationDatabase, SessionActorFactory } from "../../src/host/types.js"
+import { DatabaseChannel } from "../../src/payload/database-channel.js"
+import { GarbageCollection } from "../../src/payload/garbage-collection.js"
+import { DatabasePeer } from "../fixtures/database-peer.js"
+import type { WireReply } from "../fixtures/detached.js"
 import { HostDatabase } from "../fixtures/host-database.js"
-import { assertReply } from "../fixtures/reply.js"
+import { readSession, sessionReader, writeSession } from "../fixtures/session-peer.js"
 
 before(
     async () => {
@@ -23,20 +26,13 @@ before(
     { timeout: 30_000 }
 )
 
-test("loads a prepared JavaScript artifact only inside the first execution Worker", { timeout: 5_000 }, async () => {
+test("attaches with the actors that its artifact exports", { timeout: 5_000 }, async () => {
     const root = await mkdtemp("/tmp/actor-discovery-")
-    const entrypoint = `${root}/actors.js`
-    const fixture = await actorBundle()
-    await writeFile(`${root}/package.json`, JSON.stringify({ type: "module" }))
-    await writeFile(
-        entrypoint,
-        `import { isMainThread } from "node:worker_threads"; if (isMainThread) throw new Error("customer code loaded in supervisor"); export * from ${JSON.stringify(fixture)};`
-    )
     const server = createServer(socket => {
         const lines = createInterface({ input: socket })
         lines.once("line", line => {
             assert.deepEqual(JSON.parse(line).actor_names, ["SessionCounter"])
-            socket.write(`${JSON.stringify({ type: "attached", protocol: 32, actor: actorIdentity() })}\n`)
+            socket.write(`${JSON.stringify({ type: "attached", protocol: 33, actor: actorIdentity() })}\n`)
             socket.end()
         })
     })
@@ -45,7 +41,7 @@ test("loads a prepared JavaScript artifact only inside the first execution Worke
     const session = new ActorSession(
         parseHostSettings({
             DURABLE_ACTORS_EXECUTOR_SOCKET: `${root}/executor.sock`,
-            DURABLE_ACTORS_ENTRYPOINT: entrypoint
+            DURABLE_ACTORS_ENTRYPOINT: await actorBundle()
         })
     )
     try {
@@ -57,7 +53,7 @@ test("loads a prepared JavaScript artifact only inside the first execution Worke
     }
 })
 
-test("a stalled actor import times out and closes the Worker", { timeout: 5_000 }, async () => {
+test("a stalled actor import times out and closes the actor", { timeout: 5_000 }, async () => {
     let closed = 0
     const session = new ActorSession(
         parseHostSettings({
@@ -82,58 +78,6 @@ test("a stalled actor import times out and closes the Worker", { timeout: 5_000 
     assert.equal(closed, 1)
 })
 
-test("database calls outside a command carry only their call ID", { timeout: 5_000 }, async () => {
-    const socketPath = `/tmp/ta-activation-${process.pid}.sock`
-    await removeSocket(socketPath)
-    const server = createServer()
-    const customerSocketPromise = new Promise<Socket>(resolve => {
-        server.once("connection", resolve)
-    })
-    server.listen(socketPath)
-    await once(server, "listening")
-    let activationDatabase!: DatabaseRequester
-    const session = new ActorSession(
-        parseHostSettings({
-            DURABLE_ACTORS_EXECUTOR_SOCKET: socketPath,
-            DURABLE_ACTORS_ENTRYPOINT: await actorBundle()
-        }),
-        () => ({
-            ready: async () => ["SessionCounter"],
-            async handle() {
-                return { type: "evicted" }
-            },
-            close() {},
-            assign(_actor, database) {
-                activationDatabase = database
-            },
-            isResident: () => false,
-            onResidencyChange: () => () => {}
-        })
-    )
-    const startup = session.start()
-    try {
-        const customerSocket = await customerSocketPromise
-        const iterator = createInterface({ input: customerSocket, crlfDelay: Infinity })[Symbol.asyncIterator]()
-        await readMessage(iterator)
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 32, actor: actorIdentity() })}\n`)
-        await startup
-        const result = activationDatabase({ op: "fields" })
-        let message: unknown
-        do message = await readMessage(iterator)
-        while ((message as { type: string }).type === "residency")
-        assert.deepEqual(message, { type: "database_call", call_id: 1, call: { op: "fields" } })
-        customerSocket.write(
-            `${JSON.stringify({ type: "database_result", call_id: 1, result: { type: "fields", fields: {} } })}\n`
-        )
-        assert.deepEqual(await result, { type: "fields", fields: {} })
-        customerSocket.destroy()
-        await session.waitUntilDisconnected()
-    } finally {
-        server.close()
-        await removeSocket(socketPath)
-    }
-})
-
 test("the actor session carries only owned execution commands", async t => {
     const socketPath = `/tmp/ta-session-${process.pid}.sock`
     await removeSocket(socketPath)
@@ -144,39 +88,37 @@ test("the actor session carries only owned execution commands", async t => {
     server.listen(socketPath)
     await once(server, "listening")
     let closed = 0
+    const database = new HostDatabase()
     const session = new ActorSession(
         parseHostSettings({
             DURABLE_ACTORS_EXECUTOR_SOCKET: socketPath,
             DURABLE_ACTORS_ENTRYPOINT: await actorBundle()
         }),
         options => {
-            const supervisor = new ActorWorkerSupervisor(options)
-            const close = supervisor.close.bind(supervisor)
-            t.mock.method(supervisor, "close", () => {
+            const actor = new ResidentActor({ ...options, database: database.call })
+            const close = actor.close.bind(actor)
+            t.mock.method(actor, "close", () => {
                 closed += 1
                 close()
             })
-            return supervisor
+            return actor
         }
     )
     const startup = session.start()
 
     try {
         const customerSocket = await Promise.race([customerSocketPromise, startup.then(() => customerSocketPromise)])
-        const lines = createInterface({ input: customerSocket, crlfDelay: Infinity })
-        const iterator = lines[Symbol.asyncIterator]()
+        const read = sessionReader(customerSocket)
+        const next = () => readHostMessage(read)
 
-        assert.deepEqual(await readMessage(iterator), {
+        assert.deepEqual(await read(), {
             type: "attach",
-            protocol: 32,
+            protocol: 33,
             actor_names: ["SessionCounter"]
         })
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 32, actor: actorIdentity() })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 33, actor: actorIdentity() })}\n`)
         await startup
 
-        const database = new HostDatabase()
-        const serve = databaseServer(database, message => customerSocket.write(`${JSON.stringify(message)}\n`))
-        const next = () => readHostMessage(iterator, serve)
         const invoke = (messageId: number, method: string, args: number[]) =>
             customerSocket.write(
                 `${JSON.stringify({
@@ -231,16 +173,119 @@ test("the actor session carries only owned execution commands", async t => {
         customerSocket.end()
         await session.waitUntilDisconnected()
         assert.equal(closed, 1)
-        lines.close()
         server.close()
         await once(server, "close")
     } finally {
         if (server.listening) server.close()
+        database.close()
         await removeSocket(socketPath)
     }
 })
 
-test("a failed session connection cleans up the speculative Worker", async () => {
+test("a large database result and the socket message built from it cross the session intact", async t => {
+    const root = await mkdtemp("/tmp/large-session-")
+    const database = new HostDatabase()
+    const html = '<p class="note">caf\u00e9 \\ \u2028 \u{1f600}</p>\n'
+    const frames = [20_000, 1, 1_000, 0, 2_500, 3_000].map(repeats => ({ html: html.repeat(repeats) }))
+    const channel = new DatabaseChannel(
+        new DatabasePeer(call =>
+            call.op === "exec"
+                ? { type: "rows", columns: ["html"], rows: frames.map(frame => [frame.html]) }
+                : database.call(call)
+        ),
+        new GarbageCollection()
+    )
+    const replied = new Promise<{ message_id: number; reply: WireReply }>((resolve, reject) => {
+        const server = createServer(socket => {
+            const send = (message: object) => writeSession(socket, message)
+            const handle = (message: { type: string }) => {
+                if (message.type === "attach") {
+                    send({ type: "attached", protocol: 33, actor: actorIdentity() })
+                    send({
+                        type: "command",
+                        message_id: 1,
+                        command: {
+                            type: "websocket_event",
+                            request_id: "connect",
+                            event: { type: "connect", connection: { id: "socket-1", metadata: null, tags: [] } },
+                            connections: []
+                        }
+                    })
+                } else if (message.type === "reply") {
+                    resolve(message as never)
+                    socket.end()
+                }
+            }
+            readSession(socket, message => {
+                try {
+                    handle(message)
+                } catch (error) {
+                    reject(error)
+                }
+            })
+            socket.on("error", reject)
+        })
+        t.after(async () => {
+            server.close()
+            database.close()
+            await rm(root, { recursive: true, force: true })
+        })
+        server.listen(`${root}/executor.sock`)
+    })
+    const session = new ActorSession(
+        parseHostSettings({
+            DURABLE_ACTORS_EXECUTOR_SOCKET: `${root}/executor.sock`,
+            DURABLE_ACTORS_ENTRYPOINT: await actorBundle()
+        }),
+        withDatabase((call, invocation) => channel.call(call, invocation))
+    )
+    await session.start()
+    const { message_id, reply } = await replied
+    await session.waitUntilDisconnected()
+
+    assert.equal(message_id, 1)
+    assert.ok(reply.type === "websocket_handled", JSON.stringify(reply).slice(0, 400))
+    const [effect, ...others] = reply.effects
+    assert.deepEqual(others, [])
+    assert.ok(effect?.type === "send" && effect.connection_id === "socket-1" && effect.message.type === "text")
+    assert.deepEqual(JSON.parse(effect.message.data), { type: "frames", frames })
+})
+
+test("a database channel that stops answering ends the session", { timeout: 5_000 }, async t => {
+    const root = await mkdtemp("/tmp/broken-channel-")
+    await writeFile(`${root}/closed-channel`, "")
+    const descriptor = openSync(`${root}/closed-channel`, "r+")
+    const server = createServer(socket => {
+        readSession(socket, message => {
+            if (message.type !== "attach") return
+            writeSession(socket, { type: "attached", protocol: 33, actor: actorIdentity() })
+            writeSession(socket, {
+                type: "command",
+                message_id: 1,
+                command: { type: "invoke", request_id: "read", method: "read", args: [] }
+            })
+        })
+    })
+    t.after(async () => {
+        server.close()
+        closeSync(descriptor)
+        await rm(root, { recursive: true, force: true })
+    })
+    server.listen(`${root}/executor.sock`)
+    await once(server, "listening")
+    const session = new ActorSession(
+        parseHostSettings({
+            DURABLE_ACTORS_EXECUTOR_SOCKET: `${root}/executor.sock`,
+            DURABLE_ACTORS_ENTRYPOINT: await actorBundle(),
+            DURABLE_ACTORS_DATABASE_FD: String(descriptor)
+        })
+    )
+
+    await session.start()
+    await session.waitUntilDisconnected()
+})
+
+test("a failed session connection closes the actor", async () => {
     let closed = 0
     const session = new ActorSession(
         parseHostSettings({
@@ -266,61 +311,6 @@ test("a failed session connection cleans up the speculative Worker", async () =>
     assert.equal(closed, 1)
 })
 
-function actorIdentity(): Record<string, string> {
-    return {
-        project_id: "default",
-        actor_name: "SessionCounter",
-        actor_id: "counter-1"
-    }
-}
-
-function assertSessionReply(message: unknown, id: number, expected: object): void {
-    const { reply, ...envelope } = message as { reply: ActorExecutorReply; type: string; message_id: number }
-    assert.deepEqual(envelope, { type: "reply", message_id: id })
-    assertReply(reply, expected)
-}
-
-function databaseServer(database: HostDatabase, send: (message: unknown) => void) {
-    return (message: { call_id: number; call: DatabaseCall }) => {
-        try {
-            send({ type: "database_result", call_id: message.call_id, result: database.call(message.call) })
-        } catch (error) {
-            send({ type: "database_result", call_id: message.call_id, error: (error as Error).message })
-        }
-    }
-}
-
-async function readHostMessage(
-    iterator: AsyncIterator<string>,
-    serve: ReturnType<typeof databaseServer>
-): Promise<unknown> {
-    for (;;) {
-        const message = (await readMessage(iterator)) as {
-            type: string
-            call_id: number
-            message_id: number
-            call: DatabaseCall
-        }
-        if (message.type === "database_call") serve(message)
-        else if (message.type !== "residency") return message
-    }
-}
-
-async function readMessage(iterator: AsyncIterator<string>): Promise<unknown> {
-    const next = await iterator.next()
-    assert.equal(next.done, false)
-    const message: unknown = JSON.parse(next.value ?? "")
-    return message
-}
-
-async function removeSocket(socketPath: string): Promise<void> {
-    try {
-        await unlink(socketPath)
-    } catch (error) {
-        if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error
-    }
-}
-
 test("assigns the attached actor and reports whether it is resident", { timeout: 5_000 }, async () => {
     const root = await mkdtemp("/tmp/actor-residency-")
     const actor = { project_id: "default", actor_name: "SessionCounter", actor_id: "one" }
@@ -331,7 +321,7 @@ test("assigns the attached actor and reports whether it is resident", { timeout:
         lines.on("line", line => {
             const message = JSON.parse(line)
             if (message.type === "attach")
-                socket.write(`${JSON.stringify({ type: "attached", protocol: 32, actor })}\n`)
+                socket.write(`${JSON.stringify({ type: "attached", protocol: 33, actor })}\n`)
             else if (message.type === "residency") {
                 received = message
                 socket.end()
@@ -367,19 +357,8 @@ test("assigns the attached actor and reports whether it is resident", { timeout:
     }
 })
 
-let preparedFixture: Promise<string> | undefined
-
-function actorBundle(): Promise<string> {
-    return (preparedFixture ??= (async () => {
-        const source = fileURLToPath(new URL("../fixtures/actorSession.ts", import.meta.url))
-        const output = fileURLToPath(new URL("../fixtures/actorSession.mjs", import.meta.url))
-        await buildActor(source, output, { local: true })
-        return output
-    })())
-}
-
-for (const outcome of ["success", "rejection", "disconnect", "atomic", "method_failure", "atomic_failure"] as const) {
-    test(`database calls cross the Worker/session boundary: ${outcome}`, { timeout: 10_000 }, async t => {
+for (const outcome of ["success", "rejection", "atomic", "method_failure", "atomic_failure"] as const) {
+    test(`a write is in the database before its command replies: ${outcome}`, { timeout: 10_000 }, async t => {
         const root = await mkdtemp("/tmp/immediate-session-")
         const database = new HostDatabase()
         const writes: boolean[] = []
@@ -391,48 +370,36 @@ for (const outcome of ["success", "rejection", "disconnect", "atomic", "method_f
             resolve = yes
             reject = no
         })
+        const call: InvocationDatabase = request => {
+            if (request.op !== "persist_field") return database.call(request)
+            writes.push(request.immediate)
+            assert.equal(completed, false)
+            if (outcome === "rejection") throw new Error("durable storage rejected write")
+            return database.call(request)
+        }
         const server = createServer(socket => {
             peer = socket
-            const send = (message: unknown) => socket.write(`${JSON.stringify(message)}\n`)
-            const serve = databaseServer(database, send)
-            const lines = createInterface({ input: socket })
-            lines.on("line", line => {
+            const send = (message: object) => writeSession(socket, message)
+            const invoke = (messageId: number, method: string) =>
+                send({
+                    type: "command",
+                    message_id: messageId,
+                    command: { type: "invoke", request_id: method, method, args: [] }
+                })
+            readSession(socket, message => {
                 void (async () => {
-                    const message = JSON.parse(line)
                     if (message.type === "attach") {
-                        send({ type: "attached", protocol: 32, actor: actorIdentity() })
-                        send({
-                            type: "command",
-                            message_id: 17,
-                            command: {
-                                type: "invoke",
-                                request_id: "immediate",
-                                method:
-                                    outcome === "atomic_failure"
-                                        ? "failAtomic"
-                                        : outcome === "atomic"
-                                          ? "incrementAtomic"
-                                          : outcome === "method_failure"
-                                            ? "failAfterWrite"
-                                            : "incrementTwice",
-                                args: []
-                            }
-                        })
-                    } else if (message.type === "database_call") {
-                        if (message.call.op !== "persist_field") return serve(message)
-                        writes.push(message.call.immediate)
-                        await new Promise(ready => setTimeout(ready, 20))
-                        assert.equal(completed, false)
-                        if (outcome === "disconnect") {
-                            socket.destroy()
-                            resolve()
-                        } else if (outcome === "rejection")
-                            send({
-                                type: "database_result",
-                                call_id: message.call_id,
-                                error: "durable storage rejected write"
-                            })
-                        else serve(message)
+                        send({ type: "attached", protocol: 33, actor: actorIdentity() })
+                        invoke(
+                            17,
+                            outcome === "atomic_failure"
+                                ? "failAtomic"
+                                : outcome === "atomic"
+                                  ? "incrementAtomic"
+                                  : outcome === "method_failure"
+                                    ? "failAfterWrite"
+                                    : "incrementTwice"
+                        )
                     } else if (message.type === "reply") {
                         completed = true
                         if (
@@ -440,16 +407,7 @@ for (const outcome of ["success", "rejection", "disconnect", "atomic", "method_f
                             message.message_id === 17
                         ) {
                             assert.equal(message.reply.code, "actor_method_failed")
-                            send({
-                                type: "command",
-                                message_id: 18,
-                                command: {
-                                    type: "invoke",
-                                    request_id: "read",
-                                    method: "read",
-                                    args: []
-                                }
-                            })
+                            invoke(18, "read")
                             return
                         }
                         if (outcome === "method_failure" || outcome === "atomic_failure") {
@@ -485,10 +443,55 @@ for (const outcome of ["success", "rejection", "disconnect", "atomic", "method_f
             parseHostSettings({
                 DURABLE_ACTORS_EXECUTOR_SOCKET: `${root}/executor.sock`,
                 DURABLE_ACTORS_ENTRYPOINT: await actorBundle()
-            })
+            }),
+            withDatabase(call)
         )
         await session.start()
         await done
         await session.waitUntilDisconnected()
     })
+}
+
+function withDatabase(database: InvocationDatabase): SessionActorFactory {
+    return options => new ResidentActor({ ...options, database })
+}
+
+function actorIdentity(): Record<string, string> {
+    return {
+        project_id: "default",
+        actor_name: "SessionCounter",
+        actor_id: "counter-1"
+    }
+}
+
+function assertSessionReply(message: unknown, id: number, expected: object): void {
+    const { reply, ...envelope } = message as { reply: object; type: string; message_id: number }
+    assert.deepEqual(envelope, { type: "reply", message_id: id })
+    assert.deepEqual(reply, expected)
+}
+
+async function readHostMessage(read: () => Promise<any>): Promise<unknown> {
+    for (;;) {
+        const message = await read()
+        if (message.type !== "residency" && message.type !== "log") return message
+    }
+}
+
+async function removeSocket(socketPath: string): Promise<void> {
+    try {
+        await unlink(socketPath)
+    } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error
+    }
+}
+
+let preparedFixture: Promise<string> | undefined
+
+function actorBundle(): Promise<string> {
+    return (preparedFixture ??= (async () => {
+        const source = fileURLToPath(new URL("../fixtures/actorSession.ts", import.meta.url))
+        const output = fileURLToPath(new URL("../fixtures/actorSession.mjs", import.meta.url))
+        await buildActor(source, output, { local: true })
+        return output
+    })())
 }

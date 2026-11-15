@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-from collections.abc import Callable, Coroutine
-from typing import Any, cast
+from collections.abc import Callable
+from functools import partial
+from typing import cast
 
 from .contract import Document
 from .database import SqliteValue
+from .threads import run_in_thread
 
-DatabaseTransport = Callable[[Document], Coroutine[Any, Any, Document]]
+# Holds its thread until the Rust host has answered.
+DatabaseTransport = Callable[[Document], Document]
 
 
 class DatabaseCommitError(RuntimeError):
@@ -27,20 +29,12 @@ class DatabaseProxy:
             raise ValueError("SQL must be a string")
         result = expect(
             self.request(
-                {
-                    "op": "exec",
-                    "sql": sql,
-                    "bindings": [encode(value) for value in bindings],
-                    "immediate": False,
-                }
+                {"op": "exec", "sql": sql, "bindings": list(bindings), "immediate": False}
             ),
             "rows",
         )
         columns = result["columns"]
-        return [
-            dict(zip(columns, (decode(value) for value in row), strict=True))
-            for row in result["rows"]
-        ]
+        return [dict(zip(columns, row, strict=True)) for row in result["rows"]]
 
     def get_alarm(self) -> int | None:
         result = expect(self.request({"op": "alarm"}), "alarm")
@@ -59,31 +53,35 @@ class DatabaseProxy:
         expect(self.request({"op": "delete_alarm", "immediate": False}), "done")
 
     async def fields(self) -> Document:
-        return cast(Document, expect(await self.call({"op": "fields"}), "fields")["fields"])
+        return cast(Document, expect(await self.send({"op": "fields"}), "fields")["fields"])
 
     async def update_fields(self, stored: Document, fields: Document) -> None:
         """Writes the fields that differ from `stored` and deletes the ones `fields` dropped."""
         for name, value in fields.items():
             if name not in stored or stored[name] != value:
-                await self.call(
+                await self.send(
                     {"op": "persist_field", "name": name, "value": value, "immediate": False}
                 )
         for name in stored.keys() - fields.keys():
-            await self.call({"op": "delete_field", "name": name, "immediate": False})
+            await self.send({"op": "delete_field", "name": name, "immediate": False})
 
     async def begin(self) -> None:
-        await self.call({"op": "exec", "sql": "BEGIN", "bindings": [], "immediate": False})
+        await self.send({"op": "exec", "sql": "BEGIN", "bindings": [], "immediate": False})
 
     async def commit(self) -> None:
         try:
-            await self.call({"op": "commit"})
+            await self.send({"op": "commit"})
         except Exception as error:
             raise DatabaseCommitError(
                 f"failed to replicate actor SQLite commit: {error}"
             ) from error
 
     async def rollback(self) -> None:
-        await self.call({"op": "rollback"})
+        await self.send({"op": "rollback"})
+
+    async def send(self, call: Document) -> Document:
+        """Makes a call for a coroutine, leaving the event loop free while the host answers."""
+        return await run_in_thread(partial(self.call, call))
 
     def request(self, call: Document) -> Document:
         if running_loop() is self.loop:
@@ -91,7 +89,7 @@ class DatabaseProxy:
                 "synchronous actor database calls would block the event loop; "
                 "use AsyncActor.db from coroutines"
             )
-        return asyncio.run_coroutine_threadsafe(self.call(call), self.loop).result()
+        return self.call(call)
 
 
 def running_loop() -> asyncio.AbstractEventLoop | None:
@@ -105,28 +103,3 @@ def expect(result: Document, kind: str) -> Document:
     if result.get("type") != kind:
         raise ValueError(f"unexpected actor database result {result.get('type')}")
     return result
-
-
-def encode(value: SqliteValue) -> Document:
-    if value is None:
-        return {"type": "null"}
-    if isinstance(value, int):
-        return {"type": "integer", "value": str(int(value))}
-    if isinstance(value, float):
-        return {"type": "real", "value": value}
-    if isinstance(value, str):
-        return {"type": "text", "value": value}
-    return {"type": "blob", "value": base64.b64encode(value).decode()}
-
-
-def decode(value: Any) -> SqliteValue:
-    kind = value["type"]
-    if kind == "null":
-        return None
-    if kind == "integer":
-        return int(value["value"])
-    if kind == "blob":
-        return base64.b64decode(value["value"], validate=True)
-    if kind in {"real", "text"}:
-        return cast(SqliteValue, value["value"])
-    raise ValueError(f"unexpected SQLite value type {kind}")

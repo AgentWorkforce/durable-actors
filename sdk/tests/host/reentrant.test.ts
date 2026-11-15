@@ -4,6 +4,8 @@ import { test } from "node:test"
 import { Actor, type ActorClass, registerActorClass } from "../../src/actor/actor.js"
 import { Persistence } from "../../src/actor/schema.js"
 import { ActorRuntime } from "../fixtures/actor-runtime.js"
+import { wireEffects } from "../fixtures/detached.js"
+import { resultOf } from "../fixtures/reply.js"
 
 function deferred() {
     let resolve!: () => void
@@ -77,7 +79,7 @@ test("a failed reentrant invocation cannot erase an overlapping successful mutat
     gate.resolve()
     assert.equal((await holding).type, "failed")
     const reply = await invoke("read")
-    assert.equal("result" in reply && reply.result, 2)
+    assert.equal(resultOf(reply), 2)
 })
 
 test("socket context survives another invocation finishing during a reentrant await", async () => {
@@ -102,7 +104,7 @@ test("socket context survives another invocation finishing during a reentrant aw
     assert.notEqual(reply.type, "failed")
     assert.ok("effects" in reply)
     assert.deepEqual(
-        reply.effects?.map(effect => effect.type === "broadcast" && effect.message.data),
+        wireEffects(reply.effects ?? []).map(effect => effect.type === "broadcast" && effect.message.data),
         ['"before"', '"after"']
     )
 })
@@ -133,7 +135,7 @@ test("reentrant continuations may resume during an undecorated await and nested 
     await entered.promise
     generation.resolve()
     const result = await holding
-    assert.equal("result" in result && result.result, 1)
+    assert.equal(resultOf(result), 1)
     settings.resolve()
     await updating
 })
@@ -163,7 +165,7 @@ test("an undecorated failure on an opted-in actor cannot roll back a reentrant s
     release.resolve()
     assert.equal((await failed).type, "failed")
     const result = await invoke("read")
-    assert.equal("result" in result && result.result, 1)
+    assert.equal(resultOf(result), 1)
 })
 
 test("emittable changes compare consecutive completed snapshots, including a value restored by a continuation", async () => {

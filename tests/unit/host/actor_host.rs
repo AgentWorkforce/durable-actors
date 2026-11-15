@@ -36,6 +36,8 @@ struct IncrementingExecutor {
     invocations: AtomicU64,
 }
 
+#[path = "../../fixtures/rows.rs"]
+mod rows;
 #[path = "../../fixtures/host_sqlite.rs"]
 mod sqlite;
 use sqlite::{exec, fields, persist_fields, replication, write_fields};
@@ -849,7 +851,7 @@ async fn interleaved_admission_continues_while_database_publication_is_pending()
                 2
             };
             persist_fields(&*database, json!({"count": sequence}), self.immediate).await?;
-            database.call(DatabaseCall::Commit).await?;
+            database.call(DatabaseCall::Commit, rows::ignored()).await?;
             Ok(ActorMethodOutcome::Interleaved(
                 crate::actor::ActorInterleavedOutcome {
                     sequence,
@@ -1351,15 +1353,18 @@ async fn activation_tolerates_immediate_writes_that_leave_sqlite_unchanged() -> 
                 immediate: true,
             };
             database
-                .call(DatabaseCall::Exec {
-                    sql: "CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)".into(),
-                    bindings: vec![],
-                    immediate: true,
-                })
+                .call(
+                    DatabaseCall::Exec {
+                        sql: "CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)".into(),
+                        bindings: vec![],
+                        immediate: true,
+                    },
+                    rows::ignored(),
+                )
                 .await?;
-            database.call(upsert("sb-1")).await?;
-            database.call(upsert("sb-1")).await?;
-            database.call(upsert("sb-2")).await?;
+            database.call(upsert("sb-1"), rows::ignored()).await?;
+            database.call(upsert("sb-1"), rows::ignored()).await?;
+            database.call(upsert("sb-2"), rows::ignored()).await?;
             Ok(())
         }
 
@@ -2274,11 +2279,14 @@ impl ActorExecutor for TransactionWriter {
             persist_fields(&*database, json!({ "count": count + 1 }), true).await?;
             persist_fields(&*database, json!({ "count": count + 2 }), true).await?;
             database
-                .call(DatabaseCall::Exec {
-                    sql: "COMMIT".into(),
-                    bindings: vec![],
-                    immediate: true,
-                })
+                .call(
+                    DatabaseCall::Exec {
+                        sql: "COMMIT".into(),
+                        bindings: vec![],
+                        immediate: true,
+                    },
+                    rows::ignored(),
+                )
                 .await?;
             exec(&*database, "BEGIN").await?;
             persist_fields(&*database, json!({ "count": count + 100 }), true).await?;
@@ -2378,7 +2386,7 @@ async fn delayed_interleaved_completion_cannot_rewind_an_immediate_write() -> Re
             let count = fields(&*database).await?["count"].as_u64().unwrap_or(0) + 1;
             let immediate = invocation.request_id == "newer";
             persist_fields(&*database, json!({ "count": count }), immediate).await?;
-            database.call(DatabaseCall::Commit).await?;
+            database.call(DatabaseCall::Commit, rows::ignored()).await?;
             if count <= 2 {
                 let (reply, ack) = oneshot::channel();
                 self.captured.send(reply)?;
@@ -2471,7 +2479,7 @@ async fn database_handles_expire_with_their_invocation() -> Result<()> {
     assert_eq!(invoke(&host, "request-1").await?, completed(1));
     let retained = executor.0.lock().unwrap().clone().unwrap();
     let error = retained
-        .call(DatabaseCall::Fields { names: None })
+        .call(DatabaseCall::Fields { names: None }, rows::ignored())
         .await
         .unwrap_err();
     assert!(error.to_string().contains("no active invocation"));

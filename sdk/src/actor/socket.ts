@@ -2,10 +2,12 @@ import { AsyncLocalStorage } from "node:async_hooks"
 
 import { ActorProtocolError } from "../errors.js"
 import type { JsonValue } from "../json.js"
+import { encodeJson } from "../payload/json-text.js"
+import type { JsonText } from "../payload/json-text.js"
 
 import type {
+    HostSocketEffect,
     SocketConnection,
-    SocketEffect,
     SocketLookup,
     SocketMessage,
     SocketQuery,
@@ -110,11 +112,11 @@ async function runWithActorSockets<T>(
     instance: object,
     connections: readonly SocketConnection[] | SocketSource,
     operation: (scope: ActorSocketScope) => Promise<T>,
-    publish?: (effects: readonly SocketEffect[]) => void,
+    publish?: (effects: readonly HostSocketEffect[]) => void,
     schemas: ActorSchemas = {},
     eventConnections: readonly SocketConnection[] = []
-): Promise<{ readonly value: T; readonly effects: readonly SocketEffect[] }> {
-    const effects: SocketEffect[] = []
+): Promise<{ readonly value: T; readonly effects: readonly HostSocketEffect[] }> {
+    const effects: HostSocketEffect[] = []
     const output = publish === undefined ? effects : publishing(publish)
     const scope = new ActorSocketScope(connections, output, schemas, eventConnections)
     const context = { instance, scope, active: true }
@@ -135,7 +137,7 @@ class ActorSocketScope {
 
     constructor(
         private readonly connections: readonly SocketConnection[] | SocketSource,
-        readonly effects: Pick<SocketEffect[], "push">,
+        readonly effects: Pick<HostSocketEffect[], "push">,
         private readonly schemas: ActorSchemas,
         eventConnections: readonly SocketConnection[]
     ) {
@@ -229,7 +231,7 @@ class ActorSocketScope {
             throw new ActorProtocolError('broadcast tagMatch must be "all" or "any"')
         this.effects.push({
             type: "broadcast",
-            message: socketMessage(message, this.schemas),
+            message: encodedMessage(message, this.schemas),
             except_connection_ids: excludedSocketIds(options.except),
             tags: socketTags(options.tags ?? [], this.schemas),
             ...(options.tagMatch === undefined ? {} : { tag_match: options.tagMatch })
@@ -251,7 +253,7 @@ class RuntimeActorSocket<Metadata = JsonValue> implements ActorSocket<Metadata> 
 
     constructor(
         connection: SocketConnection,
-        private readonly effects: Pick<SocketEffect[], "push">,
+        private readonly effects: Pick<HostSocketEffect[], "push">,
         private readonly schemas: ActorSchemas,
         private stateValue: ActorSocketState = "open"
     ) {
@@ -282,7 +284,7 @@ class RuntimeActorSocket<Metadata = JsonValue> implements ActorSocket<Metadata> 
 
     send(message: ActorSocketMessage): void {
         if (this.stateValue === "closed") throw new ActorProtocolError("cannot send on a closed actor socket")
-        this.effects.push({ type: "send", connection_id: this.id, message: socketMessage(message, this.schemas) })
+        this.effects.push({ type: "send", connection_id: this.id, message: encodedMessage(message, this.schemas) })
     }
 
     close(code = 1000, reason = ""): void {
@@ -311,7 +313,7 @@ class RuntimeActorSocket<Metadata = JsonValue> implements ActorSocket<Metadata> 
     }
 }
 
-function publishing(publish: (effects: readonly SocketEffect[]) => void): Pick<SocketEffect[], "push"> {
+function publishing(publish: (effects: readonly HostSocketEffect[]) => void): Pick<HostSocketEffect[], "push"> {
     return {
         push(...effects) {
             publish(effects)
@@ -328,9 +330,17 @@ function socketScope(instance: object): ActorSocketScope {
 }
 
 function socketMessage(message: unknown, schemas: ActorSchemas = {}): SocketMessage {
+    return { type: "text", data: JSON.stringify(sendable(message, schemas)) }
+}
+
+function encodedMessage(message: unknown, schemas: ActorSchemas): SocketMessage<JsonText> {
+    return { type: "text", data: encodeJson(sendable(message, schemas)) }
+}
+
+function sendable(message: unknown, schemas: ActorSchemas): JsonValue {
     if (ArrayBuffer.isView(message) || message instanceof ArrayBuffer)
         throw new ActorProtocolError("socket messages must be JSON values, not bytes")
-    return { type: "text", data: JSON.stringify(outgoingMessage(message, schemas)) }
+    return outgoingMessage(message, schemas)
 }
 
 function decodeSocketMessage(message: SocketMessage, schemas: ActorSchemas = {}): ActorSocketMessage {

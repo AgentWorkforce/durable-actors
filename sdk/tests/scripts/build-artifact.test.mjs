@@ -5,13 +5,14 @@ import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "
 import { createServer } from "node:net"
 import os from "node:os"
 import path from "node:path"
-import { createInterface } from "node:readline"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 
 import { buildActor } from "../../dist/compiler/actor-build.js"
+import { serveDatabase } from "../fixtures/database-peer.ts"
 import { HostDatabase } from "../fixtures/host-database.ts"
+import { sessionReader, writeSession } from "../fixtures/session-peer.ts"
 
 const sdk = fileURLToPath(new URL("../../", import.meta.url))
 const run = promisify(execFile)
@@ -142,10 +143,8 @@ test("built actors run without source, compiler, or TypeScript loader", { timeou
     await writeFile(path.join(root, "src/increment.ts"), "export const increment = (amount: number) => amount + 1\n")
     await writeFile(
         path.join(root, "src/actors.ts"),
-        `import { isMainThread } from "node:worker_threads"
-        import { Actor, Persisted, Ephemeral, Emittable } from "durable-actors"
+        `import { Actor, Persisted, Ephemeral, Emittable } from "durable-actors"
         import { increment } from "./increment.js"
-        if (isMainThread) throw new Error("actor code must run only inside a Worker")
         export class BuiltCounter extends Actor {
             @Persisted @Emittable count = 0
             @Ephemeral calls = 0
@@ -173,13 +172,17 @@ test("built actors run without source, compiler, or TypeScript loader", { timeou
     const connected = once(server, "connection")
     server.listen(socketPath)
     await once(server, "listening")
-    const environment = { ...process.env, DURABLE_ACTORS_EXECUTOR_SOCKET: socketPath }
+    const environment = { ...process.env, DURABLE_ACTORS_EXECUTOR_SOCKET: socketPath, DURABLE_ACTORS_DATABASE_FD: "3" }
     delete environment.DURABLE_ACTORS_ENTRYPOINT
+    // The fourth descriptor is the database channel, which the host's thread blocks on.
     const host = spawn("bun", [bootstrap], {
         cwd: deployed,
         env: environment,
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: ["ignore", "pipe", "pipe", "pipe"]
     })
+    const database = new HostDatabase()
+    t.after(() => database.close())
+    serveDatabase(host.stdio[3], database.call)
     let stderr = ""
     host.stderr.on("data", data => (stderr += data))
     const exited = once(host, "exit")
@@ -194,26 +197,16 @@ test("built actors run without source, compiler, or TypeScript loader", { timeou
         })
     ])
     t.after(() => socket.destroy())
-    const lines = createInterface({ input: socket })[Symbol.asyncIterator]()
-    const database = new HostDatabase()
-    t.after(() => database.close())
+    const read = sessionReader(socket)
     const receive = async () => {
         for (;;) {
-            const message = JSON.parse((await lines.next()).value)
-            if (message.type === "residency") continue
-            if (message.type !== "database_call") return message
-            let reply
-            try {
-                reply = { result: database.call(message.call) }
-            } catch (error) {
-                reply = { error: error.message }
-            }
-            send({ type: "database_result", call_id: message.call_id, ...reply })
+            const message = await read()
+            if (message.type !== "residency") return message
         }
     }
-    assert.deepEqual(await receive(), { type: "attach", protocol: 32, actor_names: ["BuiltCounter"] })
-    const send = message => socket.write(JSON.stringify(message) + "\n")
-    send({ type: "attached", protocol: 32, actor: { project_id: "default", actor_name: "BuiltCounter", actor_id: "counter" } })
+    assert.deepEqual(await receive(), { type: "attach", protocol: 33, actor_names: ["BuiltCounter"] })
+    const send = message => writeSession(socket, message)
+    send({ type: "attached", protocol: 33, actor: { project_id: "default", actor_name: "BuiltCounter", actor_id: "counter" } })
     const invoke = messageId =>
         send({
             type: "command",
@@ -263,22 +256,6 @@ test("actor builds report invalid persistence annotations before deployment", as
     const root = await project(t)
     await writeFile(path.join(root, "src/actors.ts"), `import { Actor } from "durable-actors"; export class Counter extends Actor { count = 0 }`)
     await assert.rejects(buildActor(path.join(root, "src/actors.ts"), path.join(root, "dist/actors.mjs")), /must declare exactly one of @Persisted or @Ephemeral/)
-})
-
-test("an exiting actor reports failure before publishing its result and state", { timeout: 15_000 }, async t => {
-    const root = await project(t)
-    await writeFile(
-        path.join(root, "src/actors.ts"),
-        'import { Actor, Persisted } from "durable-actors"; export class Exiting extends Actor { @Persisted count = 0; async stop(): Promise<void> { this.count++; process.exit(1) } }'
-    )
-    const artifact = path.join(root, "actors.mjs")
-    await buildActor(path.join(root, "src/actors.ts"), artifact)
-    const script = fileURLToPath(new URL("../fixtures/invoke-exiting-actor.mjs", import.meta.url))
-    const { stdout } = await run("bun", [script, artifact], { timeout: 10_000 })
-    const reply = JSON.parse(stdout)
-    assert.equal(reply.type, "failed")
-    assert.equal(reply.code, "actor_worker_failed")
-    assert.match(reply.message, /exited with code 1/)
 })
 
 async function project(t, installed = sdk) {

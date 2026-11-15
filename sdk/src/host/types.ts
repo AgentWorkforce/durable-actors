@@ -1,81 +1,44 @@
-import type { SocketEffect, SocketSource } from "../actor/socketProtocol.js"
+import type { HostSocketEffect, SocketSource } from "../actor/socketProtocol.js"
 import type { JsonValue } from "../json.js"
 
 import type { DatabaseCall, DatabaseResult } from "./database.js"
-import type { ActorCallRequest, ActorExecutorReply, ActorLog, ActorWorkerCommand, ActorWorkerData } from "./protocol.js"
-import type { ActorWorkerSupervisor } from "./worker-supervisor.js"
+import type { ActorCallRequest, ActorLog } from "./protocol.js"
+import type { ResidentActor } from "./resident-actor.js"
 
 interface ActorHostSettings {
     readonly socketPath: string
     readonly actorEntrypoint: string | undefined
     readonly startupTimeoutMs: number
+    /** The inherited connection that database calls block on. Absent outside the Rust host. */
+    readonly databaseDescriptor: number | undefined
 }
 
-type SocketPublisher = (effects: readonly SocketEffect[]) => void
+type SocketPublisher = (effects: readonly HostSocketEffect[]) => void
 
-type DatabaseRequester = (call: DatabaseCall) => Promise<DatabaseResult>
+/** Holds the thread until the Rust host has answered. `invocation` names the command whose database is called. */
+type InvocationDatabase = (call: DatabaseCall, invocation?: number) => DatabaseResult
 
 type ActorCallRequester = (call: ActorCallRequest) => Promise<JsonValue>
 
 type LogWriter = (log: ActorLog) => void
 
-type ActorSessionSupervisor = Pick<ActorWorkerSupervisor, "assign" | "handle" | "isResident" | "onResidencyChange">
-
-type ActorWorkerSupervisorFactory = (
-    options: ActorWorkerSupervisorOptions
-) => ActorSessionSupervisor & Pick<ActorWorkerSupervisor, "ready" | "close">
-
-interface ActorWorkerSupervisorOptions {
+interface ResidentActorOptions {
     readonly actorEntrypointUrl: string
-    readonly createWorker?: ActorWorkerFactory
+    readonly database: InvocationDatabase
 }
 
-interface ResidentActorWorkerOptions {
-    readonly sequenceBase: number
-    readonly onResidencyChange: () => void
-    readonly database: DatabaseRequester
-    readonly calls: ActorCallRequester
-    readonly logs: LogWriter
-    readonly moduleUrl: string
-    readonly worker?: ActorWorkerHandle
-    readonly createWorker: ActorWorkerFactory
-}
+type SessionActor = Pick<ResidentActor, "ready" | "assign" | "handle" | "isResident" | "onResidencyChange" | "close">
 
-type ActorWorkerState = "starting" | "ready" | "stopping" | "stopped"
-
-interface ActorWorkerHandle {
-    readonly state: ActorWorkerState
-    ready(): Promise<readonly string[]>
-    execute(
-        command: ActorWorkerCommand,
-        allowNextInvocation: () => void,
-        database: DatabaseRequester,
-        publish?: SocketPublisher,
-        connections?: SocketSource
-    ): Promise<ActorExecutorReply>
-    terminate(reason: string): void
-}
-
-type ActorWorkerFactory = (
-    data: ActorWorkerData,
-    onStateChange: () => void,
-    database: DatabaseRequester,
-    calls: ActorCallRequester,
-    logs: LogWriter
-) => ActorWorkerHandle
+type SessionActorFactory = (options: ResidentActorOptions) => SessionActor
 
 export type {
     ActorCallRequester,
     ActorHostSettings,
-    ActorSessionSupervisor,
-    ActorWorkerFactory,
-    ActorWorkerHandle,
-    ActorWorkerState,
-    ActorWorkerSupervisorFactory,
-    ActorWorkerSupervisorOptions,
-    DatabaseRequester,
+    InvocationDatabase,
     LogWriter,
-    ResidentActorWorkerOptions,
+    ResidentActorOptions,
+    SessionActor,
+    SessionActorFactory,
     SocketPublisher,
     SocketSource
 }

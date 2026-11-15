@@ -1,7 +1,6 @@
 import type { SocketContract } from "../wire/contract.js"
 
 import type { ComputeOptions } from "./compute.js"
-import type { ActorResource } from "./resource.js"
 
 const ACTOR_ARTIFACT_VERSION = 1
 

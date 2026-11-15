@@ -5,9 +5,10 @@ import { Actor, registerActorClass } from "../../src/actor/actor.js"
 import { Ephemeral, Persisted } from "../../src/actor/decorators.js"
 import { Persistence } from "../../src/actor/schema.js"
 import type { ActorConnection, ActorSocket } from "../../src/actor/socket.js"
-import type { SocketEffect } from "../../src/actor/socketProtocol.js"
+import type { HostSocketEffect } from "../../src/actor/socketProtocol.js"
 import { ActorRuntime, DatabaseProxy } from "../fixtures/actor-runtime.js"
 import { runWithActorClientForTests } from "../fixtures/actorClient.js"
+import { wireEffects } from "../fixtures/detached.js"
 import { HostDatabase } from "../fixtures/host-database.js"
 import { assertReply } from "../fixtures/reply.js"
 
@@ -138,7 +139,7 @@ test("socket handlers load the full connection list only when requested", async 
         })
         assert.equal(reply.type, "websocket_handled")
         if (reply.type !== "websocket_handled") return
-        assert.deepEqual(reply.effects, [
+        assert.deepEqual(wireEffects(reply.effects), [
             {
                 type: "send",
                 connection_id: "sender",
@@ -230,6 +231,56 @@ test("ephemeral caches survive resident calls and reset after atomic failure or 
     assertReply(await restored.handle(command), expected)
 })
 
+test("a result is what JSON.stringify makes of the value returned", async () => {
+    class Converted extends Actor {
+        async report(): Promise<unknown> {
+            return { at: new Date(0), skipped: undefined, list: [undefined, 1], text: "caf\u00e9" }
+        }
+    }
+    const runtime = new ActorRuntime(registerActorClass(Converted, { actorName: "Converted", fields: [] }), () => {})
+
+    assertReply(
+        await runtime.handle({
+            type: "invoke",
+            request_id: "converted",
+            actor: { ...actorIdentity, actor_name: "Converted" },
+            method: "report",
+            args: []
+        }),
+        { type: "invoked", result: { at: "1970-01-01T00:00:00.000Z", list: [null, 1], text: "caf\u00e9" } }
+    )
+})
+
+test("a result that cannot be encoded fails the call", async () => {
+    class Unencodable extends Actor {
+        async loop(): Promise<unknown> {
+            const loop: { self?: unknown } = {}
+            loop.self = loop
+            return loop
+        }
+
+        async callable(): Promise<unknown> {
+            return () => 1
+        }
+    }
+    const runtime = new ActorRuntime(
+        registerActorClass(Unencodable, { actorName: "Unencodable", fields: [] }),
+        () => {}
+    )
+
+    for (const method of ["loop", "callable"])
+        assertReply(
+            await runtime.handle({
+                type: "invoke",
+                request_id: "unencodable",
+                actor: { ...actorIdentity, actor_name: "Unencodable" },
+                method,
+                args: []
+            }),
+            { type: "failed", code: "actor_method_failed", message: "actor result must be JSON serializable" }
+        )
+})
+
 test("failed state recovery reports a fatal error instead of keeping a damaged instance", async () => {
     let rejectConstruction = false
     const restore = () => {
@@ -282,7 +333,7 @@ test("streams actor output before execution finishes without replaying it in the
             this.broadcast("last")
         }
     }
-    const effects: SocketEffect[] = []
+    const effects: HostSocketEffect[] = []
     let first!: () => void
     const published = new Promise<void>(resolve => {
         first = resolve
@@ -320,7 +371,7 @@ test("streams actor output before execution finishes without replaying it in the
     }
     assertReply(await invocation, { type: "invoked", result: null })
     assert.deepEqual(
-        effects.map(effect => effect.type === "broadcast" && effect.message),
+        wireEffects(effects).map(effect => effect.type === "broadcast" && effect.message),
         [
             { type: "text", data: JSON.stringify("first") },
             { type: "text", data: JSON.stringify("last") }

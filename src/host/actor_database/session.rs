@@ -6,7 +6,8 @@ use crate::host::HostEndpoint;
 use crate::node_cache::NodeCacheClient;
 use crate::{
     actor::{
-        ActorExecutionResult, ActorInvocation, ActorInvocationFailure, DatabaseCall, DatabaseResult,
+        ActorExecutionResult, ActorInvocation, ActorInvocationFailure, DatabaseCall,
+        DatabaseResult, RowSink,
     },
     litestream::{Replicator, storage::SqliteCapture},
     request_tracking::RequestStage,
@@ -105,6 +106,7 @@ impl DatabaseSession {
         owner_epoch: Option<u64>,
         origin: CommitOrigin,
         call: DatabaseCall,
+        rows: Box<dyn RowSink>,
     ) -> Result<DatabaseReply> {
         let Some(mut cached) = self.cached_state.take() else {
             return Ok(DatabaseReply::Rejected(anyhow::anyhow!(
@@ -112,7 +114,7 @@ impl DatabaseSession {
             )));
         };
         let reply = self
-            .execute_database_call(invocation, owner_epoch, origin, &mut cached, call)
+            .execute_database_call(invocation, owner_epoch, origin, &mut cached, call, rows)
             .await;
         self.cached_state = Some(cached);
         reply
@@ -125,6 +127,7 @@ impl DatabaseSession {
         origin: CommitOrigin,
         cached: &mut ResidentDatabase,
         call: DatabaseCall,
+        rows: Box<dyn RowSink>,
     ) -> Result<DatabaseReply> {
         ensure!(
             owner_epoch.is_none_or(|owner_epoch| cached.owner_epoch == owner_epoch),
@@ -157,7 +160,7 @@ impl DatabaseSession {
         }
         let immediate = call.immediate();
         let commit = matches!(call, DatabaseCall::Commit);
-        let executed = match cached.database.call(call).await {
+        let executed = match cached.database.call(call, rows).await {
             Ok(executed) => executed,
             Err(error) => return Ok(DatabaseReply::Rejected(error)),
         };

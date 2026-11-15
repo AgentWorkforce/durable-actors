@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures_util::{FutureExt, future::FusedFuture};
 use tokio::{net::TcpListener, process::Command};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{error, info};
@@ -173,7 +174,7 @@ pub(super) async fn serve_assigned_host(
             .await
             .context("serve actor host endpoints")
     });
-    let mut executor_task = Box::pin(executor_connection.run(executor_stop.clone()));
+    let mut executor_task = Box::pin(executor_connection.run(executor_stop.clone()).fuse());
     let shutdown = async {
         tokio::select! { () = shutdown => {}, () = storage.stop.cancelled() => {} }
     };
@@ -558,12 +559,8 @@ async fn connect_executor(
     started_at: Instant,
     javascript_spawned_at_ms: &mut Option<f64>,
 ) -> Result<(ActorExecutorConnection, tokio::process::Child)> {
-    let listener = ActorExecutorListener::bind(&executor.socket).await?;
-    let javascript = spawn_executor_process(
-        false,
-        &executor.socket.display().to_string(),
-        executor.runtime,
-    )?;
+    let mut listener = ActorExecutorListener::bind(&executor.socket).await?;
+    let javascript = spawn_executor_process(false, &mut listener, executor.runtime)?;
     *javascript_spawned_at_ms = Some(started_at.elapsed().as_secs_f64() * 1_000.0);
     Ok((listener.accept().await?, javascript))
 }
@@ -631,22 +628,34 @@ async fn serve_during<T>(
     }
 }
 
-async fn stop_executor(host: &ActorHost, stop: &CancellationToken, executor: impl Future) {
+async fn stop_executor(host: &ActorHost, stop: &CancellationToken, executor: impl FusedFuture) {
     if let Err(error) = host.drain(HOST_ACTOR_DRAIN_TIMEOUT).await {
         error!(error = %format!("{error:#}"), "actor invocations did not drain cleanly");
     }
     stop.cancel();
-    let _ = tokio::time::timeout(HOST_TASK_SHUTDOWN_TIMEOUT, executor).await;
+    executor_stopped(executor).await;
+}
+
+// The executor may be what stopped the host, and a future that has finished cannot be awaited again.
+async fn executor_stopped(executor: impl FusedFuture) {
+    if !executor.is_terminated() {
+        let _ = tokio::time::timeout(HOST_TASK_SHUTDOWN_TIMEOUT, executor).await;
+    }
 }
 
 pub(super) fn spawn_executor_process(
     generic: bool,
-    socket: &str,
+    listener: &mut ActorExecutorListener,
     runtime: ActorRuntime,
 ) -> Result<tokio::process::Child> {
-    executor_command(generic, socket, runtime)
-        .spawn()
-        .context("start actor executor")
+    let socket = listener.socket_path().display().to_string();
+    let mut command = executor_command(generic, &socket, runtime);
+    // Bun cannot open a socket that its thread can block on, so it inherits its database channel.
+    // A Python worker process connects its own.
+    if runtime != ActorRuntime::Python {
+        listener.inherit_database_channel(&mut command)?;
+    }
+    command.spawn().context("start actor executor")
 }
 
 fn executor_command(generic: bool, socket: &str, runtime: ActorRuntime) -> Command {

@@ -2,19 +2,19 @@ use crate::{
     actor::{ActorKey, ActorSocketConnection, ActorSocketEffect},
     sockets::SocketRegistry,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -105,6 +105,13 @@ impl SocketBus for MemorySocketBus {
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTO_RESPONSE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+// Redis disconnects a subscriber once 8 MB waits for it, and still counts the 60 seconds it allows
+// after the subscriber has caught up, so a second such message a minute later ends the subscription.
+const PUBLISHED_EFFECTS_BYTES: usize = 64 * 1024;
+const STORED_EFFECTS_TTL: Duration = Duration::from_secs(10);
+// Shorter than SUBSCRIBE_TIMEOUT: the listener reads stored effects before it takes a new subscription.
+const STORED_EFFECTS_TIMEOUT: Duration = Duration::from_secs(3);
+const WAITING_EFFECTS_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) struct RedisSocketBus {
     shared: Arc<Shared>,
@@ -114,6 +121,7 @@ pub(super) struct RedisSocketBus {
 
 struct Shared {
     redis: crate::redis_client::Redis,
+    stored: StoredEffects,
     registry: SocketRegistry,
     namespace: String,
     replies: String,
@@ -138,6 +146,12 @@ enum Envelope {
     Effects {
         actor: ActorKey,
         effects: Vec<ActorSocketEffect>,
+    },
+    StoredEffects {
+        actor: ActorKey,
+        key: String,
+        /// The sockets the effects are for; `None` when they concern every socket of the actor.
+        connection_ids: Option<BTreeSet<String>>,
     },
     Question {
         id: String,
@@ -186,8 +200,9 @@ impl RedisSocketBus {
         max_connections: usize,
         accepts_sockets: bool,
         stop: CancellationToken,
-    ) -> Arc<dyn SocketBus> {
+    ) -> Result<Arc<dyn SocketBus>> {
         let shared = Arc::new(Shared {
+            stored: StoredEffects::new(&redis, namespace)?,
             redis,
             registry: SocketRegistry::with_max_connections(max_connections),
             namespace: namespace.to_owned(),
@@ -199,11 +214,11 @@ impl RedisSocketBus {
         });
         let (commands, receiver) = mpsc::unbounded_channel();
         tokio::spawn(shared.clone().listen(receiver, accepts_sockets, stop));
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             shared,
             commands,
             watched: Mutex::default(),
-        })
+        }))
     }
 
     async fn ask(&self, channel: &str, question: Question) -> Result<Vec<Answer>> {
@@ -270,9 +285,34 @@ impl Shared {
         )
     }
 
+    async fn publish_effects(
+        &self,
+        actor: &ActorKey,
+        effects: Vec<ActorSocketEffect>,
+    ) -> Result<()> {
+        let channel = self.actor_channel(actor);
+        let connection_ids = connection_ids(&effects);
+        let message = serde_json::to_string(&Envelope::Effects {
+            actor: actor.clone(),
+            effects,
+        })?;
+        if message.len() <= PUBLISHED_EFFECTS_BYTES {
+            self.send(&channel, message).await?;
+            return Ok(());
+        }
+        let commands = self
+            .stored
+            .publication(&channel, actor, message, connection_ids)?;
+        self.redis.run_all(commands).await
+    }
+
     async fn publish(&self, channel: &str, envelope: &Envelope) -> Result<usize> {
+        self.send(channel, serde_json::to_string(envelope)?).await
+    }
+
+    async fn send(&self, channel: &str, message: String) -> Result<usize> {
         let mut command = redis::cmd("PUBLISH");
-        command.arg(channel).arg(serde_json::to_string(envelope)?);
+        command.arg(channel).arg(message);
         self.redis.run::<usize>(command).await
     }
 
@@ -347,7 +387,7 @@ impl Shared {
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
                 message = messages.next() => {
-                    let message = message.context("Redis closed the pub/sub connection")?;
+                    let message = message.context("the Redis pub/sub connection ended")?;
                     self.clone().receive(message.get_payload_bytes()).await;
                 }
                 command = commands.recv() => match command {
@@ -381,6 +421,11 @@ impl Shared {
         match envelope {
             // In order, on the listener: an actor's effects apply as published.
             Envelope::Effects { actor, effects } => self.registry.apply(&actor, effects).await,
+            Envelope::StoredEffects {
+                actor,
+                key,
+                connection_ids,
+            } => self.receive_stored(&actor, &key, connection_ids).await,
             Envelope::Question {
                 id,
                 reply_to,
@@ -413,6 +458,117 @@ impl Shared {
             }
         }
     }
+
+    async fn receive_stored(
+        &self,
+        actor: &ActorKey,
+        key: &str,
+        connection_ids: Option<BTreeSet<String>>,
+    ) {
+        if let Some(ids) = &connection_ids
+            && !self.registry.holds_any(actor, ids).await
+        {
+            return;
+        }
+        match self.stored.read(key, read_once(&connection_ids)).await {
+            Ok(effects) => self.registry.apply(actor, effects).await,
+            Err(error) => {
+                tracing::warn!(actor = %actor.storage_key().as_str(), error = %format!("{error:#}"),
+                    "stored socket effects could not be read; the sockets they were for close");
+                let reason = "socket gateway missed a message";
+                self.registry
+                    .close_actor(actor, connection_ids.as_ref(), 1012, reason)
+                    .await;
+            }
+        }
+    }
+}
+
+/// Effects too large to publish wait in Redis for the gateways that hold their sockets.
+struct StoredEffects {
+    redis: crate::redis_client::Redis,
+    namespace: String,
+    waiting: Arc<Semaphore>,
+}
+
+impl StoredEffects {
+    fn new(redis: &crate::redis_client::Redis, namespace: &str) -> Result<Self> {
+        Ok(Self {
+            redis: redis.with_timeout(STORED_EFFECTS_TIMEOUT)?,
+            namespace: namespace.to_owned(),
+            waiting: Arc::new(Semaphore::new(WAITING_EFFECTS_BYTES / 1024)),
+        })
+    }
+
+    /// The commands that store `message` and then publish where it is.
+    fn publication(
+        &self,
+        channel: &str,
+        actor: &ActorKey,
+        message: String,
+        connection_ids: Option<BTreeSet<String>>,
+    ) -> Result<redis::Pipeline> {
+        if !read_once(&connection_ids) {
+            self.reserve(message.len())?;
+        }
+        let key = format!("{}:effects:{}", self.namespace, uuid::Uuid::new_v4());
+        let stored = serde_json::to_string(&Envelope::StoredEffects {
+            actor: actor.clone(),
+            key: key.clone(),
+            connection_ids,
+        })?;
+        let mut commands = redis::pipe();
+        commands
+            .cmd("SET")
+            .arg(key)
+            .arg(message)
+            .arg("PX")
+            .arg(STORED_EFFECTS_TTL.as_millis() as u64)
+            .ignore();
+        commands.cmd("PUBLISH").arg(channel).arg(stored).ignore();
+        Ok(commands)
+    }
+
+    /// Effects read by several gateways stay until they expire, so a gateway limits how much it leaves.
+    fn reserve(&self, bytes: usize) -> Result<()> {
+        let kibibytes = u32::try_from(bytes.div_ceil(1024))?;
+        let reserved = self
+            .waiting
+            .clone()
+            .try_acquire_many_owned(kibibytes)
+            .map_err(|_| anyhow!("too many large socket effects are waiting in Redis"))?;
+        tokio::spawn(async move {
+            tokio::time::sleep(STORED_EFFECTS_TTL).await;
+            drop(reserved);
+        });
+        Ok(())
+    }
+
+    async fn read(&self, key: &str, once: bool) -> Result<Vec<ActorSocketEffect>> {
+        let mut command = redis::cmd(if once { "GETDEL" } else { "GET" });
+        command.arg(key);
+        let stored = self
+            .redis
+            .run::<Option<Vec<u8>>>(command)
+            .await?
+            .context("the effects expired")?;
+        match serde_json::from_slice(&stored)? {
+            Envelope::Effects { effects, .. } => Ok(effects),
+            _ => anyhow::bail!("the stored message is not socket effects"),
+        }
+    }
+}
+
+fn connection_ids(effects: &[ActorSocketEffect]) -> Option<BTreeSet<String>> {
+    effects
+        .iter()
+        .map(|effect| effect.connection_id().map(str::to_owned))
+        .collect()
+}
+
+/// One gateway holds a socket, so effects for a single socket are read once and deleted as they are read.
+fn read_once(connection_ids: &Option<BTreeSet<String>>) -> bool {
+    connection_ids.as_ref().is_some_and(|ids| ids.len() == 1)
 }
 
 #[async_trait]
@@ -499,16 +655,7 @@ impl SocketBus for RedisSocketBus {
             };
             self.shared.redis.run::<redis::Value>(command).await?;
         }
-        self.shared
-            .publish(
-                &self.shared.actor_channel(actor),
-                &Envelope::Effects {
-                    actor: actor.clone(),
-                    effects,
-                },
-            )
-            .await?;
-        Ok(())
+        self.shared.publish_effects(actor, effects).await
     }
 
     async fn connections(

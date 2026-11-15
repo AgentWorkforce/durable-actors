@@ -8,6 +8,7 @@ import { Persistence } from "../../src/actor/schema.js"
 import type { InvokeCommand } from "../../src/host/protocol.js"
 import { ActorRuntime, DatabaseProxy } from "../fixtures/actor-runtime.js"
 import { HostDatabase } from "../fixtures/host-database.js"
+import { resultOf } from "../fixtures/reply.js"
 
 class SqliteCounter extends Actor {
     count = 0
@@ -100,7 +101,7 @@ test("SQL data and schema changes commit alongside unchanged JSON fields", async
     assert.equal(host.commits, afterSchema + 2)
 
     const read = await invoke(restore(host).runtime, "read")
-    assert.deepEqual(Reflect.get(read, "result"), { count: 0, rows: [{ value: "hello ' SQL" }] })
+    assert.deepEqual(resultOf(read), { count: 0, rows: [{ value: "hello ' SQL" }] })
 })
 
 test("field-only writes commit and reads leave the database unchanged", async () => {
@@ -141,7 +142,7 @@ test("large JSON fields and SQLite databases restore together", async () => {
     const { runtime, host } = createRuntime(actor)
     assert.equal((await invoke(runtime, "initialize", [], "LargeState")).type, "invoked")
     const read = await invoke(restore(host, actor).runtime, "read", [], "LargeState")
-    assert.deepEqual(Reflect.get(read, "result"), { fieldBytes, databaseBytes })
+    assert.deepEqual(resultOf(read), { fieldBytes, databaseBytes })
 })
 
 test("failed atomic calls roll back object fields, SQL writes, and SQL schema changes", async () => {
@@ -155,9 +156,9 @@ test("failed atomic calls roll back object fields, SQL writes, and SQL schema ch
         message: "rollback both stores"
     })
     const read = await invoke(runtime, "read")
-    assert.deepEqual(Reflect.get(read, "result"), { count: 0, rows: [{ value: "retained" }] })
+    assert.deepEqual(resultOf(read), { count: 0, rows: [{ value: "retained" }] })
     assert.equal(host.commits, committed)
-    assert.deepEqual(Reflect.get(await invoke(runtime, "tables"), "result"), [{ name: "entries" }])
+    assert.deepEqual(resultOf(await invoke(runtime, "tables")), [{ name: "entries" }])
 })
 
 test("socket hooks persist SQL and fields in the same completion", async () => {
@@ -189,7 +190,7 @@ test("socket hooks persist SQL and fields in the same completion", async () => {
     assert.deepEqual(host.fields(), { count: 1 })
     assert.deepEqual(reply.effects, [])
     const read = await invoke(restore(host, actor).runtime, "read", [], "SqliteRoom")
-    assert.deepEqual(Reflect.get(read, "result"), [{ count: 1 }])
+    assert.deepEqual(resultOf(read), [{ count: 1 }])
 })
 
 test("reentrant failures preserve SQL already committed by an overlapping success", async () => {
@@ -228,7 +229,7 @@ test("reentrant failures preserve SQL already committed by an overlapping succes
     release()
     assert.equal((await holding).type, "failed")
     const read = await invoke(runtime, "read", [], "ReentrantSqlite")
-    assert.deepEqual(Reflect.get(read, "result"), [{ count: 1 }, { count: 2 }])
+    assert.deepEqual(resultOf(read), [{ count: 1 }, { count: 2 }])
     assert.deepEqual(host.fields(), { count: 2 })
 })
 
@@ -246,7 +247,7 @@ test("compiled object schema changes preserve SQLite while adding and removing f
         }
     })
     const read = await invoke(updated.runtime, "read")
-    assert.deepEqual(Reflect.get(read, "result"), { count: 0, rows: [{ value: "retained" }] })
+    assert.deepEqual(resultOf(read), { count: 0, rows: [{ value: "retained" }] })
 })
 
 test("database handles keep writing after their invocation completes", async () => {
@@ -274,7 +275,7 @@ test("database handles keep writing after their invocation completes", async () 
     release()
     await pending
     const restored = restore(host, detached)
-    assert.deepEqual(Reflect.get(await invoke(restored.runtime, "read", [], "DetachedSqlite"), "result"), [{ id: 1 }])
+    assert.deepEqual(resultOf(await invoke(restored.runtime, "read", [], "DetachedSqlite")), [{ id: 1 }])
 })
 
 test("background SQL is rejected while an explicit transaction is open", async () => {
@@ -342,7 +343,7 @@ test("field initializers read the actor identity and SQLite during construction"
         })
     )
     const reply = await invoke(runtime, "read", [], "InitializedSqlite")
-    assert.deepEqual(Reflect.get(reply, "result"), { identity: "one", tables: [{ name: "initialized" }] })
+    assert.deepEqual(resultOf(reply), { identity: "one", tables: [{ name: "initialized" }] })
 })
 
 test("a commit failure prevents further execution until the actor is reloaded", async () => {

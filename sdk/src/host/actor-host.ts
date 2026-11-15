@@ -4,15 +4,21 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { z } from "zod"
 
-import type { SocketEffect, SocketLookup, SocketQuery } from "../actor/socketProtocol.js"
+import type { SocketLookup, SocketQuery } from "../actor/socketProtocol.js"
 import { ActorConfigurationError, ActorProtocolError, ActorSessionError } from "../errors.js"
 import type { JsonValue } from "../json.js"
+import { DescriptorStream } from "../payload/blocking-stream.js"
+import { DatabaseChannel, DatabaseChannelError } from "../payload/database-channel.js"
+import { GarbageCollection } from "../payload/garbage-collection.js"
+import { SessionLines } from "../payload/session-lines.js"
+import { SessionWriter } from "../payload/session-writer.js"
+import type { SessionText } from "../payload/session-writer.js"
 
-import type { DatabaseCall, DatabaseResult } from "./database.js"
-import { parseActorSessionServerMessage } from "./protocol.js"
-import type { ActorCallRequest, ActorExecutorReply, ActorSessionClientMessage } from "./protocol.js"
-import type { ActorHostSettings, ActorSessionSupervisor, ActorWorkerSupervisorFactory } from "./types.js"
-import { ActorWorkerSupervisor } from "./worker-supervisor.js"
+import type { Invocation } from "./invocation.js"
+import { detachEffects, detachReply, parseActorSessionServerMessage } from "./protocol.js"
+import type { ActorCallRequest, ActorExecutorReply, ActorSessionClientMessage, SessionPart } from "./protocol.js"
+import { ResidentActor } from "./resident-actor.js"
+import type { ActorHostSettings, InvocationDatabase, SessionActor, SessionActorFactory } from "./types.js"
 
 async function runActorHost(): Promise<never> {
     const session = new ActorSession()
@@ -25,10 +31,12 @@ async function runActorHost(): Promise<never> {
 class ActorSession {
     private startup: Promise<void> | undefined
     private connection: ActorSessionConnection | undefined
+    // One count of what has passed, whichever connection it passed on.
+    private readonly collection = new GarbageCollection()
 
     constructor(
         private readonly settings: ActorHostSettings = parseHostSettings(process.env),
-        private readonly createSupervisor: ActorWorkerSupervisorFactory = options => new ActorWorkerSupervisor(options),
+        private readonly createActor: SessionActorFactory = options => new ResidentActor(options),
         private readonly socket?: Socket
     ) {}
 
@@ -44,32 +52,43 @@ class ActorSession {
 
     private async initialize(): Promise<void> {
         const actorEntrypointUrl = await resolveActorEntrypoint(this.settings.actorEntrypoint)
-        const supervisor = this.createSupervisor({ actorEntrypointUrl })
+        const actor = this.createActor({ actorEntrypointUrl, database: this.openDatabase() })
         try {
-            const actorNames = await discoverActorNames(supervisor, this.settings.startupTimeoutMs)
-            this.connection = await ActorSessionConnection.open(
-                this.settings.socketPath,
-                actorNames,
-                supervisor,
-                this.settings.startupTimeoutMs,
-                this.socket
-            )
-            void this.connection.closed().then(() => supervisor.close())
+            const actorNames = await discoverActorNames(actor, this.settings.startupTimeoutMs)
+            if (actorNames.length === 0)
+                throw new ActorSessionError("the actor entrypoint does not export any actor classes")
+            const socket = this.socket ?? (await connectSocket(this.settings.socketPath))
+            // Known before the socket delivers a command, so a database failure inside one can end the session.
+            this.connection = new ActorSessionConnection(socket, actor, this.collection)
+            await this.connection.attach(actorNames, this.settings.startupTimeoutMs)
+            void this.connection.closed().then(() => actor.close())
         } catch (error) {
-            supervisor.close()
+            actor.close()
             throw error
+        }
+    }
+
+    private openDatabase(): InvocationDatabase {
+        const descriptor = this.settings.databaseDescriptor
+        if (descriptor === undefined) return unavailableDatabase
+        const channel = new DatabaseChannel(new DescriptorStream(descriptor), this.collection)
+        return (call, invocation) => {
+            try {
+                return channel.call(call, invocation)
+            } catch (error) {
+                // No later call can be answered, so the process ends and the Rust host starts another.
+                if (error instanceof DatabaseChannelError) this.connection?.fail(error)
+                throw error
+            }
         }
     }
 }
 
-async function discoverActorNames(
-    supervisor: Pick<ActorWorkerSupervisor, "ready">,
-    timeoutMs: number
-): Promise<readonly string[]> {
+async function discoverActorNames(actor: Pick<SessionActor, "ready">, timeoutMs: number): Promise<readonly string[]> {
     let timer: NodeJS.Timeout | undefined
     try {
         return await Promise.race([
-            supervisor.ready(),
+            actor.ready(),
             new Promise<never>((_, reject) => {
                 timer = setTimeout(
                     () => reject(new ActorSessionError(`actor module loading timed out after ${timeoutMs}ms`)),
@@ -85,17 +104,13 @@ async function discoverActorNames(
 class ActorSessionConnection {
     private unsubscribeActivity: (() => void) | undefined
     private activityTimer: NodeJS.Timeout | undefined
-    private buffer = ""
+    private readonly lines = new SessionLines()
+    private readonly writer: SessionWriter
     private attachedResolve: (() => void) | undefined
     private attachedReject: ((error: Error) => void) | undefined
     private readonly attachedPromise: Promise<void>
     private closedResolve: (() => void) | undefined
     private readonly closedPromise: Promise<void>
-    private readonly databaseCalls = new Map<
-        number,
-        { resolve: (result: DatabaseResult) => void; reject: (error: Error) => void }
-    >()
-    private nextDatabaseCallId = 0
     private readonly actorCalls = new Map<
         number,
         { resolve: (outcome: JsonValue) => void; reject: (error: Error) => void }
@@ -106,33 +121,10 @@ class ActorSessionConnection {
         { resolve: (connections: SocketLookup) => void; reject: (error: Error) => void }
     >()
 
-    static async open(
-        socketPath: string,
-        actorNames: readonly string[],
-        supervisor: ActorSessionSupervisor,
-        timeoutMs: number,
-        connectedSocket?: Socket
-    ): Promise<ActorSessionConnection> {
-        if (actorNames.length === 0)
-            throw new ActorSessionError("the actor entrypoint does not export any actor classes")
-        const socket = connectedSocket ?? (await connectSocket(socketPath))
-        const connection = new ActorSessionConnection(socket, supervisor)
-        connection.send({
-            type: "attach",
-            protocol: 32,
-            actor_names: actorNames
-        })
-        await connection.waitUntilAttached(timeoutMs)
-        return connection
-    }
-
-    closed(): Promise<void> {
-        return this.closedPromise
-    }
-
-    private constructor(
+    constructor(
         private readonly socket: Socket,
-        private readonly supervisor: ActorSessionSupervisor
+        private readonly actor: SessionActor,
+        collection: GarbageCollection
     ) {
         this.attachedPromise = new Promise<void>((resolve, reject) => {
             this.attachedResolve = resolve
@@ -141,7 +133,24 @@ class ActorSessionConnection {
         this.closedPromise = new Promise<void>(resolve => {
             this.closedResolve = resolve
         })
+        this.writer = new SessionWriter(socket, collection)
         this.bindSocket()
+    }
+
+    async attach(actorNames: readonly string[], timeoutMs: number): Promise<void> {
+        this.send({ type: "attach", protocol: 33, actor_names: actorNames })
+        await this.waitUntilAttached(timeoutMs)
+    }
+
+    closed(): Promise<void> {
+        return this.closedPromise
+    }
+
+    fail(error: Error): void {
+        this.attachedReject?.(error)
+        this.attachedResolve = undefined
+        this.attachedReject = undefined
+        this.socket.destroy()
     }
 
     private waitUntilAttached(timeoutMs: number): Promise<void> {
@@ -165,31 +174,26 @@ class ActorSessionConnection {
     }
 
     private bindSocket(): void {
-        this.socket.setEncoding("utf8")
-        this.socket.on("data", (chunk: string) => this.acceptChunk(chunk))
+        this.socket.on("data", (chunk: Buffer) => this.acceptChunk(chunk))
         this.socket.once("error", error => this.fail(error))
         this.socket.once("close", () => this.close())
     }
 
-    private acceptChunk(chunk: string): void {
-        this.buffer += chunk
-        let newline = this.buffer.indexOf("\n")
-        while (newline !== -1) {
-            const rawMessage = this.buffer.slice(0, newline)
-            this.buffer = this.buffer.slice(newline + 1)
-            void this.handle(rawMessage)
-            newline = this.buffer.indexOf("\n")
+    private acceptChunk(chunk: Buffer): void {
+        try {
+            for (const line of this.lines.accept(chunk)) void this.handle(line)
+        } catch (error) {
+            this.fail(sessionError(error))
         }
     }
 
-    private async handle(rawMessage: string): Promise<void> {
+    private async handle(line: unknown): Promise<void> {
         try {
-            const message = parseActorSessionServerMessage(rawMessage)
+            const message = parseActorSessionServerMessage(line)
             switch (message.type) {
                 case "attached":
-                    this.supervisor.assign(
+                    this.actor.assign(
                         message.actor,
-                        call => this.callDatabase(call),
                         call => this.callActor(call),
                         log =>
                             this.send({
@@ -205,26 +209,11 @@ class ActorSessionConnection {
                     this.attachedReject = undefined
                     break
                 case "command":
-                    await this.reply(
+                    this.reply(
                         message.message_id,
-                        await this.supervisor.handle(
-                            message.command,
-                            () => this.send({ type: "ready_for_invocation", message_id: message.message_id }),
-                            call => this.callDatabase(call, message.message_id),
-                            effects => this.publish(message.message_id, effects),
-                            query => this.getConnections(message.message_id, query)
-                        )
+                        await this.actor.handle(message.command, this.invocation(message.message_id))
                     )
                     break
-                case "database_result": {
-                    const pending = this.databaseCalls.get(message.call_id)
-                    if (pending === undefined)
-                        throw new ActorProtocolError("Rust host replied to unknown database call")
-                    this.databaseCalls.delete(message.call_id)
-                    if (message.result === undefined) pending.reject(new ActorSessionError(message.error!))
-                    else pending.resolve(message.result)
-                    break
-                }
                 case "actor_result": {
                     const pending = this.actorCalls.get(message.call_id)
                     if (pending === undefined) throw new ActorProtocolError("Rust host replied to unknown actor call")
@@ -253,29 +242,24 @@ class ActorSessionConnection {
         if (this.activityTimer) return
         const report = () => {
             try {
-                this.send({ type: "residency", resident: this.supervisor.isResident() })
+                this.send({ type: "residency", resident: this.actor.isResident() })
             } catch (error) {
                 this.fail(sessionError(error))
             }
         }
-        this.unsubscribeActivity = this.supervisor.onResidencyChange(report)
+        this.unsubscribeActivity = this.actor.onResidencyChange(report)
         report()
         this.activityTimer = setInterval(report, 1_000)
         this.activityTimer.unref()
     }
 
-    private callDatabase(call: DatabaseCall, messageId?: number): Promise<DatabaseResult> {
-        return new Promise((resolve, reject) => {
-            if (this.socket.destroyed) throw new ActorSessionError("Rust host disconnected before the database call")
-            const callId = ++this.nextDatabaseCallId
-            this.databaseCalls.set(callId, { resolve, reject })
-            try {
-                this.send({ type: "database_call", call_id: callId, message_id: messageId, call })
-            } catch (error) {
-                this.databaseCalls.delete(callId)
-                reject(sessionError(error))
-            }
-        })
+    private invocation(messageId: number): Invocation {
+        return {
+            id: messageId,
+            allowNext: () => this.send({ type: "ready_for_invocation", message_id: messageId }),
+            publish: effects => this.send({ type: "socket_effects", message_id: messageId }, detachEffects(effects)),
+            connections: query => this.getConnections(messageId, query)
+        }
     }
 
     private callActor(call: ActorCallRequest): Promise<JsonValue> {
@@ -290,10 +274,6 @@ class ActorSessionConnection {
                 reject(sessionError(error))
             }
         })
-    }
-
-    private publish(messageId: number, effects: readonly SocketEffect[]): void {
-        this.send({ type: "socket_effects", message_id: messageId, effects })
     }
 
     private getConnections(messageId: number, query?: SocketQuery): Promise<SocketLookup> {
@@ -311,27 +291,20 @@ class ActorSessionConnection {
     }
 
     private reply(messageId: number, reply: ActorExecutorReply): void {
-        this.send({ type: "reply", message_id: messageId, reply })
+        const { parts, ...head } = detachReply(reply)
+        this.send({ type: "reply", message_id: messageId, reply: head }, parts)
     }
 
-    private send(message: ActorSessionClientMessage): void {
-        this.socket.write(`${JSON.stringify(message)}\n`)
-    }
-
-    private fail(error: Error): void {
-        this.attachedReject?.(error)
-        this.attachedResolve = undefined
-        this.attachedReject = undefined
-        this.socket.destroy()
+    // The line announces the size of each part that follows it, in bytes of UTF-8.
+    private send(message: ActorSessionClientMessage, parts: readonly SessionPart[] = []): void {
+        const head = parts.length === 0 ? message : { ...message, parts: parts.map(partBytes) }
+        this.writer.write([`${JSON.stringify(head)}\n`, ...parts.flatMap(partTexts)])
     }
 
     private close(): void {
         clearInterval(this.activityTimer)
         this.unsubscribeActivity?.()
         this.unsubscribeActivity = undefined
-        for (const pending of this.databaseCalls.values())
-            pending.reject(new ActorSessionError("Rust host disconnected during a database call"))
-        this.databaseCalls.clear()
         for (const pending of this.actorCalls.values())
             pending.reject(new ActorSessionError("Rust host disconnected during an actor call"))
         this.actorCalls.clear()
@@ -363,8 +336,20 @@ function connectSocket(socketPath: string): Promise<Socket> {
     })
 }
 
+function partBytes(part: SessionPart): number {
+    return typeof part === "string" ? Buffer.byteLength(part) : part.byteLength
+}
+
+function partTexts(part: SessionPart): readonly SessionText[] {
+    return typeof part === "string" ? [part] : part.chunks
+}
+
 function sessionError(error: unknown): Error {
     return error instanceof Error ? error : new ActorSessionError(String(error))
+}
+
+function unavailableDatabase(): never {
+    throw new ActorSessionError("actor database is unavailable: the Rust host gave this process no database channel")
 }
 
 async function resolveActorEntrypoint(configured: string | undefined): Promise<string> {
@@ -397,7 +382,8 @@ function parseHostSettings(environment: NodeJS.ProcessEnv): ActorHostSettings {
     return {
         socketPath: result.data.DURABLE_ACTORS_EXECUTOR_SOCKET,
         actorEntrypoint: result.data.DURABLE_ACTORS_ENTRYPOINT,
-        startupTimeoutMs: parseStartupTimeout(environment.DURABLE_ACTORS_HOST_STARTUP_MS)
+        startupTimeoutMs: parseStartupTimeout(environment.DURABLE_ACTORS_HOST_STARTUP_MS),
+        databaseDescriptor: result.data.DURABLE_ACTORS_DATABASE_FD
     }
 }
 
@@ -413,7 +399,8 @@ const DEFAULT_ACTOR_STARTUP_TIMEOUT_MS = 10_000
 
 const actorSessionSettingsSchema = z.object({
     DURABLE_ACTORS_EXECUTOR_SOCKET: z.string().trim().min(1),
-    DURABLE_ACTORS_ENTRYPOINT: z.string().trim().min(1).optional()
+    DURABLE_ACTORS_ENTRYPOINT: z.string().trim().min(1).optional(),
+    DURABLE_ACTORS_DATABASE_FD: z.coerce.number().int().nonnegative().optional()
 })
 
 const DEFAULT_ACTOR_ENTRYPOINT = "dist/actors.mjs"

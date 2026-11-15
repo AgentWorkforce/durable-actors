@@ -75,6 +75,7 @@ rmcp = { version = "3.9.0", features = ["transport-streamable-http-server"] }
 tower = { version = "0.5", features = ["util"] }
 serde_urlencoded = "0.7"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+command-fds = { version = "0.3.3", features = ["tokio"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

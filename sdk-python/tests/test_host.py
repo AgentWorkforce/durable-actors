@@ -1,12 +1,9 @@
 import asyncio
 import json
 import os
-import sys
-import tempfile
-from pathlib import Path
 
 import pytest
-from fixtures.executor import ExecutorHost, build, warm_executor
+from fixtures.executor import build, executor, warm_executor
 from fixtures.host_database import HostDatabase
 
 from durable_actors.build import build_actor
@@ -125,6 +122,41 @@ class Counter(Actor):
             await host.residency(False)
 
 
+async def test_statements_reach_the_host_database_on_the_workers_own_connection(tmp_path):
+    entrypoint = build(
+        tmp_path,
+        "sqlite_actors",
+        """from durable_actors import Actor
+class Notes(Actor):
+    def add(self, text: str, attachment: str) -> None:
+        self.db.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text, file)")
+        self.db.exec("INSERT INTO notes (text, file) VALUES (?, ?)", text, attachment.encode())
+    def read(self) -> list[str]:
+        rows = self.db.exec("SELECT id, text, file FROM notes ORDER BY id")
+        return [f"{row['id']}:{row['text']}:{len(row['file'])}" for row in rows]
+    def duplicate(self) -> None:
+        self.db.exec("INSERT INTO notes (id) VALUES (1)")
+""",
+    )
+
+    async def invoke(message_id, method, *args):
+        command = {"type": "invoke", "request_id": method, "method": method, "args": list(args)}
+        host.send({"type": "command", "message_id": message_id, "command": command})
+        return (await host.receive())["reply"]
+
+    large = "\u00e9" * 200_000
+    async with warm_executor(entrypoint, {}) as host:
+        async with asyncio.timeout(10):
+            assert (await invoke(1, "add", large, "attached"))["type"] == "invoked"
+            assert (await invoke(2, "read"))["result"] == [f"1:{large}:8"]
+            failed = await invoke(3, "duplicate")
+            assert failed["code"] == "actor_method_failed"
+            assert "UNIQUE constraint failed" in failed["message"]
+            host.send({"type": "command", "message_id": 4, "command": {"type": "evict"}})
+            assert (await host.receive())["reply"] == {"type": "evicted"}
+            assert (await invoke(5, "read"))["result"] == [f"1:{large}:8"]
+
+
 @pytest.mark.parametrize("generic", [False, True])
 async def test_artifact_attaches_invokes_and_rehydrates_in_a_fresh_python_process(
     tmp_path, generic
@@ -141,73 +173,27 @@ class Counter(Actor):
     contract = build_actor(project, "actors.py", tmp_path / "build")
     assert contract["actors"][0]["actorName"] == "Counter"
     actor = {"project_id": "local", "actor_name": "Counter", "actor_id": "one"}
+    entrypoint = str(tmp_path / "build/actors.pyz")
+    increment = {"type": "invoke", "request_id": "r1", "method": "increment", "args": [2]}
     database = HostDatabase()
-    with tempfile.TemporaryDirectory(dir="/tmp") as short:
-        for expected in (2, 4):
-            done = asyncio.get_running_loop().create_future()
-
-            async def accepted(reader, writer):
-                host = ExecutorHost(reader, writer, database)
-                try:
-                    if generic:
-                        assert await host.receive() == {"type": "warm", "protocol": 32}
-                        host.send(
-                            {
-                                "type": "load",
-                                "entrypoint": str(tmp_path / "build/actors.pyz"),
-                                "environment": {},
-                            }
-                        )
-                    assert await host.receive() == {
-                        "type": "attach",
-                        "protocol": 32,
-                        "actor_names": ["Counter"],
-                    }
-                    host.send({"type": "attached", "protocol": 32, "actor": actor})
-                    host.send(
-                        {
-                            "type": "command",
-                            "message_id": 1,
-                            "command": {
-                                "type": "invoke",
-                                "request_id": "r1",
-                                "method": "increment",
-                                "args": [2],
-                            },
-                        }
-                    )
-                    reply = await host.receive()
-                    assert reply["reply"] == {"type": "invoked", "result": expected}
-                    assert database.fields() == {"count": expected}
-                    done.set_result(None)
-                except BaseException as error:
-                    done.set_exception(error)
-                finally:
-                    writer.close()
-
-            socket = str(Path(short) / "executor.sock")
-            server = await asyncio.start_unix_server(accepted, socket)
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "durable_actors.host",
-                *(["--generic"] if generic else []),
-                env={
-                    **os.environ,
-                    "DURABLE_ACTORS_EXECUTOR_SOCKET": socket,
-                    "DURABLE_ACTORS_ENTRYPOINT": str(tmp_path / "build/actors.pyz"),
-                },
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                await asyncio.wait_for(done, 10)
-            finally:
-                if process.returncode is None:
-                    process.terminate()
-                await process.communicate()
-                server.close()
-                await server.wait_closed()
+    for expected in (2, 4):
+        async with executor(
+            database, *(["--generic"] if generic else []), DURABLE_ACTORS_ENTRYPOINT=entrypoint
+        ) as (host, _):
+            async with asyncio.timeout(10):
+                if generic:
+                    assert await host.receive() == {"type": "warm", "protocol": 33}
+                    host.send({"type": "load", "entrypoint": entrypoint, "environment": {}})
+                assert await host.receive() == {
+                    "type": "attach",
+                    "protocol": 33,
+                    "actor_names": ["Counter"],
+                }
+                host.send({"type": "attached", "protocol": 33, "actor": actor})
+                host.send({"type": "command", "message_id": 1, "command": increment})
+                reply = await host.receive()
+                assert reply["reply"] == {"type": "invoked", "result": expected}
+                assert database.fields() == {"count": expected}
 
 
 @pytest.mark.parametrize("action", ["evict", "kill_host"])
@@ -228,35 +214,16 @@ class Counter(Actor):
         return self.count
 """)
     build_actor(project, "eviction_actors.py", tmp_path / "build")
-    connected = asyncio.get_running_loop().create_future()
-
-    async def accepted(reader, writer):
-        connected.set_result((reader, writer))
-
-    with tempfile.TemporaryDirectory(dir="/tmp") as short:
-        socket = str(Path(short) / "executor.sock")
-        server = await asyncio.start_unix_server(accepted, socket)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "durable_actors.host",
-            env={
-                **os.environ,
-                "DURABLE_ACTORS_EXECUTOR_SOCKET": socket,
-                "DURABLE_ACTORS_ENTRYPOINT": str(tmp_path / "build/actors.pyz"),
-            },
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        child_pid = None
+    child_pid = None
+    async with executor(
+        HostDatabase(), DURABLE_ACTORS_ENTRYPOINT=str(tmp_path / "build/actors.pyz")
+    ) as (host, process):
         try:
             async with asyncio.timeout(5):
-                reader, writer = await connected
-                host = ExecutorHost(reader, writer, HostDatabase())
                 receive, send = host.receive, host.send
                 assert (await receive())["type"] == "attach"
                 actor = {"project_id": "local", "actor_name": "Counter", "actor_id": "one"}
-                send({"type": "attached", "protocol": 32, "actor": actor})
+                send({"type": "attached", "protocol": 33, "actor": actor})
                 invocation = {
                     "type": "invoke",
                     "request_id": "r1",
@@ -316,12 +283,3 @@ class Counter(Actor):
                     os.kill(child_pid, 9)
                 except ProcessLookupError:
                     pass
-            if process.returncode is None:
-                process.terminate()
-            await asyncio.wait_for(process.communicate(), 2)
-            server.close()
-            if connected.done():
-                _, writer = connected.result()
-                writer.transport.abort()
-                await asyncio.wait_for(writer.wait_closed(), 1)
-            await server.wait_closed()

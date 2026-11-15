@@ -1,7 +1,7 @@
 import { z } from "zod"
 
 import { ActorProtocolError, ActorSerializationError, ActorValidationError } from "../errors.js"
-import { jsonValueSchema } from "../json.js"
+import { copyJsonValue, jsonValueSchema } from "../json.js"
 import type { JsonObject, JsonValue } from "../json.js"
 import type { SocketContract } from "../wire/contract.js"
 
@@ -78,19 +78,21 @@ function socketTags(tags: readonly string[], schemas: ActorSchemas = {}): string
     return result.data
 }
 
-function validateValue(value: unknown, label: string, schema?: z.ZodType, maximumBytes = Infinity): JsonValue {
-    let json: JsonValue
-    let bytes: number
-    try {
-        json = jsonValueSchema.parse(value)
-        bytes = Buffer.byteLength(JSON.stringify(json))
-    } catch (error) {
-        throw new ActorSerializationError(`${label} must be a JSON value`, { cause: error })
-    }
-    if (bytes > maximumBytes) throw new ActorValidationError(`${label} exceeds ${maximumBytes} bytes`)
+function validateValue(value: unknown, label: string, schema?: z.ZodType, maximumBytes?: number): JsonValue {
+    const json = jsonValue(value, label)
+    if (maximumBytes !== undefined && Buffer.byteLength(JSON.stringify(json)) > maximumBytes)
+        throw new ActorValidationError(`${label} exceeds ${maximumBytes} bytes`)
     const result = schema?.safeParse(json)
     if (result?.success === false) throw new ActorValidationError(`${label} is invalid: ${result.error.message}`)
     return json
+}
+
+function jsonValue(value: unknown, label: string): JsonValue {
+    try {
+        return copyJsonValue(value)
+    } catch (error) {
+        throw new ActorSerializationError(`${label} must be a JSON value`, { cause: error })
+    }
 }
 
 function isStateMessage(value: unknown): boolean {

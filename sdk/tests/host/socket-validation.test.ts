@@ -8,7 +8,8 @@ import { Persistence } from "../../src/actor/schema.js"
 import type { SocketConnection } from "../../src/actor/socketProtocol.js"
 import type { WebSocketEventCommand } from "../../src/host/protocol.js"
 import { ActorRuntime } from "../fixtures/actor-runtime.js"
-import { assertReply } from "../fixtures/reply.js"
+import { wireEffects } from "../fixtures/detached.js"
+import { assertReply, resultOf } from "../fixtures/reply.js"
 
 const metadata = z.object({ userId: z.string().min(1) })
 const incoming = z.object({ type: z.literal("post"), text: z.string().min(1) })
@@ -210,8 +211,8 @@ test("schema-validated tags persist and select broadcast recipients", async () =
     })
     assert.equal(reply.type, "invoked")
     if (reply.type !== "invoked") return
-    assert.deepEqual(reply.result, ["member"])
-    assert.deepEqual(reply.effects, [
+    assert.deepEqual(resultOf(reply), ["member"])
+    assert.deepEqual(wireEffects(reply.effects ?? []), [
         { type: "set_tags", connection_id: connection.id, tags: ["member"] },
         {
             type: "broadcast",

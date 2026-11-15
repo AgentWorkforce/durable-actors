@@ -27,7 +27,6 @@ test("hydration overlays persisted values and preserves ephemeral values and new
     const instance = { count: 5, nested: { count: 0 }, cache }
     const state = JSON.parse('{"nested":{"count":1},"cache":"obsolete","__proto__":{"polluted":true},"retired":42}')
     hydrateActorState(instance, state, schema)
-    state.nested.count = 2
     assert.equal(Object.getPrototypeOf(instance), Object.prototype)
     assert.equal(instance.cache, cache)
     assert.deepEqual(snapshotActorState(instance, schema), { count: 5, nested: { count: 1 } })

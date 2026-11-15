@@ -1,11 +1,12 @@
 mod database;
+mod database_channel;
 mod executor_connection;
 mod logs;
 mod protocol;
 mod socket;
 
 pub use self::{
-    database::{ActorDatabase, DatabaseCall, DatabaseResult, SqlValue},
+    database::{ActorDatabase, DatabaseCall, DatabaseResult, RowSink, SqlCell, SqlValue},
     executor_connection::{
         ActorExecutor, ActorInterleavedOutcome, ActorMethodInvocation, ActorMethodOutcome,
         ActorSocketConnection, ActorSocketEffect, ActorSocketEvent, ActorSocketInvocation,

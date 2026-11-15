@@ -1,4 +1,4 @@
-use crate::actor::{ActorDatabase, DatabaseCall, DatabaseResult};
+use crate::actor::{ActorDatabase, DatabaseCall, DatabaseResult, RowSink};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ pub struct UnusedDatabase;
 
 #[async_trait]
 impl ActorDatabase for UnusedDatabase {
-    async fn call(&self, _: DatabaseCall) -> Result<DatabaseResult> {
+    async fn call(&self, _: DatabaseCall, _: Box<dyn RowSink>) -> Result<DatabaseResult> {
         anyhow::bail!("unexpected database call in test")
     }
 }
@@ -25,7 +25,7 @@ pub struct DelayedDatabase {
 
 #[async_trait]
 impl ActorDatabase for DelayedDatabase {
-    async fn call(&self, call: DatabaseCall) -> Result<DatabaseResult> {
+    async fn call(&self, call: DatabaseCall, _: Box<dyn RowSink>) -> Result<DatabaseResult> {
         self.requested.send(call)?;
         self.release.acquire().await?.forget();
         anyhow::ensure!(!self.fail, "storage rejected immediate write");

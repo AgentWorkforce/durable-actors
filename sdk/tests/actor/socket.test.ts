@@ -2,8 +2,8 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { actorConnections, decodeSocketMessage, runWithActorSockets } from "../../src/actor/socket.js"
-import { parseSocketEffects } from "../../src/actor/socketProtocol.js"
 import { ActorProtocolError, ActorSerializationError } from "../../src/errors.js"
+import { wireEffects } from "../fixtures/detached.js"
 
 test("ordinary invocations and broadcasts do not enumerate connections", async () => {
     let lookups = 0
@@ -64,7 +64,7 @@ test("broadcast tag matching modes survive socket transport", async () => {
             }
         },
         async effects => {
-            published.push(...parseSocketEffects(effects))
+            published.push(...wireEffects(effects))
         }
     )
     assert.deepEqual(
@@ -84,19 +84,6 @@ test("invalid broadcast tag matching modes fail before publishing", async () => 
         assert.throws(() => scope.broadcast({}, { tagMatch: "either" as never }), ActorProtocolError)
     })
     assert.deepEqual(result.effects, [])
-    assert.throws(
-        () =>
-            parseSocketEffects([
-                {
-                    type: "broadcast",
-                    message: { type: "text", data: "{}" },
-                    except_connection_ids: [],
-                    tags: [],
-                    tag_match: "either"
-                }
-            ]),
-        ActorProtocolError
-    )
 })
 
 test("actor sends and broadcasts snapshot JSON values without caller serialization", async () => {
@@ -107,7 +94,7 @@ test("actor sends and broadcasts snapshot JSON values without caller serializati
         message.payload.text = "changed"
     })
     const encoded = { type: "text", data: '{"type":"delta","payload":{"text":"hello","flags":[true,null,3]}}' }
-    assert.deepEqual(result.effects, [
+    assert.deepEqual(wireEffects(result.effects), [
         { type: "send", connection_id: "socket-1", message: encoded },
         { type: "broadcast", message: encoded, except_connection_ids: [], tags: ["members"] }
     ])
@@ -126,7 +113,7 @@ test("invalid actor messages fail before queuing socket output", async () => {
     circular.self = circular
     const result = await runWithActorSockets({}, [{ id: "socket-1", metadata: {}, tags: [] }], async scope => {
         const socket = scope.connection("socket-1")
-        for (const value of [undefined, 1n, circular]) {
+        for (const value of [undefined, 1n, circular, { text: "x".repeat(100_000), circular }]) {
             assert.throws(() => socket.send(value as never), ActorSerializationError)
         }
         assert.throws(() => socket.send(new Uint8Array([1]) as never), ActorProtocolError)
@@ -170,7 +157,7 @@ test("automatic heartbeat responses are transported and can be cleared", async (
         scope.setWebSocketAutoResponse()
         assert.throws(() => scope.setWebSocketAutoResponse({ request: "x".repeat(2049), response: "pong" }), /2048/)
     })
-    assert.deepEqual(parseSocketEffects(result.effects), [
+    assert.deepEqual(wireEffects(result.effects), [
         { type: "set_auto_response", request: "ping", response: "pong" },
         { type: "set_auto_response", request: null, response: null }
     ])

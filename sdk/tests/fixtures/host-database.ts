@@ -2,8 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { createRequire } from "node:module"
 import { join } from "node:path"
 
-import type { DatabaseCall, DatabaseResult, DatabaseValue } from "../../src/host/database.js"
+import type { DatabaseCall, DatabaseResult } from "../../src/host/database.js"
 import type { JsonObject, JsonValue } from "../../src/json.js"
+import type { JsonText } from "../../src/payload/json-text.js"
 
 type Binding = null | bigint | number | string | Uint8Array
 
@@ -50,10 +51,8 @@ export class HostDatabase {
 
     static with(fields: JsonObject): HostDatabase {
         const database = new HostDatabase()
-        database.call({ op: "replace_fields", fields })
-        database.call({ op: "commit" })
-        database.calls.length = 0
-        database.commits = 0
+        for (const [name, value] of Object.entries(fields)) database.persist(name, JSON.stringify(value))
+        database.synced = database.changeToken()
         return database
     }
 
@@ -67,30 +66,23 @@ export class HostDatabase {
         switch (call.op) {
             case "exec":
                 return this.write(
-                    () => this.exec(call.sql, call.bindings.map(decode)),
+                    () => this.exec(call.sql, call.bindings.map(bound)),
                     /^\s*rollback(?:\s*;)?\s*$/i.test(call.sql)
                 )
             case "fields":
                 return { type: "fields", fields: this.fields() }
             case "initialize_fields":
                 return this.write(() => {
-                    for (const [name, value] of Object.entries(call.fields))
+                    for (const [name, value] of call.fields)
                         this.connection
                             .prepare("INSERT INTO __terse_fields VALUES (?, ?) ON CONFLICT(name) DO NOTHING")
-                            .run(name, JSON.stringify(value))
+                            .run(name, jsonString(value))
                 })
             case "persist_field":
-                return this.write(() => this.persist(call.name, call.value))
+                return this.write(() => this.persist(call.name, jsonString(call.value)))
             case "delete_field":
                 return this.write(() => {
                     this.connection.prepare("DELETE FROM __terse_fields WHERE name = ?").run(call.name)
-                })
-            case "replace_fields":
-                return this.write(() => {
-                    for (const [name, value] of Object.entries(call.fields)) this.persist(name, value)
-                    for (const name of Object.keys(this.fields()))
-                        if (!Object.hasOwn(call.fields, name))
-                            this.connection.prepare("DELETE FROM __terse_fields WHERE name = ?").run(name)
                 })
             case "alarm":
                 return this.write(() => this.alarm())
@@ -144,15 +136,15 @@ export class HostDatabase {
 
     private exec(sql: string, bindings: Binding[]): DatabaseResult {
         const { columns, rows } = positionalRows(this.connection.prepare(sql), bindings)
-        return { type: "rows", columns, rows: rows.map(row => row.map(encode)) }
+        return { type: "rows", columns, rows: rows.map(row => row.map(read)) }
     }
 
-    private persist(name: string, value: JsonValue): void {
+    private persist(name: string, json: string): void {
         this.connection
             .prepare(
                 "INSERT INTO __terse_fields VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value WHERE value <> excluded.value"
             )
-            .run(name, JSON.stringify(value))
+            .run(name, json)
     }
 
     private alarm(): DatabaseResult {
@@ -197,27 +189,21 @@ export class HostDatabase {
     }
 }
 
-function decode(value: DatabaseValue): Binding {
-    switch (value.type) {
-        case "null":
-            return null
-        case "integer":
-            return BigInt(value.value)
-        case "real":
-        case "text":
-            return value.value
-        case "blob":
-            return new Uint8Array(Buffer.from(value.value, "base64"))
-    }
+/** The JSON a field was sent as, which the host stores as it is. */
+export function jsonString(text: JsonText): string {
+    return Buffer.concat(text.chunks).toString()
 }
 
-function encode(value: Binding): DatabaseValue {
-    if (value === null) return { type: "null" }
-    if (typeof value === "bigint") return { type: "integer", value: value.toString() }
-    if (typeof value === "number")
-        return Number.isInteger(value) ? { type: "integer", value: value.toString() } : { type: "real", value }
-    if (typeof value === "string") return { type: "text", value }
-    return { type: "blob", value: Buffer.from(value).toString("base64") }
+// The connection reads every integer as a bigint, and binds a number as a real. A whole number is an integer
+// to the Rust host when 64 bits hold it.
+function bound(value: Binding): Binding {
+    const integer = typeof value === "number" && Number.isInteger(value) && value >= -(2 ** 63) && value < 2 ** 63
+    return integer ? BigInt(value) : value
+}
+
+// An integer reaches the actor as the Rust host sends it: a number when a number holds it exactly.
+function read(value: Binding): Binding {
+    return typeof value === "bigint" && Number.isSafeInteger(Number(value)) ? Number(value) : value
 }
 
 function positionalRows(statement: Statement, bindings: Binding[]): { columns: string[]; rows: Binding[][] } {

@@ -138,7 +138,7 @@ async fn live_checkpoint_inputs_are_read_as_one_bounded_range() -> Result<()> {
     let (writer, _) = controlled(&f, 16 * 1024 * 1024, 60_000)?;
     let (replication, history) = write_history(&f, &writer, 31).await?;
     let sqlite = writer
-        .restore(&f.stream.object(31), history[30].clone())
+        .restore_prefetched(&f.stream.object(31), history[30].clone(), None)
         .await?;
     assert_eq!(
         crate::litestream::storage::restored_fields(
@@ -187,7 +187,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
 
     let (reader, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
     let sqlite = reader
-        .restore(&f.stream.object(35), history[34].clone())
+        .restore_prefetched(&f.stream.object(35), history[34].clone(), None)
         .await?;
     assert_eq!(archive.read_requests.load(Ordering::SeqCst), 1);
     let source = f.stream.snapshot(&history[34])?;
@@ -247,7 +247,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     archive.read_batches.store(0, Ordering::SeqCst);
     archive.range_bytes.store(0, Ordering::SeqCst);
     let tail = reader
-        .restore(&f.stream.object(34), history[33].clone())
+        .restore_prefetched(&f.stream.object(34), history[33].clone(), None)
         .await?;
     assert_eq!(tail.files.len(), 3);
     assert_eq!(archive.read_batches.load(Ordering::SeqCst), 1);
@@ -261,7 +261,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     );
     archive.read_batches.store(0, Ordering::SeqCst);
     let older = reader
-        .restore(&f.stream.object(31), history[30].clone())
+        .restore_prefetched(&f.stream.object(31), history[30].clone(), None)
         .await?;
     assert_eq!(
         restored_fields(replication.as_ref(), &older.files, older.txid).await?,
@@ -301,7 +301,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     );
     assert!(
         reader
-            .restore(&f.stream.object(35), history[34].clone())
+            .restore_prefetched(&f.stream.object(35), history[34].clone(), None)
             .await
             .is_err()
     );
@@ -329,7 +329,7 @@ async fn failed_checkpoint_publication_keeps_committed_state_recoverable() -> Re
             Some(history[1].clone())
         );
         let sqlite = reader
-            .restore(&f.stream.object(2), history[1].clone())
+            .restore_prefetched(&f.stream.object(2), history[1].clone(), None)
             .await?;
         assert_eq!(
             crate::litestream::storage::restored_fields(
@@ -373,7 +373,7 @@ async fn resumed_checkpoint_retries_without_new_writes() -> Result<()> {
     };
     resumed.start(&stream).await?;
     resumed
-        .restore(&f.stream.object(33), history[32].clone())
+        .restore_prefetched(&f.stream.object(33), history[32].clone(), None)
         .await?;
     tokio::time::timeout(Duration::from_secs(2), async {
         while archive.checkpoint_attempts.load(Ordering::SeqCst) == 0 {

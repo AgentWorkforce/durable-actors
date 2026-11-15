@@ -5,7 +5,7 @@ import { test } from "node:test"
 
 import type { ActorConnection } from "../../src/actor/socket.js"
 import { RemoteActorClient } from "../../src/client/remoteClient.js"
-import { ActorInvocationError, ActorProtocolError } from "../../src/errors.js"
+import { ActorInvocationError } from "../../src/errors.js"
 
 const target = {
     route: "https://host.example.com",

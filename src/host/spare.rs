@@ -48,10 +48,10 @@ pub async fn serve_spare(shutdown: impl Future<Output = ()> + Send + 'static) ->
         .unwrap_or_else(|_| "/tmp/durable-actors-spare-ready".into());
     let bind = std::env::var("DURABLE_ACTORS_HOST_BIND").unwrap_or_else(|_| "0.0.0.0:7101".into());
     let listener = TcpListener::bind(bind).await?;
-    let ipc = ActorExecutorListener::bind(&socket).await?;
+    let mut ipc = ActorExecutorListener::bind(&socket).await?;
     let configured_runtime = std::env::var("DURABLE_ACTORS_EXECUTOR_RUNTIME").ok();
     let runtime = executor_runtime(None, configured_runtime.as_deref())?;
-    let mut javascript = spawn_executor_process(true, &socket, runtime)?;
+    let mut javascript = spawn_executor_process(true, &mut ipc, runtime)?;
     let (warmed, control_plane, node_cache) = tokio::join!(
         async {
             tokio::try_join!(

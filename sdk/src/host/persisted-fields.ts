@@ -2,7 +2,6 @@ import { actorContext } from "../actor/actor.js"
 import type { RuntimeActorContext } from "../actor/context.js"
 import { Persistence } from "../actor/schema.js"
 import type { ActorSchema } from "../actor/schema.js"
-import { cloneJsonObject } from "../json.js"
 
 import type { DatabaseProxy } from "./database.js"
 
@@ -21,8 +20,7 @@ function bindPersistedFields(
             get: () => value,
             set: next => {
                 context.assertAccess()
-                const state = cloneJsonObject({ [field.name]: next }, "actor state")
-                database.persistField(field.name, state[field.name])
+                database.persistField(field.name, next)
                 value = next
             }
         }

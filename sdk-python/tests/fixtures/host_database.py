@@ -1,7 +1,7 @@
-import base64
 import json
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 
 _directories = []
@@ -16,6 +16,7 @@ class HostDatabase:
         path = Path(directory.name) / "actor.sqlite"
         self.calls = []
         self.commits = 0
+        self.answering = threading.Lock()
         self.connection = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute(
@@ -31,30 +32,34 @@ class HostDatabase:
     @classmethod
     def seeded(cls, fields):
         database = cls()
-        database.write(False, lambda: database.replace(fields))
+        for name, value in fields.items():
+            database.persist(name, value)
         database.commit()
         database.commits = 0
         return database
 
-    async def call(self, call):
+    def call(self, call):
+        """Answers one call at a time, as a database channel does."""
+        with self.answering:
+            return self.answer(call)
+
+    def answer(self, call):
         self.calls.append(call)
         op = call["op"]
         if op == "exec":
-            return self.write(call["immediate"], lambda: self.exec(call["sql"], call["bindings"]))
+            return self.write(lambda: self.exec(call["sql"], call["bindings"]))
         if op == "fields":
             return {"type": "fields", "fields": self.fields()}
         if op == "alarm":
             return {"type": "alarm", "timestamp_ms": self.alarm()}
         if op == "set_alarm":
-            return self.write(call["immediate"], lambda: self.update_alarm(call["timestamp_ms"]))
+            return self.write(lambda: self.update_alarm(call["timestamp_ms"]))
         if op == "delete_alarm":
-            return self.write(call["immediate"], lambda: self.update_alarm(None))
-        if op == "replace_fields":
-            return self.write(False, lambda: self.replace(call["fields"]))
+            return self.write(lambda: self.update_alarm(None))
         if op == "persist_field":
-            return self.write(call["immediate"], lambda: self.persist(call["name"], call["value"]))
+            return self.write(lambda: self.persist(call["name"], call["value"]))
         if op == "delete_field":
-            return self.write(call["immediate"], lambda: self.delete(call["name"]))
+            return self.write(lambda: self.delete(call["name"]))
         if op == "commit":
             self.commit()
             return {"type": "done"}
@@ -89,31 +94,20 @@ class HostDatabase:
             self.connection.rollback()
         self.connection.close()
 
-    def write(self, immediate, operation):
+    def write(self, operation):
         result = operation() or {"type": "done"}
         if not self.connection.in_transaction:
             self.commit()
         return result
 
     def exec(self, sql, bindings):
-        cursor = self.connection.execute(sql, [decode(value) for value in bindings])
+        cursor = self.connection.execute(sql, bindings)
         columns = [column[0] for column in cursor.description or []]
         return {
             "type": "rows",
             "columns": columns,
-            "rows": [[encode(value) for value in row] for row in cursor.fetchall()],
+            "rows": [list(row) for row in cursor.fetchall()],
         }
-
-    def replace(self, fields):
-        self.connection.executemany(
-            "INSERT INTO __terse_fields VALUES (?, ?) "
-            "ON CONFLICT(name) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",
-            [(name, json.dumps(value, separators=(",", ":"))) for name, value in fields.items()],
-        )
-        self.connection.execute(
-            "DELETE FROM __terse_fields WHERE name NOT IN (SELECT value FROM json_each(?))",
-            (json.dumps(list(fields)),),
-        )
 
     def persist(self, name, value):
         self.connection.execute(
@@ -139,26 +133,3 @@ class HostDatabase:
             self.connection.execute("PRAGMA schema_version").fetchone()[0],
             self.connection.execute("PRAGMA user_version").fetchone()[0],
         )
-
-
-def decode(value):
-    kind = value["type"]
-    if kind == "null":
-        return None
-    if kind == "integer":
-        return int(value["value"])
-    if kind == "blob":
-        return base64.b64decode(value["value"])
-    return value["value"]
-
-
-def encode(value):
-    if value is None:
-        return {"type": "null"}
-    if isinstance(value, int):
-        return {"type": "integer", "value": str(value)}
-    if isinstance(value, float):
-        return {"type": "real", "value": value}
-    if isinstance(value, bytes):
-        return {"type": "blob", "value": base64.b64encode(value).decode()}
-    return {"type": "text", "value": value}
