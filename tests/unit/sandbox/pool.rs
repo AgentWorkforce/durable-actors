@@ -51,7 +51,7 @@ async fn platform_spares_follow_current_images_while_custom_spares_remain_pinned
         custom.image_ref = "im-custom".into();
         registry.register_test_deployment(&platform).await?;
         registry.register_test_deployment(&custom).await?;
-        let old_key = pool.key("im-a", "region");
+        let old_key = pool.key("im-a", "region", &ResourceLimits::default());
         let old_name = reserve(&pool.store, &old_key, 1).await?.unwrap();
         let handle = SpareHandle { node: String::new(),
             name: old_name,
@@ -64,16 +64,16 @@ async fn platform_spares_follow_current_images_while_custom_spares_remain_pinned
         pool.store.publish(&old_key, &handle, 600).await?;
         let builds = pool.reconcile(&registry).await?;
         let images: std::collections::BTreeSet<_> =
-            builds.iter().map(|build| build.image.as_str()).collect();
+            builds.iter().map(|build| build.target.image.as_str()).collect();
         assert_eq!(images, ["im-b", "im-custom"].into_iter().collect());
         assert_eq!(pool.store.retiring().await?, [handle.clone()]);
         for build in builds {
             pool.store
                 .publish(
-                    &build.key,
+                    &build.target.key,
                     &SpareHandle { node: String::new(),
                         name: build.name,
-                        resource_id: build.image,
+                        resource_id: build.target.image,
                         ..handle.clone()
                     },
                     600,
@@ -81,14 +81,14 @@ async fn platform_spares_follow_current_images_while_custom_spares_remain_pinned
                 .await?;
         }
         assert_eq!(
-            pool.claim(&platform, "region", "platform-host", &pool.config.resources, None)
+            pool.claim(&platform, "region", "platform-host", &ResourceLimits::default(), None)
                 .await?
                 .unwrap()
                 .resource_id,
             "im-b"
         );
         assert_eq!(
-            pool.claim(&custom, "region", "custom-host", &pool.config.resources, None)
+            pool.claim(&custom, "region", "custom-host", &ResourceLimits::default(), None)
                 .await?
                 .unwrap()
                 .resource_id,
@@ -107,13 +107,13 @@ async fn custom_resources_cannot_claim_default_sized_spares() -> Result<()> {
         let spec: HostLaunchSpec = serde_json::from_value(serde_json::json!({
             "projectId":"default","organizationId":"org-test","imageRef":"im-runtime","codeSnapshot":crate::sandbox::testing::code_artifact(1),"workingDirectory":"/customer","secretRefs":[]
         }))?;
-        let key = pool.key("im-runtime", "canada");
+        let key = pool.key("im-runtime", "canada", &ResourceLimits::default());
         let name = reserve(&pool.store, &key, 1).await?.unwrap();
         let spare = SpareHandle { node: String::new(),name, resource_id:"sb-test".into(), route:"https://host.test".into(), canonical_region:"canada".into(), control_route:String::new(), control_token:String::new()};
         pool.store.publish(&key, &spare, 600).await?;
         let larger = ResourceLimits {cpu_millis:2000, cpu_limit_millis:None, memory_mib:4096, memory_limit_mib:Some(4096)};
         assert!(pool.claim(&spec, "canada", "custom", &larger, None).await?.is_none());
-        assert!(pool.claim(&spec, "canada", "default", &pool.config.resources, None).await?.is_some());
+        assert!(pool.claim(&spec, "canada", "default", &ResourceLimits::default(), None).await?.is_some());
         Ok(())
     }).await
 }
@@ -326,7 +326,7 @@ async fn reconciliation_keeps_spares_for_every_project_runtime() -> Result<()> {
                     secret_refs: vec![],
                 })
                 .await?;
-            let key = pool.key(image, "region");
+            let key = pool.key(image, "region", &ResourceLimits::default());
             let name = reserve(&pool.store, &key, 1).await?.unwrap();
             pool.store
                 .publish(
@@ -368,7 +368,6 @@ fn config(idle: u32) -> PoolConfig {
         otlp_endpoint: None,
         control_plane_url: None,
         kind: SpareKind::Actor,
-        idle,
         fleet_maximum: 64,
         max_starting: 8,
         idle_ttl_seconds: 600,
@@ -377,13 +376,16 @@ fn config(idle: u32) -> PoolConfig {
         reap_interval: Duration::from_secs(30),
         pod_reap_interval: Duration::from_secs(1),
         regions: vec!["region".into()],
-        resources: ResourceLimits::default(),
+        tiers: vec![PoolTier {
+            resources: ResourceLimits::default(),
+            idle,
+        }],
     }
 }
 
 pub(super) async fn reserve(store: &PoolStore, key: &str, target: u32) -> Result<Option<String>> {
     Ok(store
-        .replenish(key, &config(target), 1)
+        .replenish(key, target, &config(target), 1)
         .await?
         .into_iter()
         .next())
@@ -391,6 +393,9 @@ pub(super) async fn reserve(store: &PoolStore, key: &str, target: u32) -> Result
 
 #[path = "pool_replenishment.rs"]
 mod replenishment;
+
+#[path = "pool_tiers.rs"]
+mod tiers;
 
 #[test]
 fn housekeeping_health_follows_the_loop_heartbeat() -> Result<()> {

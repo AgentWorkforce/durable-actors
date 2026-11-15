@@ -38,7 +38,7 @@ When upgrading from the shared image configuration, replace `image.repository` a
 - The sandbox namespace defaults to `<release-namespace>-<release-name>`; use one unique sandbox namespace per installation.
 - gVisor, separate sandbox credentials, RBAC, and sandbox NetworkPolicy are included.
 
-A single controller can interrupt service during replacement; clients must reconnect WebSockets. Increase `replicaCount` for controller redundancy; more than one controller requires Redis (`redis.urlSecretKey`). Increase `actors.warm` to reduce cold starts. The warm count is per image/region and supports 0–256. It does not cap active actors. Node autoscaling and quotas must accommodate your active workload.
+A single controller can interrupt service during replacement; clients must reconnect WebSockets. Increase `replicaCount` for controller redundancy; more than one controller requires Redis (`redis.urlSecretKey`). Increase `actors.warm` to reduce cold starts. The warm count is per image/region and supports 0–256. To also keep spares for larger actors, set `actors.tiers` instead: each tier lists its requests, limits and its own `warm` count, all required, and an actor starts on a spare only when its requests and limits equal a tier. An actor that sets only `memoryMiB: 512` keeps the default CPU and CPU limit, so with the chart defaults its tier is `{cpuMillis: 250, cpuLimitMillis: null, memoryMiB: 512, memoryLimitMiB: 512, warm: 1}`. Tiers share the 256-spare budget. It does not cap active actors. Node autoscaling and quotas must accommodate your active workload.
 
 ## Rapid writes
 

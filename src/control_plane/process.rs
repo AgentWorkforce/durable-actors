@@ -102,6 +102,7 @@ impl RuntimeImages {
 pub struct SandboxProviderConfig {
     pub runtime_images: RuntimeImages,
     pub(super) pool: crate::sandbox::pool::PoolConfig,
+    pub(super) default_resources: crate::sandbox::ResourceLimits,
     pub(crate) backend: SandboxBackend,
     pub(crate) secret_namespace: String,
     pub(crate) public_origin: String,
@@ -417,6 +418,7 @@ async fn sandbox_provisioner(
     )
     .with_runtime_access(access)
     .with_pool(pool)
+    .with_default_resources(config.default_resources)
     .with_resource_bounds(config.resource_bounds))
 }
 
@@ -810,12 +812,9 @@ fn sandbox_provider_config(
         &required(get, "DURABLE_ACTORS_CONTROL_PLANE_URL")?,
         "DURABLE_ACTORS_CONTROL_PLANE_URL",
     )?;
-    let idle = pool_number(get, "DURABLE_ACTORS_SPARE_IDLE", 64, 0, u32::MAX)?;
+    let default_resources = host_resources(get)?;
     let fleet_maximum = pool_number(get, "DURABLE_ACTORS_SPARE_FLEET_MAX", 256, 0, u32::MAX)?;
-    ensure!(
-        idle <= fleet_maximum,
-        "DURABLE_ACTORS_SPARE_IDLE must not exceed DURABLE_ACTORS_SPARE_FLEET_MAX"
-    );
+    let tiers = pool_tiers(get, &default_resources, fleet_maximum)?;
     let (backend, regions) = sandbox_backend(get, &control_plane_url)?;
     let otlp_endpoint = get("DURABLE_ACTORS_OTLP_ENDPOINT")
         .filter(|endpoint| !endpoint.is_empty())
@@ -830,7 +829,6 @@ fn sandbox_provider_config(
             control_plane_url: Some(control_plane_url.clone()),
             otlp_endpoint: otlp_endpoint.clone(),
             kind: crate::sandbox::SpareKind::Actor,
-            idle,
             fleet_maximum,
             max_starting: pool_number(get, "DURABLE_ACTORS_SPARE_MAX_STARTING", 32, 1, u32::MAX)?,
             idle_ttl_seconds: pool_number(get, "DURABLE_ACTORS_SPARE_TTL_SECONDS", 600, 30, 3600)?,
@@ -872,8 +870,9 @@ fn sandbox_provider_config(
                 .into(),
             ),
             regions,
-            resources: host_resources(get)?,
+            tiers,
         },
+        default_resources,
         backend,
         secret_namespace: get("DURABLE_ACTORS_GKE_NAMESPACE")
             .unwrap_or_else(|| "terse-sandboxes".into()),
@@ -1083,6 +1082,97 @@ fn host_resources(
         memory_mib,
         memory_limit_mib: Some(memory_limit_mib),
     })
+}
+
+/// `DURABLE_ACTORS_SPARE_TIERS` lists every spare size. Without it, one tier of the default actor
+/// size keeps `DURABLE_ACTORS_SPARE_IDLE` spares.
+fn pool_tiers(
+    get: &mut impl FnMut(&str) -> Option<String>,
+    default_resources: &crate::sandbox::ResourceLimits,
+    fleet_maximum: u32,
+) -> Result<Vec<crate::sandbox::pool::PoolTier>> {
+    let tiers = match get("DURABLE_ACTORS_SPARE_TIERS") {
+        Some(tiers) => {
+            ensure!(
+                get("DURABLE_ACTORS_SPARE_IDLE").is_none(),
+                "configure DURABLE_ACTORS_SPARE_IDLE or DURABLE_ACTORS_SPARE_TIERS, not both"
+            );
+            spare_tiers(&tiers)?
+        }
+        None => vec![crate::sandbox::pool::PoolTier {
+            resources: default_resources.clone(),
+            idle: pool_number(get, "DURABLE_ACTORS_SPARE_IDLE", 64, 0, u32::MAX)?,
+        }],
+    };
+    let idle = tiers
+        .iter()
+        .try_fold(0u32, |idle, tier| idle.checked_add(tier.idle));
+    ensure!(
+        idle.is_some_and(|idle| idle <= fleet_maximum),
+        "ready spares across all tiers must not exceed DURABLE_ACTORS_SPARE_FLEET_MAX"
+    );
+    Ok(tiers)
+}
+
+fn spare_tiers(value: &str) -> Result<Vec<crate::sandbox::pool::PoolTier>> {
+    let configured: Vec<SpareTier> =
+        serde_json::from_str(value).context("invalid DURABLE_ACTORS_SPARE_TIERS")?;
+    ensure!(
+        !configured.is_empty(),
+        "DURABLE_ACTORS_SPARE_TIERS requires at least one tier"
+    );
+    let mut tiers = Vec::<crate::sandbox::pool::PoolTier>::new();
+    for tier in configured {
+        let tier = tier.validated()?;
+        ensure!(
+            tiers.iter().all(|other| other.resources != tier.resources),
+            "DURABLE_ACTORS_SPARE_TIERS repeats a size"
+        );
+        tiers.push(tier);
+    }
+    Ok(tiers)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpareTier {
+    cpu_millis: u32,
+    // `deserialize_with` makes serde require the key, so leaving CPU uncapped takes an explicit
+    // `null`.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    cpu_limit_millis: Option<u32>,
+    #[serde(rename = "memoryMiB")]
+    memory_mib: u32,
+    #[serde(rename = "memoryLimitMiB")]
+    memory_limit_mib: u32,
+    warm: u32,
+}
+
+impl SpareTier {
+    fn validated(self) -> Result<crate::sandbox::pool::PoolTier> {
+        ensure!(
+            self.cpu_millis > 0 && self.memory_mib > 0,
+            "DURABLE_ACTORS_SPARE_TIERS requires positive cpuMillis and memoryMiB"
+        );
+        ensure!(
+            self.cpu_limit_millis
+                .is_none_or(|limit| limit >= self.cpu_millis),
+            "DURABLE_ACTORS_SPARE_TIERS cpuLimitMillis must be at least cpuMillis"
+        );
+        ensure!(
+            self.memory_limit_mib >= self.memory_mib,
+            "DURABLE_ACTORS_SPARE_TIERS memoryLimitMiB must be at least memoryMiB"
+        );
+        Ok(crate::sandbox::pool::PoolTier {
+            resources: crate::sandbox::ResourceLimits {
+                cpu_millis: self.cpu_millis,
+                cpu_limit_millis: self.cpu_limit_millis,
+                memory_mib: self.memory_mib,
+                memory_limit_mib: Some(self.memory_limit_mib),
+            },
+            idle: self.warm,
+        })
+    }
 }
 
 fn resource_bounds(

@@ -17,7 +17,14 @@ ingress:
   annotations: {}
 replicaCount: 1
 actors:
+  # Ready spares of the default actor size per image and region. Leave at 0 when tiers are set.
   warm: 0
+  # Spare sizes, replacing `warm`: each tier keeps `warm` ready spares per image and region for
+  # actors whose requests and limits equal it. Every field is required; a null cpuLimitMillis
+  # leaves CPU uncapped. For example:
+  #   - {cpuMillis: 250, cpuLimitMillis: null, memoryMiB: 256, memoryLimitMiB: 256, warm: 2}
+  #   - {cpuMillis: 250, cpuLimitMillis: null, memoryMiB: 512, memoryLimitMiB: 512, warm: 1}
+  tiers: []
   # Spares starting at once across controllers, and how often each controller refills pools.
   maxStarting: 32
   refillIntervalMs: 1000
@@ -26,6 +33,7 @@ actors:
   podReapIntervalMs: 1000
   reapConcurrency: 64
   registryReapIntervalMs: 2000
+  # The default actor size: what an actor gets for each resource its @Compute leaves unset.
   cpuMillis: 250
   # Unset leaves actor CPU uncapped.
   cpuLimitMillis: null

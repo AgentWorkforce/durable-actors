@@ -32,9 +32,9 @@ async fn fixed_capacity_is_replenished_after_claims_across_controllers() -> Resu
             }
         }
         let config = config(5);
-        let names = second.replenish("busy", &config, 32).await?;
+        let names = second.replenish("busy", 5, &config, 32).await?;
         assert_eq!(names.len(), 5);
-        assert!(first.replenish("busy", &config, 32).await?.is_empty());
+        assert!(first.replenish("busy", 5, &config, 32).await?.is_empty());
         for name in names {
             first.publish("busy", &handle(name), 600).await?;
         }
@@ -47,8 +47,8 @@ async fn fixed_capacity_is_replenished_after_claims_across_controllers() -> Resu
             );
         }
         let (first, second) = tokio::try_join!(
-            first.replenish("busy", &config, 32),
-            second.replenish("busy", &config, 32)
+            first.replenish("busy", 5, &config, 32),
+            second.replenish("busy", 5, &config, 32)
         )?;
         assert_eq!(first.len() + second.len(), 3);
         Ok(())
@@ -66,8 +66,8 @@ async fn fleet_capacity_and_build_limits_are_atomic_across_pools() -> Result<()>
         config.fleet_maximum = 3;
         config.max_starting = 2;
         let (actors, others) = tokio::try_join!(
-            actor.replenish("actors", &config, 8),
-            other.replenish("others", &config, 8)
+            actor.replenish("actors", 3, &config, 8),
+            other.replenish("others", 3, &config, 8)
         )?;
         assert_eq!(actors.len() + others.len(), 2);
         let (store, key, name) = match actors.first() {
@@ -76,12 +76,12 @@ async fn fleet_capacity_and_build_limits_are_atomic_across_pools() -> Result<()>
         };
         assert!(store.publish(key, &handle(name.clone()), 600).await?);
         let (actors, others) = tokio::try_join!(
-            actor.replenish("actors", &config, 8),
-            other.replenish("others", &config, 8)
+            actor.replenish("actors", 3, &config, 8),
+            other.replenish("others", 3, &config, 8)
         )?;
         assert_eq!(actors.len() + others.len(), 1);
-        assert!(actor.replenish("actors", &config, 8).await?.is_empty());
-        assert!(other.replenish("others", &config, 8).await?.is_empty());
+        assert!(actor.replenish("actors", 3, &config, 8).await?.is_empty());
+        assert!(other.replenish("others", 3, &config, 8).await?.is_empty());
         Ok(())
     })
     .await
@@ -93,14 +93,14 @@ async fn expiring_spares_stay_claimable_until_a_replacement_is_ready() -> Result
         let database = PostgresDatabase::connect(&fixture.url).await?;
         let store = PoolStore(database.clone(), SpareKind::Actor);
         let config = config(1);
-        let old = store.replenish("pool", &config, 8).await?.remove(0);
+        let old = store.replenish("pool", 1, &config, 8).await?.remove(0);
         store.publish("pool", &handle(old.clone()), 600).await?;
         database.execute("UPDATE durable_actors_spares SET expires_at = clock_timestamp() + interval '1 second' WHERE name = $1", &[&old]).await?;
-        let new = store.replenish("pool", &config, 8).await?.remove(0);
+        let new = store.replenish("pool", 1, &config, 8).await?.remove(0);
         assert_eq!(database.query_one("SELECT status FROM durable_actors_spares WHERE name = $1", &[&old]).await?.get::<_, &str>(0), "ready");
-        assert!(store.replenish("pool", &config, 8).await?.is_empty());
+        assert!(store.replenish("pool", 1, &config, 8).await?.is_empty());
         store.publish("pool", &handle(new.clone()), 600).await?;
-        store.replenish("pool", &config, 8).await?;
+        store.replenish("pool", 1, &config, 8).await?;
         assert_eq!(database.query_one("SELECT status FROM durable_actors_spares WHERE name = $1", &[&old]).await?.get::<_, &str>(0), "retiring");
         assert_eq!(store.claim("pool", "host", "rev", None).await?.unwrap().name, new);
         Ok(())
@@ -113,12 +113,12 @@ async fn failed_builds_back_off_without_blocking_other_pools() -> Result<()> {
         let database = PostgresDatabase::connect(&fixture.url).await?;
         let store = PoolStore(database.clone(), SpareKind::Actor);
         let config = config(1);
-        let name = store.replenish("failed", &config, 8).await?.remove(0);
+        let name = store.replenish("failed", 1, &config, 8).await?.remove(0);
         store.build_failed("failed", &name).await?;
-        assert!(store.replenish("failed", &config, 8).await?.is_empty());
-        assert_eq!(store.replenish("healthy", &config, 8).await?.len(), 1);
+        assert!(store.replenish("failed", 1, &config, 8).await?.is_empty());
+        assert_eq!(store.replenish("healthy", 1, &config, 8).await?.len(), 1);
         database.execute("UPDATE durable_actors_pool_backoffs SET retry_after = clock_timestamp() - interval '1 second' WHERE pool_key = 'failed'", &[]).await?;
-        assert_eq!(store.replenish("failed", &config, 8).await?.len(), 1);
+        assert_eq!(store.replenish("failed", 1, &config, 8).await?.len(), 1);
         Ok(())
     }).await
 }
@@ -129,26 +129,26 @@ async fn retiring_spares_hold_build_slots_until_ready_and_budget_until_terminati
         let database = PostgresDatabase::connect(&fixture.url).await?;
         let store = PoolStore(database.clone(), SpareKind::Actor);
         let mut config = config(1);
-        let name = store.replenish("old", &config, 8).await?.remove(0);
+        let name = store.replenish("old", 1, &config, 8).await?.remove(0);
         store.retire_unwanted(&["new".into()], true).await?;
         for (fleet, starting) in [(1, 8), (64, 1)] {
             config.fleet_maximum = fleet;
             config.max_starting = starting;
-            assert!(store.replenish("new", &config, 8).await?.is_empty());
+            assert!(store.replenish("new", 1, &config, 8).await?.is_empty());
         }
         assert!(store.retiring().await?.is_empty());
         assert!(store.publish("old", &handle(name), 600).await?);
         store.retire_unwanted(&["new".into()], true).await?;
         assert_eq!(store.retiring().await?.len(), 1);
         config.fleet_maximum = 1;
-        assert!(store.replenish("new", &config, 8).await?.is_empty());
+        assert!(store.replenish("new", 1, &config, 8).await?.is_empty());
         database
             .execute(
                 "DELETE FROM durable_actors_spares WHERE status = 'retiring'",
                 &[],
             )
             .await?;
-        assert_eq!(store.replenish("new", &config, 8).await?.len(), 1);
+        assert_eq!(store.replenish("new", 1, &config, 8).await?.len(), 1);
         Ok(())
     })
     .await
@@ -159,13 +159,13 @@ async fn trimming_cannot_retire_a_spare_claimed_while_it_waits_for_a_lock() -> R
     with_postgres(async |fixture| {
         let database = PostgresDatabase::connect(&fixture.url).await?;
         let store = Arc::new(PoolStore(database.clone(), SpareKind::Actor));
-        let names = store.replenish("pool", &config(2), 8).await?;
+        let names = store.replenish("pool", 2, &config(2), 8).await?;
         for name in &names { store.publish("pool", &handle(name.clone()), 600).await?; }
         database.execute("UPDATE durable_actors_spares SET expires_at = clock_timestamp() + interval '590 seconds' WHERE name = $1", &[&names[0]]).await?;
         let mut client = database.connection().await?;
         let tx = client.transaction().await?;
         let pid: i32 = tx.query_one("SELECT pg_backend_pid() FROM durable_actors_spares WHERE name = $1 FOR UPDATE", &[&names[0]]).await?.get(0);
-        let trimming = { let store = store.clone(); tokio::spawn(async move { store.replenish("pool", &config(1), 8).await }) };
+        let trimming = { let store = store.clone(); tokio::spawn(async move { store.replenish("pool", 1, &config(1), 8).await }) };
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let waiting: bool = database.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))", &[&pid]).await?.get(0);
@@ -202,11 +202,11 @@ async fn a_stalled_region_does_not_block_claim_replenishment_in_another_region()
         let stop = CancellationToken::new();
         let task = tokio::spawn(pool.clone().run(registry, stop.clone()));
         let guard = stop.clone().drop_guard();
-        let key = pool.key("im-runtime", "fast");
+        let key = pool.key("im-runtime", "fast", &ResourceLimits::default());
         wait_for_ready(&database, &key).await?;
-        assert!(pool.claim(&spec, "fast", "host", &pool.config.resources, None).await?.is_some());
+        assert!(pool.claim(&spec, "fast", "host", &ResourceLimits::default(), None).await?.is_some());
         wait_for_ready(&database, &key).await?;
-        assert_eq!(database.query_one("SELECT count(*) FROM durable_actors_spares WHERE pool_key = $1 AND status = 'starting'", &[&pool.key("im-runtime", "slow")]).await?.get::<_, i64>(0), 1);
+        assert_eq!(database.query_one("SELECT count(*) FROM durable_actors_spares WHERE pool_key = $1 AND status = 'starting'", &[&pool.key("im-runtime", "slow", &ResourceLimits::default())]).await?.get::<_, i64>(0), 1);
         drop(guard);
         tokio::time::timeout(Duration::from_secs(2), task).await??;
         Ok(())
@@ -267,7 +267,16 @@ async fn actor_pool_passes_its_control_plane_url_to_idle_spares() -> Result<()> 
             Arc::new(RegionalProvider { control_plane_url }),
             config,
         );
-        pool.create("im-runtime", "fast", "spare").await?;
+        let build = Build {
+            target: Target {
+                key: String::new(),
+                image: "im-runtime".into(),
+                region: "fast".into(),
+                tier: pool.config.tiers[0].clone(),
+            },
+            name: "spare".into(),
+        };
+        pool.create(&build).await?;
     }
     Ok(())
 }

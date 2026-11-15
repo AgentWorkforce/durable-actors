@@ -10,6 +10,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 mod delegated_access;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+#[path = "spare_tiers.rs"]
+mod spare_tiers;
 
 struct FakeSocketEventSink {
     delivered: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
@@ -590,36 +592,17 @@ fn sandbox_resources_override_only_the_configured_fields() -> Result<()> {
         },
         test_issuer()?,
         None,
-    );
+    )
+    .with_default_resources(crate::sandbox::ResourceLimits {
+        cpu_millis: 4000,
+        cpu_limit_millis: None,
+        memory_mib: 8192,
+        memory_limit_mib: Some(8192),
+    });
     let spec: HostLaunchSpec = serde_json::from_value(serde_json::json!({
         "projectId":"default", "organizationId":"org-test", "imageRef":"image", "workingDirectory":"/app", "secretRefs":[],
         "sandboxes":{"Counter":{"cpu":2.5,"idleTimeoutMs":60000},"Room":{"memoryMiB":4096}}
     }))?;
-    let pool = crate::sandbox::pool::SparePool::new(
-        crate::postgres::PostgresDatabase::lazy("postgresql://localhost:1/unavailable")?,
-        provisioner.provider.clone(),
-        crate::sandbox::pool::PoolConfig {
-            otlp_endpoint: None,
-            control_plane_url: None,
-            kind: crate::sandbox::SpareKind::Actor,
-            idle: 0,
-            fleet_maximum: 64,
-            max_starting: 8,
-            idle_ttl_seconds: 600,
-            refill_interval: Duration::from_secs(1),
-            retire_concurrency: 8,
-            reap_interval: Duration::from_secs(30),
-            pod_reap_interval: Duration::from_secs(1),
-            regions: vec!["north-america-east".into()],
-            resources: crate::sandbox::ResourceLimits {
-                cpu_millis: 4000,
-                cpu_limit_millis: None,
-                memory_mib: 8192,
-                memory_limit_mib: Some(8192),
-            },
-        },
-    );
-    let provisioner = provisioner.with_pool(pool);
     for (actor_name, cpu_millis, memory_mib) in [
         ("Counter", 2500, 8192),
         ("Room", 4000, 4096),

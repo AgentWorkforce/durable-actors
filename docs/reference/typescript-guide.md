@@ -454,7 +454,7 @@ export class BankAccount extends Actor {
 }
 ```
 
-`cpu` and `memoryMiB` are requests; `cpuLimit` and `memoryLimitMiB` cap them and must be at least the request. An omitted limit inherits the server default, which may leave CPU uncapped, and is raised to fit your request. The server rejects deployments outside its configured range. Actors without `@Compute` resources start on prewarmed sandboxes; other sizes start a new sandbox.
+`cpu` and `memoryMiB` are requests; `cpuLimit` and `memoryLimitMiB` cap them and must be at least the request. An omitted limit inherits the server default, which may leave CPU uncapped, and is raised to fit your request. The server rejects deployments outside its configured range. Actors without `@Compute` resources start on prewarmed sandboxes, as do sizes the server keeps a spare tier for; other sizes start a new sandbox.
 
 
 ## Using Unchecked<> 

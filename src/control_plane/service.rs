@@ -1059,6 +1059,7 @@ pub(crate) struct SandboxHostProvisioner {
     admission: Option<Arc<super::organization_limits::ActorAdmission>>,
     runtime_images: Option<super::process::RuntimeImages>,
     pool: Option<Arc<crate::sandbox::pool::SparePool>>,
+    default_resources: crate::sandbox::ResourceLimits,
     resource_bounds: Option<crate::sandbox::ResourceBounds>,
     runtime_access: Option<Arc<crate::bucket::access::RuntimeAccess>>,
     provider: Arc<dyn SandboxProvider>,
@@ -1077,6 +1078,15 @@ impl SandboxHostProvisioner {
 
     pub(crate) fn with_pool(mut self, pool: Arc<crate::sandbox::pool::SparePool>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// The size of an actor whose deployment leaves its `@Compute` resources unset.
+    pub(crate) fn with_default_resources(
+        mut self,
+        resources: crate::sandbox::ResourceLimits,
+    ) -> Self {
+        self.default_resources = resources;
         self
     }
 
@@ -1102,6 +1112,7 @@ impl SandboxHostProvisioner {
             runtime_images,
             admission: None,
             pool: None,
+            default_resources: Default::default(),
             resource_bounds: None,
             runtime_access: None,
             provider,
@@ -1419,11 +1430,6 @@ impl SandboxHostProvisioner {
             .cloned()
             .unwrap_or_default();
         options.validate()?;
-        let defaults = self
-            .pool
-            .as_ref()
-            .map(|pool| pool.config.resources.clone())
-            .unwrap_or_default();
         let config_key = spec.host_config_key();
         let host_id = HostId::new(format!("host.v3.{}.{}", config_key, uuid::Uuid::new_v4()));
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -1445,7 +1451,7 @@ impl SandboxHostProvisioner {
             actor: Some(actor.clone()),
             code_snapshot: spec.code_snapshot.clone(),
             spare: None,
-            resources: options.resources(defaults),
+            resources: options.resources(self.default_resources.clone()),
             runtime_config: None,
             host_config_key: config_key,
             canonical_region: region.to_owned(),

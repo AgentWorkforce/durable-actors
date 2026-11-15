@@ -16,6 +16,14 @@
 {{- define "actors.validate" -}}
 {{- if eq (include "actors.sandboxNamespace" .) .Release.Namespace }}{{ fail "sandbox namespace must differ from the control-plane namespace" }}{{ end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.redis.urlSecretKey) }}{{ fail "replicaCount above 1 requires redis.urlSecretKey" }}{{ end -}}
+{{- if and .Values.actors.tiers (gt (int .Values.actors.warm) 0) }}{{ fail "actors.tiers replaces actors.warm; set warm on each tier" }}{{ end -}}
+{{- $sizes := dict -}}{{- $warm := 0 -}}
+{{- range .Values.actors.tiers -}}
+{{- $size := printf "%v/%v/%v/%v" .cpuMillis .cpuLimitMillis .memoryMiB .memoryLimitMiB -}}
+{{- if hasKey $sizes $size }}{{ fail "actors.tiers require distinct sizes" }}{{ end -}}
+{{- $_ := set $sizes $size true -}}{{- $warm = add $warm .warm -}}
+{{- end -}}
+{{- if gt (int $warm) 256 }}{{ fail "actors.tiers may keep at most 256 warm spares in total" }}{{ end -}}
 {{- if eq .Values.analytics.backend "clickhouse" -}}
 {{- range $key, $value := .Values.analytics.clickhouse -}}
 {{- if empty $value }}{{ fail (printf "analytics.clickhouse.%s is required" $key) }}{{ end -}}

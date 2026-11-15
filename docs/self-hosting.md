@@ -94,7 +94,7 @@ curl --fail https://actors.example.com/healthz
 
 Use the [deployment registration API](reference/openapi.md) to register compiled actor code and its contract for your project, then generate your application client using the [TypeScript](reference/typescript-guide.md) or [Python](reference/python-guide.md) guide. A healthy controller does not register or deploy an application automatically. Upload immutable compiled artifacts into the configured bucket and register their manifest; artifact format and registration endpoints are described in the [OpenAPI specification](reference/openapi.yaml).
 
-Verify an actor write and read, restart its sandbox, and read the value again. Also verify a WebSocket connection through your chosen ingress. One controller handles HTTP and sockets by default; actors start on demand. Increase `actors.warm` for lower cold-start latency and `replicaCount` for controller redundancy; more than one replica requires Redis. These settings do not create additional node pools or guarantee capacity.
+Verify an actor write and read, restart its sandbox, and read the value again. Also verify a WebSocket connection through your chosen ingress. One controller handles HTTP and sockets by default; actors start on demand. Increase `actors.warm`, or set `actors.tiers` to keep spares in several sizes, for lower cold-start latency and `replicaCount` for controller redundancy; more than one replica requires Redis. These settings do not create additional node pools or guarantee capacity.
 
 ## Speed up writes with GCS Rapid
 

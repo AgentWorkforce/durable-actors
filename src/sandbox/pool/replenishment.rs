@@ -1,10 +1,31 @@
+use std::{collections::HashMap, time::Instant};
+
 use super::*;
 use tokio_postgres::Transaction;
+
+/// When each pool last started a spare. Pools share the fleet and start limits, so the pool that
+/// has waited longest refills first; a busy pool cannot starve the others.
+#[derive(Default)]
+pub(super) struct RefillTurns(std::sync::Mutex<HashMap<String, Instant>>);
+
+impl RefillTurns {
+    pub(super) fn order(&self, mut targets: Vec<Target>) -> Vec<Target> {
+        let mut served = self.0.lock().unwrap();
+        served.retain(|key, _| targets.iter().any(|target| &target.key == key));
+        targets.sort_by_key(|target| served.get(&target.key).copied());
+        targets
+    }
+
+    pub(super) fn served(&self, key: &str) {
+        self.0.lock().unwrap().insert(key.into(), Instant::now());
+    }
+}
 
 impl PoolStore {
     pub(super) async fn replenish(
         &self,
         key: &str,
+        idle: u32,
         config: &PoolConfig,
         batch: u32,
     ) -> Result<Vec<String>> {
@@ -17,9 +38,9 @@ impl PoolStore {
         .await?;
         tx.execute("INSERT INTO durable_actors_pool_backoffs (pool_key, kind) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&key, &self.1.as_str()]).await?;
         let row = tx.query_one("SELECT retry_after <= clock_timestamp() AS can_build FROM durable_actors_pool_backoffs WHERE pool_key = $1", &[&key]).await?;
-        trim(&tx, key, config.idle).await?;
+        trim(&tx, key, idle).await?;
         let count = if row.get::<_, bool>("can_build") {
-            capacity(&tx, key, config).await?.min(batch)
+            capacity(&tx, key, idle, config).await?.min(batch)
         } else {
             0
         };
@@ -40,15 +61,15 @@ async fn trim(tx: &Transaction<'_>, key: &str, target: u32) -> Result<()> {
     Ok(())
 }
 
-async fn capacity(tx: &Transaction<'_>, key: &str, config: &PoolConfig) -> Result<u32> {
+async fn capacity(tx: &Transaction<'_>, key: &str, idle: u32, config: &PoolConfig) -> Result<u32> {
     // Allow the build timeout for replacement, bounded by half the spare's lifetime.
     let replacement_seconds = (config.idle_ttl_seconds / 2).min(120);
     let row = tx.query_one("SELECT count(*) FILTER (WHERE pool_key = $1 AND expires_at > clock_timestamp() AND (status = 'starting' OR (status = 'ready' AND expires_at > clock_timestamp() + make_interval(secs => $2)))) AS available, count(*) FILTER (WHERE pool_key = $1) AS occupied, count(*) AS fleet, count(*) FILTER (WHERE status = 'starting') AS starting FROM durable_actors_spares WHERE status IN ('ready', 'starting') OR (status = 'retiring' AND host_id IS NULL AND handle IS NOT NULL)", &[&key, &f64::from(replacement_seconds)]).await?;
     let remaining = |limit: u32, field| {
         limit.saturating_sub(row.get::<_, i64>(field).min(i64::from(u32::MAX)) as u32)
     };
-    Ok(remaining(config.idle, "available")
-        .min(remaining(config.idle.saturating_mul(2), "occupied"))
+    Ok(remaining(idle, "available")
+        .min(remaining(idle.saturating_mul(2), "occupied"))
         .min(remaining(config.fleet_maximum, "fleet"))
         .min(remaining(config.max_starting, "starting")))
 }

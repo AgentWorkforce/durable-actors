@@ -4,6 +4,7 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::*;
+use crate::sandbox::pool::PoolTier;
 use std::collections::HashMap;
 
 #[test]
@@ -98,7 +99,7 @@ fn parses_the_minimal_storage_configuration() -> Result<()> {
         values.get(name).map(|value| (*value).into())
     })?;
     assert_eq!(config.storage.bucket, "actor-state-test");
-    let resources = &config.sandbox_provider.pool.resources;
+    let resources = &config.sandbox_provider.default_resources;
     assert_eq!((resources.cpu_millis, resources.memory_mib), (250, 256));
     assert_eq!(resources, &crate::sandbox::ResourceLimits::default());
     assert_eq!(config.sandbox_provider.runtime.host_idle_timeout_ms, 10_000);
@@ -115,9 +116,13 @@ fn pool_capacity_is_configurable_and_validated() -> Result<()> {
     };
     let defaults = parse(&values)?.sandbox_provider.pool;
     assert_eq!(
-        (defaults.idle, defaults.fleet_maximum, defaults.max_starting),
-        (64, 256, 32)
+        defaults.tiers,
+        [PoolTier {
+            resources: crate::sandbox::ResourceLimits::default(),
+            idle: 64
+        }]
     );
+    assert_eq!((defaults.fleet_maximum, defaults.max_starting), (256, 32));
     assert_eq!(defaults.refill_interval, Duration::from_secs(1));
     values.extend([
         ("DURABLE_ACTORS_SPARE_IDLE", "128"),
@@ -126,12 +131,15 @@ fn pool_capacity_is_configurable_and_validated() -> Result<()> {
         ("DURABLE_ACTORS_SPARE_REFILL_INTERVAL_MS", "250"),
         ("DURABLE_ACTORS_HOST_CPU_MILLIS", "500"),
     ]);
-    let configured = parse(&values)?.sandbox_provider.pool;
-    assert_eq!(configured.resources.cpu_millis, 500);
+    let configured = parse(&values)?.sandbox_provider;
+    assert_eq!(configured.default_resources.cpu_millis, 500);
+    let configured = configured.pool;
+    assert_eq!(configured.tiers.len(), 1);
+    assert_eq!(configured.tiers[0].resources.cpu_millis, 500);
     assert_eq!(configured.refill_interval, Duration::from_millis(250));
     assert_eq!(
         (
-            configured.idle,
+            configured.tiers[0].idle,
             configured.fleet_maximum,
             configured.max_starting
         ),
@@ -145,6 +153,110 @@ fn pool_capacity_is_configurable_and_validated() -> Result<()> {
     values.insert("DURABLE_ACTORS_SPARE_MAX_STARTING", "4");
     values.insert("DURABLE_ACTORS_SPARE_REFILL_INTERVAL_MS", "10");
     assert!(parse(&values).is_err());
+    Ok(())
+}
+
+#[test]
+fn spare_tiers_keep_a_pool_per_size_beside_the_default_actor_size() -> Result<()> {
+    let mut values = process_environment();
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|v| (*v).into()))
+    };
+    values.insert(
+        "DURABLE_ACTORS_SPARE_TIERS",
+        r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":8},
+            {"cpuMillis":500,"cpuLimitMillis":1000,"memoryMiB":512,"memoryLimitMiB":768,"warm":2}]"#,
+    );
+    let configured = parse(&values)?.sandbox_provider;
+    let small = crate::sandbox::ResourceLimits::default();
+    assert_eq!(small.memory_mib, 256);
+    assert_eq!(configured.default_resources, small);
+    assert_eq!(
+        configured.pool.tiers,
+        [
+            PoolTier {
+                resources: small,
+                idle: 8
+            },
+            PoolTier {
+                resources: crate::sandbox::ResourceLimits {
+                    cpu_millis: 500,
+                    cpu_limit_millis: Some(1000),
+                    memory_mib: 512,
+                    memory_limit_mib: Some(768),
+                },
+                idle: 2
+            }
+        ]
+    );
+    values.insert(
+        "DURABLE_ACTORS_SPARE_TIERS",
+        r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":512,"memoryLimitMiB":512,"warm":2}]"#,
+    );
+    let configured = parse(&values)?.sandbox_provider;
+    assert_eq!(configured.default_resources.memory_mib, 256);
+    assert_eq!(configured.pool.tiers[0].resources.memory_mib, 512);
+    for (reason, tiers) in [
+        ("no tiers", "[]"),
+        (
+            "not a list",
+            r#"{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":1}"#,
+        ),
+        (
+            "missing spare count",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256}]"#,
+        ),
+        (
+            "missing CPU limit",
+            r#"[{"cpuMillis":250,"memoryMiB":256,"memoryLimitMiB":256,"warm":1}]"#,
+        ),
+        (
+            "missing memory limit",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"warm":1}]"#,
+        ),
+        (
+            "no memory limit",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":null,"warm":1}]"#,
+        ),
+        (
+            "unknown field",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":1,"idle":1}]"#,
+        ),
+        (
+            "zero CPU",
+            r#"[{"cpuMillis":0,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":1}]"#,
+        ),
+        (
+            "zero memory",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":0,"memoryLimitMiB":256,"warm":1}]"#,
+        ),
+        (
+            "CPU limit below request",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":100,"memoryMiB":256,"memoryLimitMiB":256,"warm":1}]"#,
+        ),
+        (
+            "memory limit below request",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":512,"memoryLimitMiB":256,"warm":1}]"#,
+        ),
+        (
+            "repeated size",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":1},{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":2}]"#,
+        ),
+        (
+            "more spares than the fleet",
+            r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":200},{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":512,"memoryLimitMiB":512,"warm":57}]"#,
+        ),
+    ] {
+        values.insert("DURABLE_ACTORS_SPARE_TIERS", tiers);
+        assert!(parse(&values).is_err(), "accepted {reason}");
+    }
+    values.insert(
+        "DURABLE_ACTORS_SPARE_TIERS",
+        r#"[{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":256,"memoryLimitMiB":256,"warm":200},{"cpuMillis":250,"cpuLimitMillis":null,"memoryMiB":512,"memoryLimitMiB":512,"warm":56}]"#,
+    );
+    parse(&values)?;
+    values.insert("DURABLE_ACTORS_SPARE_IDLE", "8");
+    assert!(parse(&values).is_err(), "accepted both spare settings");
     Ok(())
 }
 

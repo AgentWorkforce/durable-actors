@@ -19,7 +19,6 @@ pub(crate) struct PoolConfig {
     pub control_plane_url: Option<String>,
     pub otlp_endpoint: Option<String>,
     pub kind: SpareKind,
-    pub idle: u32,
     pub fleet_maximum: u32,
     pub max_starting: u32,
     pub idle_ttl_seconds: u32,
@@ -28,7 +27,15 @@ pub(crate) struct PoolConfig {
     pub reap_interval: Duration,
     pub pod_reap_interval: Duration,
     pub regions: Vec<String>,
+    pub tiers: Vec<PoolTier>,
+}
+
+/// One spare size: `idle` ready spares per image and region, claimed by actors whose resources
+/// equal `resources`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PoolTier {
     pub resources: ResourceLimits,
+    pub idle: u32,
 }
 
 pub(crate) struct SparePool {
@@ -37,6 +44,7 @@ pub(crate) struct SparePool {
     pub config: PoolConfig,
     runtime_images: Option<crate::control_plane::RuntimeImages>,
     heartbeat: std::sync::atomic::AtomicU64,
+    refills: replenishment::RefillTurns,
 }
 
 impl SparePool {
@@ -61,6 +69,7 @@ impl SparePool {
             config,
             runtime_images,
             heartbeat: now_ms().into(),
+            refills: Default::default(),
         })
     }
 
@@ -72,19 +81,26 @@ impl SparePool {
         resources: &ResourceLimits,
         node: Option<&str>,
     ) -> Result<Option<SpareHandle>> {
-        if spec.code_snapshot.is_none() || resources != &self.config.resources {
+        if spec.code_snapshot.is_none() || !self.has_tier(resources) {
             return Ok(None);
         }
         let result = self
             .store
             .claim(
-                &self.key(self.image(spec)?, region),
+                &self.key(self.image(spec)?, region, resources),
                 host,
                 &spec.host_config_key(),
                 node,
             )
             .await?;
         Ok(result)
+    }
+
+    fn has_tier(&self, resources: &ResourceLimits) -> bool {
+        self.config
+            .tiers
+            .iter()
+            .any(|tier| &tier.resources == resources)
     }
 
     pub async fn host_node(&self, host: &str) -> Result<Option<String>> {
@@ -230,12 +246,7 @@ impl SparePool {
                 Ok(plans) => {
                     for plan in plans {
                         let pool = self.clone();
-                        jobs.spawn(async move {
-                            Background::Build(
-                                pool.build(&plan.key, &plan.image, &plan.region, plan.name)
-                                    .await,
-                            )
-                        });
+                        jobs.spawn(async move { Background::Build(pool.build(plan).await) });
                     }
                 }
                 Err(error) => report(Err(error)),
@@ -251,47 +262,45 @@ impl SparePool {
     }
 
     async fn reconcile(&self, registry: &dyn AdminRegistry) -> Result<Vec<Build>> {
+        let targets = self.targets(registry).await?;
+        let keys: Vec<String> = targets.iter().map(|target| target.key.clone()).collect();
+        let enabled = self.config.tiers.iter().any(|tier| tier.idle > 0);
+        self.store.retire_unwanted(&keys, enabled).await?;
+        let batch = (self.config.max_starting / keys.len().max(1) as u32).max(1);
+        let mut builds = Vec::new();
+        for target in self.refills.order(targets) {
+            match self.replenish(&target, batch).await {
+                Ok(names) => builds.extend(names.into_iter().map(|name| Build {
+                    target: target.clone(),
+                    name,
+                })),
+                Err(error) => report(Err(error)),
+            }
+        }
+        Ok(builds)
+    }
+
+    async fn targets(&self, registry: &dyn AdminRegistry) -> Result<Vec<Target>> {
         let deployments = registry.launch_specs().await?;
         let images: std::collections::BTreeSet<_> = deployments
             .iter()
             .filter(|spec| spec.code_snapshot.is_some())
             .map(|spec| self.image(spec))
             .collect::<Result<_>>()?;
-        let keys: Vec<String> = images
-            .iter()
-            .flat_map(|image| {
-                self.config
-                    .regions
-                    .iter()
-                    .map(|region| self.key(image, region))
-            })
-            .collect();
-        self.store
-            .retire_unwanted(&keys, self.config.idle > 0)
-            .await?;
-        let batch = (self.config.max_starting / keys.len().max(1) as u32).max(1);
-        let mut builds = Vec::new();
+        let mut targets = Vec::new();
         for image in images {
             for region in &self.config.regions {
-                let key = self.key(image, region);
-                let names = match self.store.replenish(&key, &self.config, batch).await {
-                    Ok(names) => names,
-                    Err(error) => {
-                        report(Err(error));
-                        continue;
-                    }
-                };
-                for name in names {
-                    builds.push(Build {
-                        key: key.clone(),
+                for tier in &self.config.tiers {
+                    targets.push(Target {
+                        key: self.key(image, region, &tier.resources),
                         image: image.into(),
                         region: region.clone(),
-                        name,
+                        tier: tier.clone(),
                     });
                 }
             }
         }
-        Ok(builds)
+        Ok(targets)
     }
 
     fn image<'a>(&'a self, spec: &'a HostLaunchSpec) -> Result<&'a str> {
@@ -301,9 +310,20 @@ impl SparePool {
         }
     }
 
-    async fn build(&self, key: &str, image: &str, region: &str, name: String) -> Result<()> {
-        let result = self.create(image, region, &name).await;
-        match result {
+    async fn replenish(&self, target: &Target, batch: u32) -> Result<Vec<String>> {
+        let names = self
+            .store
+            .replenish(&target.key, target.tier.idle, &self.config, batch)
+            .await?;
+        if !names.is_empty() {
+            self.refills.served(&target.key);
+        }
+        Ok(names)
+    }
+
+    async fn build(&self, build: Build) -> Result<()> {
+        let key = &build.target.key;
+        match self.create(&build).await {
             Ok(handle) => {
                 if !self
                     .store
@@ -315,13 +335,19 @@ impl SparePool {
                 Ok(())
             }
             Err(error) => {
-                self.store.build_failed(key, &name).await?;
+                self.store.build_failed(key, &build.name).await?;
                 Err(error)
             }
         }
     }
 
-    async fn create(&self, image: &str, region: &str, name: &str) -> Result<SpareHandle> {
+    async fn create(&self, build: &Build) -> Result<SpareHandle> {
+        let Target {
+            image,
+            region,
+            tier,
+            ..
+        } = &build.target;
         let request = CreateSpareRequest {
             control_plane_url: self
                 .config
@@ -333,10 +359,10 @@ impl SparePool {
                 .otlp_endpoint
                 .clone()
                 .filter(|_| self.config.kind == SpareKind::Actor),
-            name: name.into(),
-            image_ref: image.into(),
-            canonical_region: region.into(),
-            resources: self.config.resources.clone(),
+            name: build.name.clone(),
+            image_ref: image.clone(),
+            canonical_region: region.clone(),
+            resources: tier.resources.clone(),
             kind: self.config.kind,
         };
         let handle = tokio::time::timeout(
@@ -346,8 +372,8 @@ impl SparePool {
         .await
         .context("spare creation timed out")??;
         ensure!(
-            handle.name == name
-                && handle.canonical_region == region
+            handle.name == build.name
+                && handle.canonical_region == *region
                 && !handle.resource_id.is_empty()
                 && !handle.route.is_empty()
                 && !handle.control_route.is_empty()
@@ -387,16 +413,23 @@ impl SparePool {
         Ok(())
     }
 
-    fn key(&self, image: &str, region: &str) -> String {
-        serde_json::to_string(&(self.config.kind, image, region, &self.config.resources))
+    fn key(&self, image: &str, region: &str, resources: &ResourceLimits) -> String {
+        serde_json::to_string(&(self.config.kind, image, region, resources))
             .expect("serializable pool key")
     }
 }
 
-struct Build {
+/// The spares one tier keeps ready for one image in one region.
+#[derive(Clone)]
+struct Target {
     key: String,
     image: String,
     region: String,
+    tier: PoolTier,
+}
+
+struct Build {
+    target: Target,
     name: String,
 }
 
