@@ -1,5 +1,5 @@
 use crate::{
-    payload::{JsonBody, JsonText},
+    payload::{ARRIVING_BYTES, JsonBody, JsonPayload, JsonStream, JsonText},
     request_tracking::HostState,
     sandbox::assignment::{InitialOperation, InitialRequest},
     sockets::operations::SocketOperation,
@@ -11,6 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use serde_json::{Value, json};
 use std::future::Future;
@@ -48,11 +49,10 @@ pub(super) async fn invoke_alarm(
     )
     .await
     .map_err(|_| anyhow::anyhow!("alarm outcome could not be confirmed"))?;
-    anyhow::ensure!(
-        outcome.ran,
-        "alarm was not executed: {}",
-        outcome.text.get()
-    );
+    if !outcome.ran {
+        let reply = outcome.text.into_text().await?;
+        anyhow::bail!("alarm was not executed: {}", reply.get());
+    }
     Ok(())
 }
 
@@ -73,7 +73,7 @@ pub(super) async fn invoke(
     invocation.validate().map_err(ApiError::bad_request)?;
     let outcome = resolve_and_dispatch(&state, &headers, request.home_region, &invocation).await?;
     let body =
-        JsonBody::with_field(&json!({}), "outcome", &outcome.text).map_err(ApiError::internal)?;
+        JsonBody::with_field(&json!({}), "outcome", outcome.text).map_err(ApiError::internal)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], body).into_response())
 }
 
@@ -81,9 +81,16 @@ pub(super) async fn invoke_from_host(
     service: &super::ControlPlaneService,
     invocation: &ActorInvocation,
 ) -> Value {
-    resolve_and_dispatch_from_host(service, invocation)
-        .await
-        .and_then(|outcome| outcome.text.decode().map_err(ApiError::internal))
+    let outcome = match resolve_and_dispatch_from_host(service, invocation).await {
+        Ok(outcome) => outcome
+            .text
+            .into_text()
+            .await
+            .map_err(|_| outcome_unknown()),
+        Err(error) => Err(error),
+    };
+    outcome
+        .and_then(|text| text.decode().map_err(ApiError::internal))
         .unwrap_or_else(ApiError::into_outcome)
 }
 
@@ -299,24 +306,13 @@ async fn send_invocation(
     if !response.status().is_success() {
         return Err(outcome_unknown());
     }
-    let reply = read_reply(response).await.map_err(|_| outcome_unknown())?;
-    HostReply::check(reply)
+    HostReply::read(response).await
 }
 
-/// Reads into one buffer of the announced length, which the reply's text then keeps.
-async fn read_reply(mut response: reqwest::Response) -> anyhow::Result<JsonText> {
-    let mut body = Vec::new();
-    body.try_reserve_exact(usize::try_from(response.content_length().unwrap_or(0))?)?;
-    while let Some(chunk) = response.chunk().await? {
-        body.extend_from_slice(&chunk);
-    }
-    JsonText::from_vec(body)
-}
-
-/// An invocation's outcome, kept as the host's text, which the caller receives unchanged.
+/// An invocation's outcome as the host's text, which the caller receives unchanged.
 pub(super) struct HostReply {
     ran: bool,
-    text: JsonText,
+    text: JsonPayload,
 }
 
 impl HostReply {
@@ -325,6 +321,29 @@ impl HostReply {
             ran: false,
             text: reply.into(),
         }
+    }
+
+    /// A large completed reply is passed on as it arrives. Any other is read whole and checked.
+    async fn read(response: reqwest::Response) -> Result<Self, ApiError> {
+        let len = response
+            .content_length()
+            .and_then(|len| usize::try_from(len).ok())
+            .unwrap_or(0);
+        let completed = response
+            .headers()
+            .get(super::OUTCOME_HEADER)
+            .is_some_and(|outcome| outcome == "completed");
+        if completed && len > ARRIVING_BYTES {
+            let chunks = response.bytes_stream().map(|chunk| Ok(chunk?));
+            return Ok(Self {
+                ran: true,
+                text: JsonStream::new(chunks, len).into(),
+            });
+        }
+        let reply = read_reply(response, len)
+            .await
+            .map_err(|_| outcome_unknown())?;
+        Self::check(reply)
     }
 
     fn check(text: JsonText) -> Result<Self, ApiError> {
@@ -347,8 +366,21 @@ impl HostReply {
             }
             _ => return Err(outcome_unknown()),
         };
-        Ok(Self { ran, text })
+        Ok(Self {
+            ran,
+            text: text.into(),
+        })
     }
+}
+
+/// Reads into one buffer of the announced length, which the reply's text then keeps.
+async fn read_reply(mut response: reqwest::Response, len: usize) -> anyhow::Result<JsonText> {
+    let mut body = Vec::new();
+    body.try_reserve_exact(len)?;
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    JsonText::from_vec(body)
 }
 
 /// The fields of a reply that decide its outcome. The result is skipped, not parsed.

@@ -14,9 +14,9 @@ use tracing::{info, warn};
 
 use crate::{
     actor::{ActorExecutionResult, ActorInvocation, ActorKey, ActorSocketPublisher},
-    control_plane::{ActorJwtVerifier, ActorPrincipal},
+    control_plane::{ActorJwtVerifier, ActorPrincipal, OUTCOME_HEADER},
     host::{ActorHost, HostId, sockets::HostSockets},
-    payload::{JsonBody, JsonText},
+    payload::{JsonBody, JsonPayload, JsonText},
 };
 
 pub(crate) struct ActorHostHttpService {
@@ -81,12 +81,14 @@ impl ActorHostHttpService {
                     )
                     .with_metadata(None)
                     .body()?
-                    .into_text();
+                    .into_text()
+                    .await;
                 }
                 self.execute(invocation, owner_epoch, HostState::Cold, routing_ms)
                     .await
                     .body()?
                     .into_text()
+                    .await
             }
             InitialRequest::Socket { invocation } => {
                 anyhow::ensure!(
@@ -362,18 +364,24 @@ struct InvocationResponse {
 }
 
 impl InvocationResponse {
-    /// The reply's JSON, which shares a result's text rather than copying it.
-    fn body(&self) -> anyhow::Result<JsonBody> {
-        match &self.outcome {
-            InvocationReply::Completed { result } => JsonBody::with_field(self, "result", result),
-            _ => JsonBody::encode(self),
+    /// The reply's JSON, which shares a result's text, or passes it on as it arrives, rather than
+    /// copying it.
+    fn body(mut self) -> anyhow::Result<JsonBody> {
+        match &mut self.outcome {
+            InvocationReply::Completed { result } => {
+                let result = std::mem::take(result);
+                JsonBody::with_field(&self, "result", result)
+            }
+            _ => JsonBody::encode(&self),
         }
     }
 }
 
 impl IntoResponse for InvocationResponse {
     fn into_response(self) -> Response {
+        let completed = matches!(self.outcome, InvocationReply::Completed { .. });
         match self.body() {
+            Ok(body) if completed => ([(OUTCOME_HEADER, "completed")], body).into_response(),
             Ok(body) => body.into_response(),
             Err(error) => {
                 HttpError(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response()
@@ -388,7 +396,7 @@ enum InvocationReply {
     Completed {
         /// Written by `InvocationResponse::body`, after the rest of the reply.
         #[serde(skip)]
-        result: JsonText,
+        result: JsonPayload,
     },
     Failed {
         code: String,

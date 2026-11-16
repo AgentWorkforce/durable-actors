@@ -93,7 +93,7 @@ impl DatabaseSession {
         }
         Ok(match result {
             Some(result) => PreparedInvocation::Completed(ActorExecutionResult::Completed {
-                result,
+                result: result.into(),
                 effects: vec![],
             }),
             None => PreparedInvocation::Execute,
@@ -259,7 +259,7 @@ impl DatabaseSession {
         &mut self,
         invocation: &ActorInvocation,
         owner_epoch: Option<u64>,
-        result: JsonText,
+        result: Option<JsonText>,
         committed: Option<u64>,
         origin: CommitOrigin,
     ) -> Result<u64> {
@@ -272,12 +272,15 @@ impl DatabaseSession {
             cached.owner_epoch == owner_epoch,
             "database completion ownership changed"
         );
-        let publication = match cached.unpublished(committed) {
-            Some(txid) => {
+        let publication = match (cached.unpublished(committed), result) {
+            (Some(txid), Some(result)) => {
                 self.publish_result(invocation, owner_epoch, &mut cached, result, txid, origin)
                     .await
             }
-            None => Ok(()),
+            (Some(_), None) => Err(anyhow::anyhow!(
+                "a result passed on as it arrived cannot be kept with its state"
+            )),
+            (None, _) => Ok(()),
         };
         let version = cached.state_version;
         if publication.is_err() {

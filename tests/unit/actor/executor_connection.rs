@@ -615,6 +615,106 @@ async fn large_results_and_messages_arrive_whole_beside_inline_effects() -> Resu
 }
 
 #[tokio::test]
+async fn large_results_pass_on_as_they_arrive_and_unread_ones_are_skipped() -> Result<()> {
+    let (host, customer) = UnixStream::pair()?;
+    let (reader, writer) = host.into_split();
+    let (executor, running) = JsActorExecutor::start(
+        BufReader::new(reader),
+        writer,
+        vec!["counter".into()],
+        Arc::default(),
+    );
+    let rows = json!({"rows": "x".repeat(2 * ARRIVING_BYTES)});
+    let peer = async {
+        let mut customer = BufReader::new(customer);
+        for _ in 0..2 {
+            let command = read_message(&mut customer).await?;
+            write_message(
+                &mut customer,
+                &json!({"type": "reply", "message_id": command["message_id"], "reply": {
+                    "type": "invoked", "result": rows
+                }}),
+            )
+            .await?;
+        }
+        anyhow::Ok(())
+    };
+    let calls = async {
+        for request in ["unread", "read"] {
+            let outcome = executor
+                .invoke(invocation(request, "rows"), actor_database::unused())
+                .await?;
+            let ActorMethodOutcome::Completed {
+                result: result @ JsonPayload::Arriving(_),
+                effects,
+            } = outcome
+            else {
+                anyhow::bail!("expected a result that is still arriving");
+            };
+            assert!(effects.is_empty());
+            if request == "read" {
+                assert_eq!(result.into_text().await?.decode::<Value>()?, rows);
+            }
+        }
+        anyhow::Ok(())
+    };
+    let result = timeout(Duration::from_secs(5), async {
+        tokio::try_join!(peer, calls)
+    })
+    .await;
+    running.abort();
+    result??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_result_cut_off_as_it_arrives_fails_and_ends_the_session() -> Result<()> {
+    let (host, customer) = UnixStream::pair()?;
+    let (reader, writer) = host.into_split();
+    let (executor, running) = JsActorExecutor::start(
+        BufReader::new(reader),
+        writer,
+        vec!["counter".into()],
+        Arc::default(),
+    );
+    let peer = async {
+        let mut customer = BufReader::new(customer);
+        let command = read_message(&mut customer).await?;
+        let line = json!({"type": "reply", "message_id": command["message_id"],
+            "reply": {"type": "invoked"}, "parts": [2 * ARRIVING_BYTES, 2]});
+        let cut = format!("{line}\n\"{}", "x".repeat(ARRIVING_BYTES));
+        customer.write_all(cut.as_bytes()).await?;
+        anyhow::Ok(())
+    };
+    let call = async {
+        let outcome = executor
+            .invoke(invocation("cut", "rows"), actor_database::unused())
+            .await?;
+        let ActorMethodOutcome::Completed { result, .. } = outcome else {
+            anyhow::bail!("expected a completed result");
+        };
+        anyhow::Ok(result.into_text().await)
+    };
+    let ((), arrived) = timeout(Duration::from_secs(5), async {
+        tokio::try_join!(peer, call)
+    })
+    .await??;
+    let error = arrived.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("ended before all of it arrived"),
+        "{error:#}"
+    );
+    let session = timeout(Duration::from_secs(1), running)
+        .await??
+        .unwrap_err();
+    assert!(
+        format!("{session:#}").contains("disconnected inside a message"),
+        "{session:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn messages_with_missing_extra_or_impossible_parts_end_the_session() -> Result<()> {
     for (message, problem) in [
         (

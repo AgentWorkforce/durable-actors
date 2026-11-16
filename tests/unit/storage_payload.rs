@@ -1,4 +1,4 @@
-use crate::payload::{JsonBody, JsonText, Spool, Text, encode};
+use crate::payload::{JsonBody, JsonPayload, JsonStream, JsonText, Piece, Spool, Text, encode};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -26,21 +26,82 @@ async fn json_bodies_send_a_field_from_its_own_text() -> Result<()> {
             json!({"type": "completed", "rows": [1, 2]}),
         ),
     ] {
-        let body = JsonBody::with_field(&object, "rows", &rows)?;
-        assert_eq!(body.0[1].as_ptr(), rows.get().as_ptr());
+        let body = JsonBody::with_field(&object, "rows", rows.clone().into())?;
+        assert!(matches!(&body.0[1], Piece::Ready(bytes) if bytes.as_ptr() == rows.get().as_ptr()));
         let length = body.size_hint().exact();
         let bytes = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX).await?;
         assert_eq!(length, Some(bytes.len() as u64));
         assert_eq!(serde_json::from_slice::<Value>(&bytes)?, expected);
     }
     assert_eq!(
-        JsonBody::with_field(&json!({}), "rows", &rows)?
-            .into_text()?
+        JsonBody::with_field(&json!({}), "rows", rows.clone().into())?
+            .into_text()
+            .await?
             .get(),
         r#"{"rows":[1,2]}"#
     );
-    assert!(JsonBody::with_field(&json!([]), "rows", &rows).is_err());
+    assert!(JsonBody::with_field(&json!([]), "rows", rows.into()).is_err());
     Ok(())
+}
+
+#[tokio::test]
+async fn json_bodies_send_a_field_as_it_arrives_with_its_announced_length() -> Result<()> {
+    use http_body::Body as _;
+    let (chunks, _open) = sent(&["[1,", "2]"]);
+    let mut stream = JsonStream::new(chunks, 5);
+    let finished = stream.finished();
+    let body = JsonBody::with_field(&json!({"type": "completed"}), "rows", stream.into())?;
+    let expected = r#"{"type":"completed","rows":[1,2]}"#;
+    assert_eq!(body.size_hint().exact(), Some(expected.len() as u64));
+    let bytes = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX).await?;
+    assert_eq!(bytes.as_ref(), expected.as_bytes());
+    assert!(finished.await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_arriving_document_that_ends_short_or_runs_long_fails() -> Result<()> {
+    for (part, problem) in [
+        ("[1,", "ended before all of it arrived"),
+        ("[1,2,3]", "arrived longer than announced"),
+    ] {
+        let (chunks, open) = sent(&[part]);
+        drop(open);
+        let error = JsonPayload::from(JsonStream::new(chunks, 5))
+            .into_text()
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(problem), "{error:#}");
+        let (chunks, open) = sent(&[part]);
+        drop(open);
+        let body = JsonBody::with_field(&json!({}), "rows", JsonStream::new(chunks, 5).into())?;
+        assert!(
+            axum::body::to_bytes(axum::body::Body::new(body), usize::MAX)
+                .await
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+/// A stream of `parts`, which stays open until the returned sender is dropped.
+fn sent(
+    parts: &[&str],
+) -> (
+    impl futures_util::Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+    tokio::sync::mpsc::Sender<bytes::Bytes>,
+) {
+    use futures_util::StreamExt;
+    let (sender, receiver) = tokio::sync::mpsc::channel(parts.len());
+    for part in parts {
+        sender
+            .try_send(bytes::Bytes::copy_from_slice(part.as_bytes()))
+            .expect("room for every part");
+    }
+    (
+        tokio_stream::wrappers::ReceiverStream::new(receiver).map(Ok),
+        sender,
+    )
 }
 
 #[test]

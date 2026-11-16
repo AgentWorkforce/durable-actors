@@ -275,7 +275,17 @@ impl DatabaseInvocation {
         self.scope.active.store(false, Ordering::Release);
     }
 
-    pub(super) async fn complete(&self, result: JsonText, sequence: Option<u64>) -> Result<u64> {
+    pub(super) fn wrote(&self) -> bool {
+        self.scope.committed.load(Ordering::Acquire) > 0
+    }
+
+    /// `result` is `None` when it passes on as it arrives, which only a call that wrote nothing
+    /// can do.
+    pub(super) async fn complete(
+        &self,
+        result: Option<JsonText>,
+        sequence: Option<u64>,
+    ) -> Result<u64> {
         self.close();
         let (reply, response) = oneshot::channel();
         self.database
@@ -386,7 +396,7 @@ enum Command {
 
 struct PendingCompletion {
     scope: Arc<InvocationScope>,
-    result: JsonText,
+    result: Option<JsonText>,
     sequence: Option<u64>,
     reply: oneshot::Sender<Result<u64>>,
 }

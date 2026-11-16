@@ -1,6 +1,6 @@
 #[path = "../../fixtures/spans.rs"]
 mod spans;
-use crate::payload::JsonText;
+use crate::payload::{JsonStream, JsonText};
 use crate::request_tracking::HostState;
 use crate::{
     actor::{
@@ -226,6 +226,68 @@ async fn ordinary_methods_execute_and_commit_without_a_socket_gateway() -> Resul
     assert_eq!(attribution.operation, "increment");
     assert!(attribution.connection_id.is_none());
     assert!(attribution.committed_at_ms > 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn results_of_writes_are_kept_and_results_of_reads_pass_on_as_work_until_taken() -> Result<()>
+{
+    struct ArrivingExecutor;
+    #[async_trait]
+    impl ActorExecutor for ArrivingExecutor {
+        fn supports(&self, _: &str) -> bool {
+            true
+        }
+        async fn invoke(
+            &self,
+            invocation: ActorMethodInvocation,
+            database: Arc<dyn ActorDatabase>,
+        ) -> Result<ActorMethodOutcome> {
+            if invocation.request_id == "write" {
+                write_fields(&*database, json!({ "count": 1 })).await?;
+            }
+            let chunks = futures_util::stream::iter([Ok(bytes::Bytes::from_static(b"[1,2]"))]);
+            Ok(ActorMethodOutcome::Completed {
+                result: JsonStream::new(chunks, 5).into(),
+                effects: vec![],
+            })
+        }
+    }
+    let state = Arc::new(FakeStateTransport::default());
+    let host = create_host(
+        HostEndpoint {
+            id: super::super::HostId::new("host-1"),
+            route: "http://host.invalid/".into(),
+        },
+        Arc::new(ArrivingExecutor),
+        Arc::new(FakeAuthority::default()),
+        state.clone(),
+        Arc::new(EmptySocketPublisher),
+        replication().await,
+    );
+    assert!(matches!(
+        invoke(&host, "write").await?,
+        ActorExecutionResult::Completed { result, .. } if result == json!([1, 2]).into()
+    ));
+    let snapshot = StateSnapshot::decode(&state.writes.lock().unwrap()[0])?;
+    assert_eq!(snapshot.completion.unwrap().result, json!([1, 2]).into());
+
+    let ActorExecutionResult::Completed {
+        result: result @ JsonPayload::Arriving(_),
+        ..
+    } = invoke(&host, "read").await?
+    else {
+        anyhow::bail!("a read's result should pass on as it arrives");
+    };
+    let mut status = host.status();
+    assert!(status.borrow_and_update().idle_since.is_none());
+    assert_eq!(result.into_text().await?, json!([1, 2]).into());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        status.wait_for(|status| status.idle_since.is_some()),
+    )
+    .await??;
+    assert_eq!(state.writes.lock().unwrap().len(), 1);
     Ok(())
 }
 
@@ -1159,7 +1221,7 @@ impl ActorExecutor for InvalidEffectsExecutor {
     ) -> Result<ActorMethodOutcome> {
         write_fields(&*database, json!({ "count": 1 })).await?;
         Ok(ActorMethodOutcome::Completed {
-            result: JsonText::null(),
+            result: Default::default(),
             effects: vec![ActorSocketEffect::Close {
                 connection_id: "socket-1".into(),
                 code: 1001,
@@ -2117,7 +2179,7 @@ async fn socket_events_return_effects_only_after_committing_state() -> Result<()
 
     assert!(matches!(
         result,
-        ActorExecutionResult::Completed { ref result, ref effects } if *result == JsonText::null() && effects.len() == 1
+        ActorExecutionResult::Completed { ref result, ref effects } if *result == JsonText::null().into() && effects.len() == 1
     ));
     assert_eq!(state.writes.lock().unwrap().len(), 1);
     let saved = state.writes.lock().unwrap()[0].clone();
@@ -2691,7 +2753,7 @@ async fn restored_request_only_returns_a_saved_result_when_completion_is_present
         if complete {
             assert!(matches!(
                 result,
-                ActorExecutionResult::Completed { ref result, .. } if *result == JsonText::null()
+                ActorExecutionResult::Completed { ref result, .. } if *result == JsonText::null().into()
             ));
             assert_eq!(executor.invocations.load(Ordering::Relaxed), 0);
         } else {

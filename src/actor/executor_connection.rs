@@ -8,7 +8,9 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
+use bytes::Bytes;
 use command_fds::{CommandFdExt, FdMapping};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
@@ -21,6 +23,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -29,10 +32,13 @@ use super::{
     ActorSocketSource, LogLevel, StdioLogSink,
     database_channel::{self, DatabaseScopes},
 };
-use crate::payload::JsonText;
+use crate::payload::{ARRIVING_BYTES, BUFFER_BYTES, JsonPayload, JsonStream, JsonText};
 
 const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 33;
 const DATABASE_FD: i32 = 3;
+const NO_EFFECTS: &[u8] = b"[]";
+const ARRIVING_RESULT_CHUNKS: usize = 16;
+const ARRIVING_RESULT_STALL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 pub struct ActorMethodInvocation {
@@ -162,7 +168,7 @@ impl ActorSocketEffect {
 pub enum ActorMethodOutcome {
     Interleaved(ActorInterleavedOutcome),
     Completed {
-        result: JsonText,
+        result: JsonPayload,
         effects: Vec<ActorSocketEffect>,
     },
     Failed(ActorInvocationFailure),
@@ -178,7 +184,7 @@ pub enum ActorSocketOutcome {
 #[derive(Debug, PartialEq)]
 pub struct ActorInterleavedOutcome {
     pub sequence: u64,
-    pub result: JsonText,
+    pub result: JsonPayload,
     pub effects: Vec<ActorSocketEffect>,
 }
 
@@ -568,7 +574,7 @@ impl ActorExecutor for JsActorExecutor {
             ExecutorReply::WebsocketHandled { effects, sequence } => Ok(match sequence {
                 Some(sequence) => ActorSocketOutcome::Interleaved(ActorInterleavedOutcome {
                     sequence,
-                    result: JsonText::null(),
+                    result: JsonPayload::default(),
                     effects,
                 }),
                 None => ActorSocketOutcome::Handled { effects },
@@ -975,19 +981,71 @@ async fn read_executor_messages(
     inbound: mpsc::UnboundedSender<Result<ActorExecutorClientMessage>>,
 ) -> Result<()> {
     loop {
-        let reply = match read_client_message(&mut reader).await {
-            Ok(Some(message)) => Ok(message),
-            Ok(None) => Err(anyhow::anyhow!(
-                "customer JavaScript actor executor disconnected"
-            )),
-            Err(error) => Err(error),
-        };
-        let stopped = reply.is_err();
-        inbound
-            .send(reply)
-            .context("actor executor driver stopped")?;
-        if stopped {
+        if let Err(error) = forward_client_message(&mut reader, &inbound).await {
+            inbound.send(Err(error)).map_err(|_| driver_stopped())?;
             return Ok(());
+        }
+    }
+}
+
+/// Sends the next message to the driver. A result passed on as it arrives follows its message.
+async fn forward_client_message(
+    reader: &mut BufReader<OwnedReadHalf>,
+    inbound: &mpsc::UnboundedSender<Result<ActorExecutorClientMessage>>,
+) -> Result<()> {
+    let mut message = read_client_line(reader)
+        .await?
+        .context("customer JavaScript actor executor disconnected")?;
+    let arriving = message.arriving_result();
+    if arriving.is_none() {
+        read_parts(reader, &mut message).await?;
+    }
+    inbound.send(Ok(message)).map_err(|_| driver_stopped())?;
+    match arriving {
+        Some(arriving) => arriving.forward(reader).await,
+        None => Ok(()),
+    }
+}
+
+fn driver_stopped() -> anyhow::Error {
+    anyhow::anyhow!("actor executor driver stopped")
+}
+
+/// A result passed on as it arrives, followed by nothing but empty socket effects.
+struct ArrivingResult {
+    size: usize,
+    chunks: mpsc::Sender<Bytes>,
+}
+
+impl ArrivingResult {
+    /// Once nobody takes the result any more, the rest is still read, so the next message lines
+    /// up.
+    async fn forward(self, reader: &mut BufReader<OwnedReadHalf>) -> Result<()> {
+        let mut chunks = Some(self.chunks);
+        let mut remaining = self.size;
+        while remaining > 0 {
+            let chunk = read_part(reader, remaining.min(BUFFER_BYTES)).await?;
+            remaining -= chunk.len();
+            if let Some(taker) = &chunks
+                && !pass_on(taker, chunk).await
+            {
+                chunks = None;
+            }
+        }
+        ensure!(
+            read_part(reader, NO_EFFECTS.len()).await? == NO_EFFECTS,
+            "a result passed on as it arrives was followed by socket effects"
+        );
+        Ok(())
+    }
+}
+
+async fn pass_on(chunks: &mpsc::Sender<Bytes>, chunk: Vec<u8>) -> bool {
+    match tokio::time::timeout(ARRIVING_RESULT_STALL, chunks.send(chunk.into())).await {
+        Ok(sent) => sent.is_ok(),
+        Err(_) => {
+            warn!("an actor result was not taken for 30 seconds, so the rest of it is dropped");
+            false
         }
     }
 }
@@ -1043,20 +1101,36 @@ struct ExecutorWrite {
 async fn read_client_message(
     reader: &mut BufReader<OwnedReadHalf>,
 ) -> Result<Option<ActorExecutorClientMessage>> {
+    let Some(mut message) = read_client_line(reader).await? else {
+        return Ok(None);
+    };
+    read_parts(reader, &mut message).await?;
+    Ok(Some(message))
+}
+
+async fn read_client_line(
+    reader: &mut BufReader<OwnedReadHalf>,
+) -> Result<Option<ActorExecutorClientMessage>> {
     let mut line = Vec::new();
     if reader.read_until(b'\n', &mut line).await? == 0 {
         return Ok(None);
     }
-    let mut message: ActorExecutorClientMessage = serde_json::from_slice(trim_ascii_end(&line))
-        .context("decode customer actor executor message")?;
+    serde_json::from_slice(trim_ascii_end(&line))
+        .map(Some)
+        .context("decode customer actor executor message")
+}
+
+async fn read_parts(
+    reader: &mut BufReader<OwnedReadHalf>,
+    message: &mut ActorExecutorClientMessage,
+) -> Result<()> {
     let mut parts = Vec::new();
     for &size in message.part_sizes() {
         parts.push(read_part(reader, size).await?);
     }
     message
         .attach(parts)
-        .context("decode customer actor executor message parts")?;
-    Ok(Some(message))
+        .context("decode customer actor executor message parts")
 }
 
 // The customer process chooses the size, so memory is claimed only as its bytes arrive.
@@ -1178,6 +1252,33 @@ impl ActorExecutorClientMessage {
         }
     }
 
+    /// A large result of a call that is not interleaved, with no socket effects after it, is
+    /// passed on as it arrives rather than read whole first.
+    fn arriving_result(&mut self) -> Option<ArrivingResult> {
+        let Self::Reply {
+            reply:
+                ExecutorReply::Invoked {
+                    result,
+                    sequence: None,
+                    ..
+                },
+            parts,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let &[size, effects] = parts.as_slice() else {
+            return None;
+        };
+        if size <= ARRIVING_BYTES || effects != NO_EFFECTS.len() {
+            return None;
+        }
+        let (chunks, arriving) = mpsc::channel(ARRIVING_RESULT_CHUNKS);
+        *result = JsonStream::new(ReceiverStream::new(arriving).map(Ok), size).into();
+        Some(ArrivingResult { size, chunks })
+    }
+
     /// Fills in what followed the line: the result of an invocation, then the socket effects.
     fn attach(&mut self, parts: Vec<Vec<u8>>) -> Result<()> {
         let mut parts = Parts(parts.into_iter());
@@ -1187,7 +1288,7 @@ impl ActorExecutorClientMessage {
                 ExecutorReply::Invoked {
                     result, effects, ..
                 } => {
-                    *result = JsonText::from_vec(parts.next()?)?;
+                    *result = JsonText::from_vec(parts.next()?)?.into();
                     *effects = parts.effects()?;
                 }
                 ExecutorReply::WebsocketHandled { effects, .. } => *effects = parts.effects()?,
@@ -1270,7 +1371,7 @@ enum ExecutorReply {
     Hydrated,
     Invoked {
         #[serde(skip)]
-        result: JsonText,
+        result: JsonPayload,
         #[serde(default)]
         sequence: Option<u64>,
         #[serde(skip)]

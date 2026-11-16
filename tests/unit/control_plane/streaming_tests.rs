@@ -752,7 +752,9 @@ impl Stack {
             .await
             .0?;
         match result {
-            crate::actor::ActorExecutionResult::Completed { result, .. } => result.decode(),
+            crate::actor::ActorExecutionResult::Completed { result, .. } => {
+                result.into_text().await?.decode()
+            }
             other => anyhow::bail!("actor call failed: {other:?}"),
         }
     }

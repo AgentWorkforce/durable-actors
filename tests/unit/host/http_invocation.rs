@@ -49,7 +49,7 @@ fn diagnostic_logs_use_finalized_request_timing() -> Result<()> {
     tracker.mark(crate::request_tracking::RequestStage::StateCacheChecked);
     tracker.mark(crate::request_tracking::RequestStage::ActorExecutionCompleted);
     let result = Ok(ActorExecutionResult::Completed {
-        result: crate::payload::JsonText::null(),
+        result: Default::default(),
         effects: vec![],
     });
     tracker.complete(&result);

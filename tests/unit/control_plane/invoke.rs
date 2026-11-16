@@ -139,6 +139,27 @@ async fn combined_invocation_resolves_and_dispatches_with_a_scoped_host_token() 
 }
 
 #[tokio::test]
+async fn large_completed_replies_pass_through_with_their_length() -> Result<()> {
+    let host_reply = json!({"type":"completed", "result":{"rows":"x".repeat(2 * crate::payload::ARRIVING_BYTES)}});
+    let host_length = serde_json::to_vec(&host_reply)?.len();
+    let fixture = Fixture::start(vec![(StatusCode::OK, host_reply.clone())]).await?;
+    let response = fixture
+        .call(
+            "api-key",
+            json!({"requestId":"rows", "method":"clear", "args":[]}),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.content_length(),
+        Some((r#"{"outcome":}"#.len() + host_length) as u64)
+    );
+    let reply: Value = response.json().await?;
+    assert_eq!(reply, json!({"outcome": host_reply}));
+    Ok(())
+}
+
+#[tokio::test]
 async fn resolving_an_existing_host_marks_the_request_warm() -> Result<()> {
     let fixture = Fixture::start_with_existing_host(
         vec![(StatusCode::OK, json!({"type":"completed", "result":1}))],
@@ -710,6 +731,10 @@ async fn host_invoke(
         .unwrap()
         .pop_front()
         .expect("unexpected replay");
+    if reply["type"] == "completed" {
+        let completed = [(crate::control_plane::OUTCOME_HEADER, "completed")];
+        return (status, completed, Json(reply)).into_response();
+    }
     (status, Json(reply)).into_response()
 }
 
