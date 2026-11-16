@@ -1,17 +1,31 @@
-# Terse engineering conventions
+# Working in durable-actors
 
-Rules for working in this repo. Keep changes minimal and idiomatic.
+```sh
+cargo build --workspace
+cargo test --workspace
+bun install
+bun run test
+bun run build
+```
 
-## Core rules
+- Keep dependency injection at replaceable effectful boundaries, not around pure helpers. Preserve the existing public-orchestration-first convention.
 
-1. **Minimize comments.** Add one only when a choice is non-obvious, odd, or a deliberate compromise whose rationale must remain beside the code.
+## Agency and guidance
 
-2. **Prefer a library** over building it yourself for common problems.
+- Act autonomously on routine assigned work; ask forgiveness rather than permission. Preserve explicit production, release and credential gates.
+- For guidance, ask the engineering leads, the agent that spawned you, or the layered owner on Agent Relay.
+- Only a truly pressing or blocking question goes to `khaliq-gant` or `will-washburn` (CODEOWNERS) on Agent Relay.
 
-3. **Use dependency injection at effectful boundaries.** Code against a narrow interface when an implementation must be replaceable, and inject dependencies through constructors. Do not add interfaces around pure helpers.
+## Cross-repo context
 
-4. **Follow the step-down rule.** Present public orchestration first, followed by progressively lower-level helpers in call order.
+- Before and during changes, understand how this repo fits the wider system; consult its repo map and related-repo docs where available.
+- Check relevant agents’ summaries on Agent Relay and proactively contact owning agents about dependencies, adjacent changes and work in flight.
 
-5. **Keep methods and functions short.** Split work into named operations when a function mixes responsibilities or abstraction levels.
+## Pull requests (when used)
 
-6. **Follow SOLID principles**
+- Open PRs as ready for review by default. If merging requires Khaliq’s OK, use `merge-train:hold` instead of draft status.
+- If you open a PR, immediately subscribe to its feedback through Agent Relay using [this skill](https://github.com/AgentWorkforce/skills/blob/main/skills/subscribing-relay-webhooks-and-writebacks/SKILL.md), and verify subscription readiness.
+- Evaluate each review finding. Address applicable feedback and explain declined changes in the thread.
+- A PR is not ready while feedback remains unaddressed or merge conflicts remain.
+- When ready, alert the CODEOWNERS and the agent that spawned you on Agent Relay.
+- Keep related open PRs from going stale: find their authoring agent on Agent Relay and coordinate; if that agent is no longer on the relay, escalate to the CODEOWNERS or the layered owner.
