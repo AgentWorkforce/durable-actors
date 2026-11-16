@@ -13,7 +13,11 @@ use crate::{
         live::{InProcessFeed, LiveFeed, RedisFeed},
         persistence::{NoTraceQueries, clickhouse::ClickHouseTracePersistence},
     },
-    sandbox::{HostSandboxRuntimeConfig, gke::GkeConfig, modal::ModalConfig},
+    sandbox::{
+        HostSandboxRuntimeConfig,
+        gke::{GKE_RUNTIME_CLASS, GkeConfig},
+        modal::ModalConfig,
+    },
 };
 
 use super::{ActorJwtVerifier, ControlPlaneService};
@@ -912,6 +916,9 @@ fn sandbox_backend(
                         1024,
                     )? as usize,
                     node_cache_url: node_cache_url(get)?,
+                    runtime_class: get("DURABLE_ACTORS_GKE_RUNTIME_CLASS")
+                        .filter(|class| !class.is_empty())
+                        .unwrap_or_else(|| GKE_RUNTIME_CLASS.into()),
                 }),
                 regions,
             ))

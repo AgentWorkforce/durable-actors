@@ -27,6 +27,7 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
         ],
         "test-token",
         Some("http://node-cache:7103"),
+        GKE_RUNTIME_CLASS,
     )?;
     assert_eq!(
         pod.metadata
@@ -317,6 +318,7 @@ async fn fake_cluster(
             zones: BTreeMap::from([("north-america-west".into(), vec!["us-west4-a".into()])]),
             reap_concurrency: 4,
             node_cache_url: None,
+            runtime_class: GKE_RUNTIME_CLASS.into(),
         },
     );
     Ok((cluster, server))
@@ -401,12 +403,54 @@ fn spare_pod_manifest_only_uses_fields_kubernetes_knows() {
 }
 
 fn spare_json() -> serde_json::Value {
-    let pod = spare_pod(
+    serde_json::to_value(spare_under(GKE_RUNTIME_CLASS)).unwrap()
+}
+
+fn spare_under(runtime_class: &str) -> Pod {
+    spare_pod(
         &spare_request("actor"),
         &["us-west4-a".into()],
         "token",
         None,
+        runtime_class,
     )
-    .unwrap();
-    serde_json::to_value(pod).unwrap()
+    .unwrap()
+}
+
+/// The expected values are what GKE writes on a spare under its own class.
+#[test]
+fn a_spare_under_another_runtime_class_carries_the_mount_annotations_gke_would_add() {
+    assert_eq!(gvisor_mounts(spare_under(GKE_RUNTIME_CLASS)), []);
+    let spare = spare_under("gvisor-with-overhead");
+    assert_eq!(
+        spare.spec.as_ref().unwrap().runtime_class_name.as_deref(),
+        Some("gvisor-with-overhead")
+    );
+    assert_eq!(
+        gvisor_mounts(spare),
+        [
+            ("customer.options", "rw,rprivate"),
+            ("customer.share", "container"),
+            ("customer.type", "bind"),
+            ("runtime.options", "rw,rprivate"),
+            ("runtime.share", "pod"),
+            ("runtime.type", "bind"),
+            ("tmp.options", "rw,rprivate"),
+            ("tmp.share", "container"),
+            ("tmp.type", "bind"),
+        ]
+        .map(|(mount, value)| (mount.to_owned(), value.to_owned()))
+    );
+}
+
+fn gvisor_mounts(pod: Pod) -> Vec<(String, String)> {
+    pod.metadata
+        .annotations
+        .unwrap()
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let mount = name.strip_prefix("dev.gvisor.spec.mount.")?;
+            Some((mount.to_owned(), value))
+        })
+        .collect()
 }

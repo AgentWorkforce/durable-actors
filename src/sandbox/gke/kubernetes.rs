@@ -21,6 +21,8 @@ use super::*;
 use crate::sandbox::kube_retry::retry_throttled;
 
 const MANAGED: &str = "app.kubernetes.io/managed-by=terse";
+/// The RuntimeClass GKE provides for gVisor.
+pub(crate) const GKE_RUNTIME_CLASS: &str = "gvisor";
 
 #[derive(Clone, Debug)]
 pub(crate) struct GkeConfig {
@@ -28,6 +30,7 @@ pub(crate) struct GkeConfig {
     pub zones: BTreeMap<String, Vec<String>>,
     pub reap_concurrency: usize,
     pub node_cache_url: Option<String>,
+    pub runtime_class: String,
 }
 
 /// Reads pod state from one shared watch so provisioning costs a single API call per pod.
@@ -120,6 +123,7 @@ impl SandboxCluster for Kubernetes {
             self.zones(&request.canonical_region)?,
             &token,
             self.config.node_cache_url.as_deref(),
+            &self.config.runtime_class,
         )?;
         let ready = self.start(pod).await?;
         let ip: std::net::IpAddr = ready
@@ -248,6 +252,7 @@ fn spare_pod(
     zones: &[String],
     token: &str,
     node_cache_url: Option<&str>,
+    runtime_class: &str,
 ) -> Result<Pod> {
     let mut pod: Pod = serde_yaml::from_str(SPARE_POD).context("spare pod manifest")?;
     pod.metadata.name = Some(request.name.clone());
@@ -269,6 +274,14 @@ fn spare_pod(
         .env
         .get_or_insert_with(Vec::new)
         .extend(spare_env(request, token, node_cache_url)?);
+    if runtime_class != GKE_RUNTIME_CLASS {
+        spec.runtime_class_name = Some(runtime_class.to_owned());
+        let mounts = mount_annotations(spec);
+        pod.metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .extend(mounts);
+    }
     Ok(pod)
 }
 
@@ -331,6 +344,49 @@ fn env_var(name: &str, value: &str) -> EnvVar {
         value: Some(value.into()),
         ..Default::default()
     }
+}
+
+/// GKE tells gVisor how to mount a pod's volumes, but only for pods under its own class. A pod
+/// under another class has to say the same itself, or its volumes are mounted straight from the
+/// node's disk.
+fn mount_annotations(spec: &PodSpec) -> BTreeMap<String, String> {
+    spec.volumes
+        .iter()
+        .flatten()
+        .filter(|volume| volume.empty_dir.is_some())
+        .flat_map(|volume| {
+            let share = match mounting_containers(spec, &volume.name) {
+                1 => "container",
+                _ => "pod",
+            };
+            [
+                ("type", "bind"),
+                ("share", share),
+                ("options", "rw,rprivate"),
+            ]
+            .map(|(hint, value)| {
+                (
+                    format!("dev.gvisor.spec.mount.{}.{hint}", volume.name),
+                    value.to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn mounting_containers(spec: &PodSpec, volume: &str) -> usize {
+    spec.init_containers
+        .iter()
+        .flatten()
+        .chain(&spec.containers)
+        .filter(|container| {
+            container
+                .volume_mounts
+                .iter()
+                .flatten()
+                .any(|mount| mount.name == volume)
+        })
+        .count()
 }
 
 fn terminal_or_ready(pod: &Pod) -> bool {

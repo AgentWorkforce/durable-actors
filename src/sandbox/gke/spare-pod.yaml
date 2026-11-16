@@ -1,5 +1,6 @@
 # A spare actor sandbox. spare_pod in kubernetes.rs sets what varies per request: the name, both
-# images, the zones, CPU and memory, and the spare's token and endpoints.
+# images, the zones, CPU and memory, and the spare's token and endpoints. It also replaces the
+# runtime class when the control plane is configured with another.
 apiVersion: v1
 kind: Pod
 metadata:

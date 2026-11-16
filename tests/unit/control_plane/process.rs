@@ -449,6 +449,23 @@ fn rapid_configuration_uses_two_zones_and_gke() -> Result<()> {
 }
 
 #[test]
+fn sandboxes_run_under_gkes_runtime_class_unless_another_is_named() -> Result<()> {
+    for (configured, expected) in [
+        (None, "gvisor"),
+        (Some(""), "gvisor"),
+        (Some("gvisor-with-overhead"), "gvisor-with-overhead"),
+    ] {
+        let mut values = process_environment();
+        values.extend(configured.map(|class| ("DURABLE_ACTORS_GKE_RUNTIME_CLASS", class)));
+        let config = ControlPlaneProcessConfig::from_lookup(|name| {
+            values.get(name).map(|value| (*value).into())
+        })?;
+        assert_eq!(gke(&config).runtime_class, expected, "{configured:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn compute_region_accepts_multiple_zones_and_rejects_empty_or_mismatched_sets() -> Result<()> {
     let mut values = process_environment();
     values.insert(
