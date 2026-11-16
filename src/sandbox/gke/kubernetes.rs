@@ -25,6 +25,8 @@ pub(crate) struct GkeConfig {
     pub namespace: String,
     pub zones: BTreeMap<String, Vec<String>>,
     pub reap_concurrency: usize,
+    /// Forwarded to spare hosts as `BUN_OPTIONS` so operators can profile the actor executor.
+    pub bun_options: Option<String>,
 }
 
 /// Reads pod state from one shared watch so provisioning costs a single API call per pod.
@@ -112,7 +114,12 @@ impl SandboxCluster for Kubernetes {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let pod = spare_pod(request, self.zones(&request.canonical_region)?, &token)?;
+        let pod = spare_pod(
+            request,
+            self.zones(&request.canonical_region)?,
+            &token,
+            self.config.bun_options.as_deref(),
+        )?;
         let ready = self.start(pod).await?;
         let ip: std::net::IpAddr = ready
             .status
@@ -224,7 +231,12 @@ async fn observe(pods: Api<Pod>, writer: Writer<Pod>, changed: watch::Sender<()>
         .await;
 }
 
-fn spare_pod(request: &CreateSpareRequest, zones: &[String], token: &str) -> Result<Pod> {
+fn spare_pod(
+    request: &CreateSpareRequest,
+    zones: &[String],
+    token: &str,
+    bun_options: Option<&str>,
+) -> Result<Pod> {
     let mut pod = base_pod(&request.name, &request.image_ref, zones, &request.resources);
     pod["metadata"]["annotations"] =
         json!({"cluster-autoscaler.kubernetes.io/safe-to-evict": "true"});
@@ -233,6 +245,13 @@ fn spare_pod(request: &CreateSpareRequest, zones: &[String], token: &str) -> Res
         {"name":"DURABLE_ACTORS_SPARE_TOKEN", "value":token},
         {"name":"DURABLE_ACTORS_CONTROL_PLANE_URL", "value":request.control_plane_url.as_ref().context("spare control plane URL required")?}
     ]);
+    // Spares start Bun before assignment, so actor secrets arrive too late to set its flags.
+    if let Some(options) = bun_options {
+        pod["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .context("spare env missing")?
+            .push(json!({"name":"BUN_OPTIONS", "value":options}));
+    }
     pod["spec"]["containers"][0]["readinessProbe"] = json!({"exec":{"command":["/usr/bin/test", "-f", "/tmp/durable-actors-spare-ready"]}, "periodSeconds":1, "failureThreshold":3});
     Ok(serde_json::from_value(pod)?)
 }

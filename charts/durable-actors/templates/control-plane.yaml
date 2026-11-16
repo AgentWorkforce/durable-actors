@@ -122,6 +122,9 @@ spec:
             {{- with $.Values.actors.memoryLimitMiB }}
             - {name: DURABLE_ACTORS_HOST_MEMORY_LIMIT_MIB, value: {{ . | quote }}}
             {{- end }}
+            {{- with $.Values.actors.bunOptions }}
+            - {name: DURABLE_ACTORS_HOST_BUN_OPTIONS, value: {{ . | quote }}}
+            {{- end }}
             {{- with $.Values.actors.bounds.minCpuMillis }}
             - {name: DURABLE_ACTORS_SANDBOX_MIN_CPU_MILLIS, value: {{ . | quote }}}
             {{- end }}

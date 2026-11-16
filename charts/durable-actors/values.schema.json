@@ -186,6 +186,9 @@
           "type": ["integer", "null"],
           "minimum": 1
         },
+        "bunOptions": {
+          "type": "string"
+        },
         "bounds": {
           "type": "object",
           "additionalProperties": false,

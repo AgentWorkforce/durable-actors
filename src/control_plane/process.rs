@@ -846,6 +846,7 @@ fn sandbox_backend(
                         1,
                         1024,
                     )? as usize,
+                    bun_options: host_bun_options(get)?,
                 }),
                 regions,
             ))
@@ -970,6 +971,38 @@ fn compute_zones(value: &str) -> Result<BTreeMap<String, Vec<String>>> {
         }
     }
     Ok(zones)
+}
+
+/// Bun flags for actor hosts, e.g. `--cpu-prof` or `--inspect=127.0.0.1:6499/debug`.
+/// The inspector may only bind loopback, so profiling never opens a port to the network.
+fn host_bun_options(get: &mut impl FnMut(&str) -> Option<String>) -> Result<Option<String>> {
+    const NAME: &str = "DURABLE_ACTORS_HOST_BUN_OPTIONS";
+    let Some(options) = get(NAME).map(|value| value.trim().to_owned()) else {
+        return Ok(None);
+    };
+    if options.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        !options.chars().any(char::is_control),
+        "{NAME} must not contain control characters"
+    );
+    for flag in options.split_whitespace() {
+        let Some((name, target)) = flag.split_once('=') else {
+            continue;
+        };
+        if !name.starts_with("--inspect") {
+            continue;
+        }
+        let address = target.trim_start_matches("ws://");
+        let address = address.split('/').next().unwrap_or_default();
+        let loopback = match address.rsplit_once(':') {
+            Some((host, _)) => matches!(host, "127.0.0.1" | "localhost" | "[::1]"),
+            None => address.chars().all(|c| c.is_ascii_digit()),
+        };
+        ensure!(loopback, "{NAME} {name} must bind 127.0.0.1");
+    }
+    Ok(Some(options))
 }
 
 fn host_resources(

@@ -134,6 +134,11 @@ test("configures how fast warm pools refill and drain", () => {
     assert.match(output, /DURABLE_ACTORS_SPARE_REAP_INTERVAL_MS, value: "5000"/)
 })
 
+test("passes Bun flags to actor hosts only when configured", () => {
+    assert.doesNotMatch(manifests(), /DURABLE_ACTORS_HOST_BUN_OPTIONS/)
+    assert.match(manifests({ actors: { bunOptions: "--cpu-prof --cpu-prof-dir=/tmp" } }), /DURABLE_ACTORS_HOST_BUN_OPTIONS, value: "--cpu-prof --cpu-prof-dir=\/tmp"/)
+})
+
 for (const [name, overrides] of [
     ["unknown storage mode", { storage: { mode: "standrad" } }],
     ["missing Rapid placements", { storage: { mode: "rapid" } }],

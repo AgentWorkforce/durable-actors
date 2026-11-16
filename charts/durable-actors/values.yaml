@@ -32,6 +32,9 @@ actors:
   memoryMiB: 256
   # Unset matches memoryMiB.
   memoryLimitMiB: null
+  # Bun flags for actor hosts (BUN_OPTIONS), e.g. "--cpu-prof --cpu-prof-dir=/tmp" or
+  # "--inspect=127.0.0.1:6499/debug". The inspector must bind loopback. Empty leaves Bun unchanged.
+  bunOptions: ""
   # Range a deployment's @Compute may request; unset uses the runtime defaults.
   bounds:
     minCpuMillis: null
