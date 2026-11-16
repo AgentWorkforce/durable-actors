@@ -29,7 +29,7 @@ use super::{
 
 const HOST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_ACTOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const NODE_CACHE_SAVE_BUDGET: Duration = Duration::from_secs(5);
+const NODE_CACHE_SAVE_BUDGET: Duration = Duration::from_secs(30);
 /// How long the executor waits for its host to attach. Falling back from Rapid can
 /// spend two operation timeouts before Standard starts: the failed open, then
 /// deleting the replicas that did open.

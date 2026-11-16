@@ -161,7 +161,7 @@ impl NodeCacheClient {
 async fn file_body(path: &Path) -> Result<reqwest::Body> {
     let file = tokio::fs::File::open(path).await?;
     Ok(reqwest::Body::wrap_stream(
-        tokio_util::io::ReaderStream::new(file),
+        tokio_util::io::ReaderStream::with_capacity(file, super::FILE_CHUNK_BYTES),
     ))
 }
 

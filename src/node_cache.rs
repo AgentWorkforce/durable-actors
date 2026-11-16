@@ -11,6 +11,9 @@ mod store;
 pub(crate) use client::{DatabaseDownload, NodeCacheClient, NodeCacheConnection};
 
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+/// tokio reads a file through one thread-pool hop per chunk, which at `ReaderStream`'s 4 KiB
+/// default took most of a transfer. Chunks larger than this are no faster and hold more memory.
+const FILE_CHUNK_BYTES: usize = 256 * 1024;
 /// Each indexed entry holds about 350 bytes of memory, so this default fits a 256 MiB cache pod.
 const DEFAULT_MAX_ENTRIES: u64 = 500_000;
 /// Larger databases take longer to export at shutdown than they save at the next activation.

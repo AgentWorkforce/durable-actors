@@ -15,7 +15,7 @@ use futures_util::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use super::{MAX_ENTRY_BYTES, keys::HostTokens, store::DiskStore, valid_digest};
+use super::{FILE_CHUNK_BYTES, MAX_ENTRY_BYTES, keys::HostTokens, store::DiskStore, valid_digest};
 use crate::{actor::ActorKey, control_plane::ActorPrincipal};
 
 #[derive(Clone)]
@@ -146,7 +146,7 @@ impl NodeCache {
         match self.store.get(key).await {
             Some((file, size)) => (
                 [(header::CONTENT_LENGTH, size)],
-                Body::from_stream(ReaderStream::new(file)),
+                Body::from_stream(ReaderStream::with_capacity(file, FILE_CHUNK_BYTES)),
             )
                 .into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
