@@ -761,7 +761,7 @@ impl HostProvisioner for InvocationProvisioner {
         _: bool,
         _: Option<&crate::bucket::OwnershipHint>,
         operation: Option<&crate::sandbox::assignment::InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+    ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
         tokio::time::sleep(Duration::from_millis(25)).await;
         let lease = HostLease {
             route: self.route.clone(),
@@ -812,7 +812,7 @@ impl HostProvisioner for InvocationProvisioner {
         } else {
             None
         };
-        Ok((lease, owner_epoch, initial_reply))
+        Ok((lease, owner_epoch, initial_reply.map(Into::into)))
     }
     async fn terminate_hosts(&self, _: &HostLaunchSpec, _: &[String]) -> Result<HostTermination> {
         anyhow::bail!("unexpected termination")

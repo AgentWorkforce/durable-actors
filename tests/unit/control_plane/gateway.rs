@@ -289,7 +289,7 @@ impl super::super::service::HostProvisioner for PausedProvisioner {
     ) -> Result<(
         crate::host_leases::HostLease,
         u64,
-        Option<serde_json::Value>,
+        Option<crate::payload::JsonText>,
     )> {
         assert_eq!(region, "north-america-east");
         assert_eq!(actor.actor_id, "one");

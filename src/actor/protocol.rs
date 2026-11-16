@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{actor::ActorSocketEffect, actor_state::ActorStorageKey};
+use crate::{actor::ActorSocketEffect, actor_state::ActorStorageKey, payload::JsonText};
 
 const MAX_ACTOR_NAME_BYTES: usize = 48;
 const MAX_ACTOR_ID_BYTES: usize = 128;
@@ -100,7 +100,7 @@ impl ActorInvocationFailure {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActorExecutionResult {
     Completed {
-        result: Value,
+        result: JsonText,
         effects: Vec<ActorSocketEffect>,
     },
     Failed {

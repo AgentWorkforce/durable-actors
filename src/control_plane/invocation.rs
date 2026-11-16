@@ -1,4 +1,5 @@
 use crate::{
+    payload::{JsonBody, JsonText},
     request_tracking::HostState,
     sandbox::assignment::{InitialOperation, InitialRequest},
     sockets::operations::SocketOperation,
@@ -10,7 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use serde_json::{Value, json};
 use std::future::Future;
 use tokio::time::Instant;
@@ -47,10 +48,12 @@ pub(super) async fn invoke_alarm(
     )
     .await
     .map_err(|_| anyhow::anyhow!("alarm outcome could not be confirmed"))?;
-    match outcome["type"].as_str() {
-        Some("completed" | "failed") => Ok(()),
-        _ => anyhow::bail!("alarm was not executed: {outcome}"),
-    }
+    anyhow::ensure!(
+        outcome.ran,
+        "alarm was not executed: {}",
+        outcome.text.get()
+    );
+    Ok(())
 }
 
 pub(super) async fn invoke(
@@ -69,11 +72,9 @@ pub(super) async fn invoke(
     };
     invocation.validate().map_err(ApiError::bad_request)?;
     let outcome = resolve_and_dispatch(&state, &headers, request.home_region, &invocation).await?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({"outcome": outcome})),
-    )
-        .into_response())
+    let body =
+        JsonBody::with_field(&json!({}), "outcome", &outcome.text).map_err(ApiError::internal)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], body).into_response())
 }
 
 pub(super) async fn invoke_from_host(
@@ -82,13 +83,14 @@ pub(super) async fn invoke_from_host(
 ) -> Value {
     resolve_and_dispatch_from_host(service, invocation)
         .await
+        .and_then(|outcome| outcome.text.decode().map_err(ApiError::internal))
         .unwrap_or_else(ApiError::into_outcome)
 }
 
 async fn resolve_and_dispatch_from_host(
     service: &super::ControlPlaneService,
     invocation: &ActorInvocation,
-) -> Result<Value, ApiError> {
+) -> Result<HostReply, ApiError> {
     invocation.validate().map_err(ApiError::bad_request)?;
     let started = Instant::now();
     let deadline = started + super::CONTROL_PLANE_REQUEST_TIMEOUT;
@@ -120,7 +122,7 @@ async fn resolve_and_dispatch(
     headers: &HeaderMap,
     home_region: Option<String>,
     invocation: &ActorInvocation,
-) -> Result<Value, ApiError> {
+) -> Result<HostReply, ApiError> {
     let deadline = Instant::now() + super::CONTROL_PLANE_REQUEST_TIMEOUT;
     let resolve = || {
         resolve_actor_target(
@@ -150,7 +152,7 @@ async fn settle<Resolve, Resolving>(
     invocation: &ActorInvocation,
     deadline: Instant,
     resolve: Resolve,
-) -> Result<Value, ApiError>
+) -> Result<HostReply, ApiError>
 where
     Resolve: Fn() -> Resolving,
     Resolving: Future<Output = Result<ActorTarget, ApiError>>,
@@ -164,11 +166,8 @@ where
         }
         let outcome = match target.initial_reply.take() {
             Some(reply) => {
-                let result = validate_reply(reply);
-                if result
-                    .as_ref()
-                    .map_or(true, |reply| reply["type"] == "not_executed")
-                {
+                let result = HostReply::check(reply);
+                if result.as_ref().map_or(true, |reply| !reply.ran) {
                     service
                         .routes
                         .remove(&invocation.actor, &target.identity)
@@ -188,11 +187,7 @@ where
                 .await?
             }
         };
-        if !matches!(
-            outcome["type"].as_str(),
-            Some("not_executed" | "unauthenticated")
-        ) || Instant::now() >= deadline
-        {
+        if outcome.ran || Instant::now() >= deadline {
             return Ok(outcome);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -254,14 +249,9 @@ async fn dispatch(
     invocation: &ActorInvocation,
     host_state: HostState,
     routing_ms: f64,
-) -> Result<Value, ApiError> {
+) -> Result<HostReply, ApiError> {
     let result = send_invocation(client, target, invocation, host_state, routing_ms).await;
-    if result.as_ref().map_or(true, |reply| {
-        matches!(
-            reply["type"].as_str(),
-            Some("not_executed" | "unauthenticated")
-        )
-    }) {
+    if result.as_ref().map_or(true, |reply| !reply.ran) {
         service
             .routes
             .remove(&invocation.actor, &target.identity)
@@ -276,7 +266,7 @@ async fn send_invocation(
     invocation: &ActorInvocation,
     host_state: HostState,
     routing_ms: f64,
-) -> Result<Value, ApiError> {
+) -> Result<HostReply, ApiError> {
     let actor = &invocation.actor;
     let url = format!(
         "{}/v1/projects/{}/actors/{}/{}/invoke",
@@ -297,43 +287,84 @@ async fn send_invocation(
     let response = match response {
         Ok(response) => response,
         Err(error) if error.is_connect() => {
-            return Ok(json!({"type":"not_executed", "reason":"upstream_not_reached"}));
+            return Ok(HostReply::not_run(
+                json!({"type":"not_executed", "reason":"upstream_not_reached"}),
+            ));
         }
         Err(_) => return Err(outcome_unknown()),
     };
     if response.status() == StatusCode::UNAUTHORIZED {
-        return Ok(json!({"type":"unauthenticated"}));
+        return Ok(HostReply::not_run(json!({"type":"unauthenticated"})));
     }
     if !response.status().is_success() {
         return Err(outcome_unknown());
     }
-    let reply = read_reply(response).await?;
-    validate_reply(reply)
+    let reply = read_reply(response).await.map_err(|_| outcome_unknown())?;
+    HostReply::check(reply)
 }
 
-fn validate_reply(reply: Value) -> Result<Value, ApiError> {
-    match reply.get("type").and_then(Value::as_str) {
-        Some("not_executed")
-            if matches!(
-                reply["reason"].as_str(),
-                Some("host_unavailable" | "upstream_not_reached")
-            ) =>
-        {
-            Ok(reply)
+/// Reads into one buffer of the announced length, which the reply's text then keeps.
+async fn read_reply(mut response: reqwest::Response) -> anyhow::Result<JsonText> {
+    let mut body = Vec::new();
+    body.try_reserve_exact(usize::try_from(response.content_length().unwrap_or(0))?)?;
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    JsonText::from_vec(body)
+}
+
+/// An invocation's outcome, kept as the host's text, which the caller receives unchanged.
+pub(super) struct HostReply {
+    ran: bool,
+    text: JsonText,
+}
+
+impl HostReply {
+    fn not_run(reply: Value) -> Self {
+        Self {
+            ran: false,
+            text: reply.into(),
         }
-        Some("completed") if reply.get("result").is_some() => Ok(reply),
-        Some("failed")
-            if reply["code"].as_str().is_some_and(|code| !code.is_empty())
-                && reply["message"].is_string() =>
-        {
-            Ok(reply)
-        }
-        _ => Err(outcome_unknown()),
+    }
+
+    fn check(text: JsonText) -> Result<Self, ApiError> {
+        let head: ReplyHead = serde_json::from_str(text.get()).map_err(|_| outcome_unknown())?;
+        let ran = match head.kind.as_str() {
+            "not_executed"
+                if matches!(
+                    head.reason.as_deref(),
+                    Some("host_unavailable" | "upstream_not_reached")
+                ) =>
+            {
+                false
+            }
+            "completed" if head.result => true,
+            "failed"
+                if head.code.as_deref().is_some_and(|code| !code.is_empty())
+                    && head.message.is_some() =>
+            {
+                true
+            }
+            _ => return Err(outcome_unknown()),
+        };
+        Ok(Self { ran, text })
     }
 }
 
-async fn read_reply(response: reqwest::Response) -> Result<Value, ApiError> {
-    response.json().await.map_err(|_| outcome_unknown())
+/// The fields of a reply that decide its outcome. The result is skipped, not parsed.
+#[derive(Deserialize)]
+struct ReplyHead {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, deserialize_with = "present")]
+    result: bool,
+    reason: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 fn outcome_unknown() -> ApiError {

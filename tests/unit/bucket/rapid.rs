@@ -629,7 +629,7 @@ fn large_snapshots() -> Result<BTreeMap<u64, Bytes>> {
         .map(|version| {
             let mut snapshot = StateSnapshot::decode(&state(version, 1)?)?;
             snapshot.completion.as_mut().unwrap().result =
-                serde_json::json!({"data": "x".repeat(1_000_000)});
+                serde_json::json!({"data": "x".repeat(1_000_000)}).into();
             Ok((version, snapshot.encode()?.into()))
         })
         .collect()
@@ -672,7 +672,7 @@ async fn large_records_and_subsequent_small_writes_stay_on_rapid() -> Result<()>
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     let mut snapshot = StateSnapshot::decode(&state(2, 1)?)?;
     snapshot.completion.as_mut().unwrap().result =
-        serde_json::json!({"data": "x".repeat(5 * 1024 * 1024)});
+        serde_json::json!({"data": "x".repeat(5 * 1024 * 1024)}).into();
     let bytes: Bytes = snapshot.encode()?.into();
     store.put(&f.stream.object(2), bytes.clone()).await?;
     store.put(&f.stream.object(3), state(3, 1)?).await?;
@@ -841,7 +841,7 @@ async fn recovery_ignores_incomplete_tail_but_rejects_corrupt_complete_records()
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     let mut snapshot = StateSnapshot::decode(&state(2, 1)?)?;
     snapshot.completion.as_mut().unwrap().result =
-        serde_json::json!({"data": "x".repeat(5 * 1024 * 1024)});
+        serde_json::json!({"data": "x".repeat(5 * 1024 * 1024)}).into();
     let interrupted = Record {
         version: 2,
         state: snapshot.encode()?,

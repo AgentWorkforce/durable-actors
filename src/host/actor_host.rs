@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
@@ -18,6 +17,7 @@ use crate::actor::{
     ActorSocketInvocation, ActorSocketOutcome, ActorSocketPublisher, validate_socket_effects,
 };
 use crate::host_leases::WaitingOperation;
+use crate::payload::JsonText;
 use crate::request_traces::RequestKind;
 use crate::request_tracking::{
     HostState, RequestCompletion, RequestMetadata, RequestObserver, RequestStage, RequestTracker,
@@ -579,7 +579,7 @@ async fn run_request(
             id,
             request,
             result: Ok(ActorExecutionResult::Completed {
-                result: Value::Null,
+                result: JsonText::null(),
                 effects: vec![],
             }),
             interleaved: false,
@@ -712,7 +712,7 @@ async fn execute(
                     ActorMethodOutcome::Interleaved(outcome)
                 }
                 ActorSocketOutcome::Handled { effects } => ActorMethodOutcome::Completed {
-                    result: Value::Null,
+                    result: JsonText::null(),
                     effects,
                 },
                 ActorSocketOutcome::Failed(failure) => ActorMethodOutcome::Failed(failure),
@@ -787,7 +787,7 @@ async fn commit_outcome(
 
 fn complete_with_state(
     state_version: u64,
-    result: Value,
+    result: JsonText,
     effects: Vec<ActorSocketEffect>,
     database: &HostDatabase,
     publisher: &Arc<dyn ActorSocketPublisher>,

@@ -200,9 +200,10 @@ async fn run_activation(
     };
     assert_eq!(response.host_id, host_id);
     assert_eq!(response.session_id, session);
-    let initial = response
+    let initial: serde_json::Value = response
         .initial_reply
-        .context("assignment omitted operation result")?;
+        .context("assignment omitted operation result")?
+        .decode()?;
     assert_eq!(initial["type"], "completed");
     let assigned = before + i64::from(before == 1);
     if before >= 2 {

@@ -29,6 +29,7 @@ use super::{
     ActorSocketSource, LogLevel, StdioLogSink,
     database_channel::{self, DatabaseScopes},
 };
+use crate::payload::JsonText;
 
 const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 33;
 const DATABASE_FD: i32 = 3;
@@ -161,7 +162,7 @@ impl ActorSocketEffect {
 pub enum ActorMethodOutcome {
     Interleaved(ActorInterleavedOutcome),
     Completed {
-        result: Value,
+        result: JsonText,
         effects: Vec<ActorSocketEffect>,
     },
     Failed(ActorInvocationFailure),
@@ -177,7 +178,7 @@ pub enum ActorSocketOutcome {
 #[derive(Debug, PartialEq)]
 pub struct ActorInterleavedOutcome {
     pub sequence: u64,
-    pub result: Value,
+    pub result: JsonText,
     pub effects: Vec<ActorSocketEffect>,
 }
 
@@ -567,7 +568,7 @@ impl ActorExecutor for JsActorExecutor {
             ExecutorReply::WebsocketHandled { effects, sequence } => Ok(match sequence {
                 Some(sequence) => ActorSocketOutcome::Interleaved(ActorInterleavedOutcome {
                     sequence,
-                    result: Value::Null,
+                    result: JsonText::null(),
                     effects,
                 }),
                 None => ActorSocketOutcome::Handled { effects },
@@ -1186,7 +1187,7 @@ impl ActorExecutorClientMessage {
                 ExecutorReply::Invoked {
                     result, effects, ..
                 } => {
-                    *result = parts.json()?;
+                    *result = JsonText::from_vec(parts.next()?)?;
                     *effects = parts.effects()?;
                 }
                 ExecutorReply::WebsocketHandled { effects, .. } => *effects = parts.effects()?,
@@ -1269,7 +1270,7 @@ enum ExecutorReply {
     Hydrated,
     Invoked {
         #[serde(skip)]
-        result: Value,
+        result: JsonText,
         #[serde(default)]
         sequence: Option<u64>,
         #[serde(skip)]

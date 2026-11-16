@@ -1,5 +1,6 @@
 #[path = "../../fixtures/spans.rs"]
 mod spans;
+use crate::payload::JsonText;
 use crate::request_tracking::HostState;
 use crate::{
     actor::{
@@ -109,7 +110,7 @@ async fn commits_fields_and_sql_and_recovers_them_at_one_version() -> Result<()>
             let result = values["count"].clone();
             write_fields(&*database, values).await?;
             Ok(ActorMethodOutcome::Completed {
-                result,
+                result: result.into(),
                 effects: vec![],
             })
         }
@@ -216,7 +217,7 @@ async fn ordinary_methods_execute_and_commit_without_a_socket_gateway() -> Resul
     );
     assert!(matches!(
         invoke(&host, "request-1").await?,
-        ActorExecutionResult::Completed { result, .. } if result == json!(1)
+        ActorExecutionResult::Completed { result, .. } if result == json!(1).into()
     ));
     assert_eq!(executor.invocations.load(Ordering::Relaxed), 1);
     assert_eq!(state.writes.lock().unwrap().len(), 1);
@@ -313,7 +314,7 @@ async fn assert_reentrant_commit_order(fail_write: bool) -> Result<()> {
             Ok(ActorMethodOutcome::Interleaved(
                 crate::actor::ActorInterleavedOutcome {
                     sequence,
-                    result: json!(sequence),
+                    result: json!(sequence).into(),
                     effects: vec![],
                 },
             ))
@@ -369,14 +370,14 @@ async fn assert_reentrant_commit_order(fail_write: bool) -> Result<()> {
                 .completion
                 .unwrap()
                 .result,
-            json!(1)
+            JsonText::from(json!(1))
         );
         assert_eq!(
             StateSnapshot::decode(&writes[1])?
                 .completion
                 .unwrap()
                 .result,
-            json!(2)
+            JsonText::from(json!(2))
         );
         Ok::<_, anyhow::Error>(())
     };
@@ -404,7 +405,7 @@ async fn an_unconfirmed_interleaved_commit_evicts_once_and_stops_the_actor() -> 
             Ok(ActorMethodOutcome::Interleaved(
                 crate::actor::ActorInterleavedOutcome {
                     sequence: 1,
-                    result: json!(1),
+                    result: json!(1).into(),
                     effects: vec![],
                 },
             ))
@@ -479,7 +480,7 @@ async fn a_reentrant_completion_cannot_open_an_ordinary_invocations_gate() -> Re
             Ok(ActorMethodOutcome::Interleaved(
                 crate::actor::ActorInterleavedOutcome {
                     sequence,
-                    result: json!(sequence),
+                    result: json!(sequence).into(),
                     effects: vec![],
                 },
             ))
@@ -800,7 +801,7 @@ async fn interleaved_actors_replay_durable_results_without_reexecution() -> Resu
             Ok(ActorMethodOutcome::Interleaved(
                 crate::actor::ActorInterleavedOutcome {
                     sequence,
-                    result: json!(sequence),
+                    result: json!(sequence).into(),
                     effects: vec![],
                 },
             ))
@@ -855,7 +856,7 @@ async fn interleaved_admission_continues_while_database_publication_is_pending()
             Ok(ActorMethodOutcome::Interleaved(
                 crate::actor::ActorInterleavedOutcome {
                     sequence,
-                    result: json!(sequence),
+                    result: json!(sequence).into(),
                     effects: vec![],
                 },
             ))
@@ -1158,7 +1159,7 @@ impl ActorExecutor for InvalidEffectsExecutor {
     ) -> Result<ActorMethodOutcome> {
         write_fields(&*database, json!({ "count": 1 })).await?;
         Ok(ActorMethodOutcome::Completed {
-            result: Value::Null,
+            result: JsonText::null(),
             effects: vec![ActorSocketEffect::Close {
                 connection_id: "socket-1".into(),
                 code: 1001,
@@ -1729,7 +1730,7 @@ async fn read_only_results_are_withheld_if_the_lease_expires_during_execution() 
         ) -> Result<ActorMethodOutcome> {
             self.0.fenced.store(true, Ordering::SeqCst);
             Ok(ActorMethodOutcome::Completed {
-                result: json!(8),
+                result: json!(8).into(),
                 effects: vec![],
             })
         }
@@ -1999,7 +2000,7 @@ async fn publishes_automatic_state_after_commit() -> Result<()> {
             let count = fields(&*database).await?["count"].as_u64().unwrap_or(0) + 1;
             write_fields(&*database, json!({"count": count})).await?;
             Ok(ActorMethodOutcome::Completed {
-                result: json!(count),
+                result: json!(count).into(),
                 effects: serde_json::from_value(
                     json!([{ "type":"state_update", "changes":{"count":count}, "removed":[] }]),
                 )?,
@@ -2116,7 +2117,7 @@ async fn socket_events_return_effects_only_after_committing_state() -> Result<()
 
     assert!(matches!(
         result,
-        ActorExecutionResult::Completed { result: Value::Null, ref effects } if effects.len() == 1
+        ActorExecutionResult::Completed { ref result, ref effects } if *result == JsonText::null() && effects.len() == 1
     ));
     assert_eq!(state.writes.lock().unwrap().len(), 1);
     let saved = state.writes.lock().unwrap()[0].clone();
@@ -2175,7 +2176,7 @@ impl ActorExecutor for ImmediateWriter {
         }
         write_fields(&*database, json!({ "count": count + 1 })).await?;
         Ok(ActorMethodOutcome::Completed {
-            result: json!(count + 1),
+            result: json!(count + 1).into(),
             effects: vec![],
         })
     }
@@ -2247,7 +2248,10 @@ async fn immediate_writes_wait_for_durability_and_share_atomic_versions() -> Res
     assert!(snapshots[0].completion.is_some());
     assert!(snapshots[1].completion.is_none());
     assert!(snapshots[2].completion.is_none());
-    assert_eq!(snapshots[3].completion.as_ref().unwrap().result, json!(4));
+    assert_eq!(
+        snapshots[3].completion.as_ref().unwrap().result,
+        JsonText::from(json!(4))
+    );
     for pair in snapshots.windows(2) {
         assert_eq!(
             pair[1].sqlite.parent.as_ref().unwrap().state_version,
@@ -2293,7 +2297,7 @@ impl ActorExecutor for TransactionWriter {
             exec(&*database, "ROLLBACK").await?;
         }
         Ok(ActorMethodOutcome::Completed {
-            result: json!(fields(&*database).await?["count"].as_u64().unwrap_or(0)),
+            result: json!(fields(&*database).await?["count"].as_u64().unwrap_or(0)).into(),
             effects: vec![],
         })
     }
@@ -2395,7 +2399,7 @@ async fn delayed_interleaved_completion_cannot_rewind_an_immediate_write() -> Re
             }
             Ok(ActorMethodOutcome::Interleaved(ActorInterleavedOutcome {
                 sequence: count,
-                result: json!(count),
+                result: json!(count).into(),
                 effects: vec![],
             }))
         }
@@ -2601,7 +2605,7 @@ async fn increment(database: &dyn ActorDatabase) -> Result<ActorMethodOutcome> {
     let count = fields(database).await?["count"].as_u64().unwrap_or(0) + 1;
     write_fields(database, json!({ "count": count })).await?;
     Ok(ActorMethodOutcome::Completed {
-        result: json!(count),
+        result: json!(count).into(),
         effects: Vec::new(),
     })
 }
@@ -2628,7 +2632,7 @@ async fn invoke(host: &ActorHost, request_id: &str) -> Result<ActorExecutionResu
 
 fn completed(count: u64) -> ActorExecutionResult {
     ActorExecutionResult::Completed {
-        result: json!(count),
+        result: json!(count).into(),
         effects: Vec::new(),
     }
 }
@@ -2687,10 +2691,7 @@ async fn restored_request_only_returns_a_saved_result_when_completion_is_present
         if complete {
             assert!(matches!(
                 result,
-                ActorExecutionResult::Completed {
-                    result: Value::Null,
-                    ..
-                }
+                ActorExecutionResult::Completed { ref result, .. } if *result == JsonText::null()
             ));
             assert_eq!(executor.invocations.load(Ordering::Relaxed), 0);
         } else {

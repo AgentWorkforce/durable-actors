@@ -1093,6 +1093,7 @@ dependencies = [
  "google-cloud-storage",
  "hickory-resolver",
  "http",
+ "http-body",
  "jsonwebtoken 10.4.0",
  "k8s-openapi",
  "kube",

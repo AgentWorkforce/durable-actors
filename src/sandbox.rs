@@ -138,7 +138,7 @@ pub struct EnsureHostRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ActorHostHandle {
     #[serde(default)]
-    pub(crate) initial_reply: Option<serde_json::Value>,
+    pub(crate) initial_reply: Option<crate::payload::JsonText>,
     pub lease: Option<crate::host_leases::HostLease>,
     #[serde(default)]
     pub owner_epoch: u64,

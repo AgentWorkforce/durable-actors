@@ -1,7 +1,6 @@
-use crate::{litestream::storage::LtxFile, storage::SnapshotRef};
+use crate::{litestream::storage::LtxFile, payload::JsonText, storage::SnapshotRef};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 pub(crate) mod binary;
 mod legacy;
@@ -21,8 +20,7 @@ pub struct StateSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestCompletion {
-    #[serde(deserialize_with = "Value::deserialize")]
-    pub result: Value,
+    pub result: JsonText,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,7 +81,7 @@ impl StateSnapshot {
         owner_epoch: u64,
         request_id: String,
         sqlite: SqliteSnapshot,
-        result: Value,
+        result: impl Into<JsonText>,
     ) -> Result<Self> {
         let snapshot = Self {
             attribution: None,
@@ -91,7 +89,9 @@ impl StateSnapshot {
             owner_epoch,
             request_id,
             sqlite,
-            completion: Some(RequestCompletion { result }),
+            completion: Some(RequestCompletion {
+                result: result.into(),
+            }),
         };
         snapshot.validate()?;
         Ok(snapshot)

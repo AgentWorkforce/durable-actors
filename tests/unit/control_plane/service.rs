@@ -58,7 +58,7 @@ impl HostProvisioner for UnavailableProvisioner {
         _new_actor: bool,
         _owner_hint: Option<&crate::bucket::OwnershipHint>,
         _: Option<&crate::sandbox::assignment::InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+    ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
         anyhow::bail!("host creation is outside this test")
     }
 
@@ -98,7 +98,7 @@ impl HostProvisioner for FakeRetiringProvisioner {
         _new_actor: bool,
         _owner_hint: Option<&crate::bucket::OwnershipHint>,
         _: Option<&crate::sandbox::assignment::InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+    ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
         anyhow::bail!("host creation is outside this test")
     }
 
@@ -145,7 +145,7 @@ async fn gcs_routes_use_the_hosts_epoch_without_claiming_or_preparing_in_the_con
             _new_actor: bool,
             _owner_hint: Option<&crate::bucket::OwnershipHint>,
             _: Option<&crate::sandbox::assignment::InitialOperation>,
-        ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+        ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
             Ok((self.0.clone(), 42, None))
         }
         async fn terminate_hosts(
@@ -663,7 +663,7 @@ impl HostProvisioner for LosingActivation {
         _new_actor: bool,
         _owner_hint: Option<&crate::bucket::OwnershipHint>,
         _: Option<&crate::sandbox::assignment::InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+    ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
         let host = HostId::new(format!("host.v3.{}.winner", spec.host_config_key()));
         let mut lease = test_lease(&host);
         lease.route = "https://winner.example.com".into();
@@ -752,7 +752,7 @@ impl HostProvisioner for FakeRoutingProvisioner {
         _new_actor: bool,
         _owner_hint: Option<&crate::bucket::OwnershipHint>,
         _: Option<&crate::sandbox::assignment::InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+    ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
         self.calls.lock().unwrap().push(region.to_owned());
         ensure!(
             !self.failed_regions.contains(&region),

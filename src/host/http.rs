@@ -16,6 +16,7 @@ use crate::{
     actor::{ActorExecutionResult, ActorInvocation, ActorKey, ActorSocketPublisher},
     control_plane::{ActorJwtVerifier, ActorPrincipal},
     host::{ActorHost, HostId, sockets::HostSockets},
+    payload::{JsonBody, JsonText},
 };
 
 pub(crate) struct ActorHostHttpService {
@@ -59,7 +60,7 @@ impl ActorHostHttpService {
         operation: crate::sandbox::assignment::InitialOperation,
         owner_epoch: u64,
         startup_ms: f64,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<JsonText> {
         use crate::sandbox::assignment::InitialRequest;
         let routing_ms = operation.routing_ms + startup_ms;
         match operation.request {
@@ -74,28 +75,29 @@ impl ActorHostHttpService {
                 if authorize_grant(grant.as_ref(), Some(&invocation.method)).is_err()
                     || grant.as_ref().is_some_and(|grant| grant.expires_at <= now)
                 {
-                    return Ok(serde_json::to_value(
-                        InvocationReply::failed(
-                            "forbidden",
-                            "operation is outside the actor grant",
-                        )
-                        .with_metadata(None),
-                    )?);
+                    return InvocationReply::failed(
+                        "forbidden",
+                        "operation is outside the actor grant",
+                    )
+                    .with_metadata(None)
+                    .body()?
+                    .into_text();
                 }
-                Ok(serde_json::to_value(
-                    self.execute(invocation, owner_epoch, HostState::Cold, routing_ms)
-                        .await,
-                )?)
+                self.execute(invocation, owner_epoch, HostState::Cold, routing_ms)
+                    .await
+                    .body()?
+                    .into_text()
             }
             InitialRequest::Socket { invocation } => {
                 anyhow::ensure!(
                     invocation.actor == *self.host.actor(),
                     "assignment operation actor mismatch"
                 );
-                Ok(serde_json::to_value(
-                    self.execute_socket(invocation, owner_epoch, HostState::Cold, routing_ms)
+                JsonText::encode(
+                    &self
+                        .execute_socket(invocation, owner_epoch, HostState::Cold, routing_ms)
                         .await,
-                )?)
+                )
             }
         }
     }
@@ -252,7 +254,7 @@ async fn invoke(
     Path(actor): Path<ActorKey>,
     headers: HeaderMap,
     body: Result<Json<InvokeRequest>, JsonRejection>,
-) -> Result<Json<InvocationResponse>, HttpError> {
+) -> Result<InvocationResponse, HttpError> {
     let principal = service.authenticate(&headers)?;
     let Json(request) = body.map_err(json_error)?;
     service.authorize(&principal, &actor, request.owner_epoch)?;
@@ -261,9 +263,7 @@ async fn invoke(
         .as_ref()
         .and_then(|capability| capability.grant.as_ref());
     if let Err(error) = authorize_grant(grant, Some(&request.method)) {
-        return Ok(Json(
-            InvocationReply::failed("forbidden", &error.1).with_metadata(None),
-        ));
+        return Ok(InvocationReply::failed("forbidden", &error.1).with_metadata(None));
     }
     if let Some(grant) = grant {
         info!(event = "delegated_actor_invocation", subject = %grant.subject, grant_id = %grant.grant_id, project_id = %actor.project_id, actor_name = %actor.actor_name, actor_id = %actor.actor_id, request_id = %request.request_id, method = %request.method);
@@ -275,16 +275,14 @@ async fn invoke(
         args: request.args,
     };
     invocation.validate().map_err(bad_request)?;
-    Ok(Json(
-        service
-            .execute(
-                invocation,
-                request.owner_epoch,
-                request.host_state,
-                request.routing_ms,
-            )
-            .await,
-    ))
+    Ok(service
+        .execute(
+            invocation,
+            request.owner_epoch,
+            request.host_state,
+            request.routing_ms,
+        )
+        .await)
 }
 
 fn authorize_grant(
@@ -363,11 +361,34 @@ struct InvocationResponse {
     metadata: Option<crate::request_tracking::RequestMetadata>,
 }
 
+impl InvocationResponse {
+    /// The reply's JSON, which shares a result's text rather than copying it.
+    fn body(&self) -> anyhow::Result<JsonBody> {
+        match &self.outcome {
+            InvocationReply::Completed { result } => JsonBody::with_field(self, "result", result),
+            _ => JsonBody::encode(self),
+        }
+    }
+}
+
+impl IntoResponse for InvocationResponse {
+    fn into_response(self) -> Response {
+        match self.body() {
+            Ok(body) => body.into_response(),
+            Err(error) => {
+                HttpError(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response()
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum InvocationReply {
     Completed {
-        result: Value,
+        /// Written by `InvocationResponse::body`, after the rest of the reply.
+        #[serde(skip)]
+        result: JsonText,
     },
     Failed {
         code: String,

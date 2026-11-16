@@ -1,6 +1,6 @@
+use crate::payload::JsonText;
 use crate::request_tracking::HostState;
 use crate::sandbox::assignment::{AssignmentOutcomeUnknown, InitialOperation};
-use serde_json::Value;
 use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -460,7 +460,7 @@ impl ControlPlaneService {
 
 #[derive(Clone)]
 pub(super) struct ActorTarget {
-    pub initial_reply: Option<Value>,
+    pub initial_reply: Option<JsonText>,
     pub host_state: HostState,
     pub home_region: String,
     pub route: String,
@@ -1047,7 +1047,7 @@ pub(crate) trait HostProvisioner: Send + Sync {
         new_actor: bool,
         owner_hint: Option<&OwnershipHint>,
         operation: Option<&InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<Value>)>;
+    ) -> Result<(HostLease, u64, Option<JsonText>)>;
     async fn terminate_hosts(
         &self,
         spec: &HostLaunchSpec,
@@ -1189,7 +1189,7 @@ impl HostProvisioner for SandboxHostProvisioner {
         new_actor: bool,
         owner_hint: Option<&OwnershipHint>,
         operation: Option<&InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<Value>)> {
+    ) -> Result<(HostLease, u64, Option<JsonText>)> {
         self.launch(spec, region, actor, new_actor, owner_hint, operation)
             .await
     }
@@ -1223,7 +1223,7 @@ impl SandboxHostProvisioner {
         new_actor: bool,
         owner_hint: Option<&OwnershipHint>,
         operation: Option<&InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<Value>)> {
+    ) -> Result<(HostLease, u64, Option<JsonText>)> {
         let started_at = Instant::now();
         let mut request = self.request(spec, region, actor)?;
         request.initial_operation = operation.cloned();
@@ -1259,7 +1259,7 @@ impl SandboxHostProvisioner {
         mut request: EnsureHostRequest,
         node: Option<&str>,
         started_at: Instant,
-    ) -> Result<(HostLease, u64, Option<Value>)> {
+    ) -> Result<(HostLease, u64, Option<JsonText>)> {
         let token = async {
             match &self.runtime_access {
                 Some(access) => Ok(Some(
@@ -1511,7 +1511,7 @@ fn ready_lease(
 }
 
 struct RoutedActor {
-    initial_reply: Option<Value>,
+    initial_reply: Option<JsonText>,
     host_state: HostState,
     placement: ObjectPlacement,
     host_config_key: String,

@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn reads_legacy_results_and_encodes_only_the_current_format() -> Result<()> {
@@ -14,7 +14,15 @@ fn reads_legacy_results_and_encodes_only_the_current_format() -> Result<()> {
     ] {
         let stored = legacy_record(result.clone())?;
         let snapshot = StateSnapshot::decode(&serde_json::to_vec(&stored)?)?;
-        assert_eq!(snapshot.completion.as_ref().unwrap().result, result);
+        assert_eq!(
+            snapshot
+                .completion
+                .as_ref()
+                .unwrap()
+                .result
+                .decode::<Value>()?,
+            result
+        );
         let encoded = serde_json::to_value(StateSnapshot::decode(&snapshot.encode()?)?)?;
         let mut expected = stored;
         expected.as_object_mut().unwrap().remove("result");

@@ -1,4 +1,5 @@
 use super::HostEndpoint;
+use crate::payload::JsonText;
 use crate::{
     actor::{
         ActorDatabase, ActorExecutionResult, ActorInvocation, DatabaseCall, DatabaseResult, RowSink,
@@ -10,7 +11,6 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use serde_json::Value;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -275,7 +275,7 @@ impl DatabaseInvocation {
         self.scope.active.store(false, Ordering::Release);
     }
 
-    pub(super) async fn complete(&self, result: Value, sequence: Option<u64>) -> Result<u64> {
+    pub(super) async fn complete(&self, result: JsonText, sequence: Option<u64>) -> Result<u64> {
         self.close();
         let (reply, response) = oneshot::channel();
         self.database
@@ -386,7 +386,7 @@ enum Command {
 
 struct PendingCompletion {
     scope: Arc<InvocationScope>,
-    result: Value,
+    result: JsonText,
     sequence: Option<u64>,
     reply: oneshot::Sender<Result<u64>>,
 }

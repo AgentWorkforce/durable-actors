@@ -182,7 +182,7 @@ impl SocketGateway {
                 actor.actor_id
             );
             let reply = if let Some(reply) = target.initial_reply.take() {
-                serde_json::from_value::<SocketEventReply>(reply)?
+                reply.decode::<SocketEventReply>()?
             } else {
                 let reply = self
                     .http

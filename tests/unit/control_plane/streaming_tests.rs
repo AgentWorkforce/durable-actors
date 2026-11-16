@@ -752,7 +752,7 @@ impl Stack {
             .await
             .0?;
         match result {
-            crate::actor::ActorExecutionResult::Completed { result, .. } => Ok(result),
+            crate::actor::ActorExecutionResult::Completed { result, .. } => result.decode(),
             other => anyhow::bail!("actor call failed: {other:?}"),
         }
     }
@@ -936,7 +936,7 @@ impl HostProvisioner for SocketTestProvisioner {
         _new_actor: bool,
         _owner_hint: Option<&crate::bucket::OwnershipHint>,
         _: Option<&crate::sandbox::assignment::InitialOperation>,
-    ) -> Result<(HostLease, u64, Option<serde_json::Value>)> {
+    ) -> Result<(HostLease, u64, Option<crate::payload::JsonText>)> {
         anyhow::bail!("fixture host must be active")
     }
     async fn terminate_hosts(

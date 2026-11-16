@@ -1,11 +1,23 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
+use axum::{
+    body::Body,
+    http::header,
+    response::{IntoResponse, Response},
+};
 use bytes::Bytes;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use http_body::{Frame, SizeHint};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::DeserializeOwned};
+use serde_json::value::RawValue;
 use std::{
+    collections::VecDeque,
+    convert::Infallible,
     fmt,
     fs::File,
     io::{self, Read, Write},
     ops::Deref,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
 };
 
 pub(crate) const BUFFER_BYTES: usize = 64 * 1024;
@@ -132,6 +144,146 @@ impl<'de> Deserialize<'de> for Text {
             }
         }
         deserializer.deserialize_str(Visitor)
+    }
+}
+
+/// A JSON document kept as its text, which passes through without being parsed. Clones share the
+/// text.
+// Boxed because `Arc<RawValue>` would copy the text out of its box.
+#[derive(Clone, Debug)]
+pub struct JsonText(Arc<Box<RawValue>>);
+
+impl JsonText {
+    /// Checks that `bytes` hold one JSON document and keeps them as its text, without a copy.
+    pub fn from_vec(bytes: Vec<u8>) -> Result<Self> {
+        Ok(RawValue::from_string(String::from_utf8(bytes)?)?.into())
+    }
+
+    pub fn encode(value: &impl Serialize) -> Result<Self> {
+        Ok(serde_json::value::to_raw_value(value)?.into())
+    }
+
+    pub fn null() -> Self {
+        RawValue::NULL.to_owned().into()
+    }
+
+    pub fn get(&self) -> &str {
+        self.0.get()
+    }
+
+    pub fn decode<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_str(self.get())?)
+    }
+
+    /// The text as a buffer that shares it.
+    pub fn bytes(&self) -> Bytes {
+        Bytes::from_owner(self.clone())
+    }
+}
+
+impl Default for JsonText {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+impl From<Box<RawValue>> for JsonText {
+    fn from(value: Box<RawValue>) -> Self {
+        Self(Arc::new(value))
+    }
+}
+impl From<serde_json::Value> for JsonText {
+    fn from(value: serde_json::Value) -> Self {
+        serde_json::value::to_raw_value(&value)
+            .expect("a JSON value always encodes")
+            .into()
+    }
+}
+impl AsRef<[u8]> for JsonText {
+    fn as_ref(&self) -> &[u8] {
+        self.get().as_bytes()
+    }
+}
+impl PartialEq for JsonText {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+impl Eq for JsonText {}
+impl Serialize for JsonText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for JsonText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Box::<RawValue>::deserialize(deserializer).map(Self::from)
+    }
+}
+
+/// A JSON body sent from shared buffers, so the documents inside it are never copied.
+pub(crate) struct JsonBody(VecDeque<Bytes>);
+
+impl JsonBody {
+    pub fn encode(value: &impl Serialize) -> Result<Self> {
+        Ok(Self(VecDeque::from([serde_json::to_vec(value)?.into()])))
+    }
+
+    /// `object` with `value` added as its last `field`.
+    pub fn with_field(object: &impl Serialize, field: &str, value: &JsonText) -> Result<Self> {
+        let mut head = serde_json::to_vec(object)?;
+        ensure!(head.pop() == Some(b'}'), "a JSON body needs an object");
+        if head.len() > 1 {
+            head.push(b',');
+        }
+        serde_json::to_writer(&mut head, field)?;
+        head.push(b':');
+        Ok(Self(VecDeque::from([
+            head.into(),
+            value.bytes(),
+            Bytes::from_static(b"}"),
+        ])))
+    }
+
+    pub fn into_text(self) -> Result<JsonText> {
+        let mut text = Vec::with_capacity(self.len());
+        for bytes in &self.0 {
+            text.extend_from_slice(bytes);
+        }
+        JsonText::from_vec(text)
+    }
+
+    fn len(&self) -> usize {
+        self.0.iter().map(Bytes::len).sum()
+    }
+}
+
+impl IntoResponse for JsonBody {
+    fn into_response(self) -> Response {
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            Body::new(self),
+        )
+            .into_response()
+    }
+}
+
+impl http_body::Body for JsonBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        Poll::Ready(self.0.pop_front().map(|bytes| Ok(Frame::data(bytes))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.len() as u64)
     }
 }
 

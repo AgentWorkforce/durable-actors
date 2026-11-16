@@ -205,13 +205,15 @@ async fn connection_lookup_is_scoped_to_its_invocation_and_does_not_block_other_
         let fast = async {
             requests.recv().await.context("no lookup")?;
             assert!(
-                matches!(invoke("fast").await?, ActorMethodOutcome::Completed { result, .. } if result == json!(42))
+                matches!(invoke("fast").await?, ActorMethodOutcome::Completed { result, .. } if result == json!(42).into())
             );
             release.add_permits(1);
             anyhow::Ok(())
         };
         let (slow, ()) = tokio::try_join!(invoke("slow"), fast)?;
-        assert!(matches!(slow, ActorMethodOutcome::Completed { result, .. } if result == json!(1)));
+        assert!(
+            matches!(slow, ActorMethodOutcome::Completed { result, .. } if result == json!(1).into())
+        );
         anyhow::Ok(())
     };
     let result = timeout(Duration::from_secs(2), async {
@@ -313,10 +315,10 @@ async fn multiplexes_out_of_order_replies_before_peer_disconnect() -> Result<()>
     let _ = running.await;
     let (first, second) = replies?;
     assert!(
-        matches!(first, ActorMethodOutcome::Completed { result, .. } if result == json!("first"))
+        matches!(first, ActorMethodOutcome::Completed { result, .. } if result == json!("first").into())
     );
     assert!(
-        matches!(second, ActorMethodOutcome::Completed { result, .. } if result == json!("second"))
+        matches!(second, ActorMethodOutcome::Completed { result, .. } if result == json!("second").into())
     );
     Ok(())
 }
@@ -380,7 +382,7 @@ async fn one_javascript_executor_runs_until_host_shutdown() -> Result<()> {
     assert_eq!(
         outcome,
         ActorMethodOutcome::Completed {
-            result: json!(2),
+            result: json!(2).into(),
             effects: Vec::new(),
         }
     );
@@ -461,7 +463,7 @@ async fn commands_carry_no_sqlite_state() -> Result<()> {
             assert_eq!(
                 outcome,
                 ActorMethodOutcome::Completed {
-                    result: json!(1),
+                    result: json!(1).into(),
                     effects: vec![],
                 }
             );
@@ -605,7 +607,7 @@ async fn large_results_and_messages_arrive_whole_beside_inline_effects() -> Resu
         result??.0,
         ActorMethodOutcome::Interleaved(ActorInterleavedOutcome {
             sequence: 4,
-            result: json!({"html": html}),
+            result: json!({"html": html}).into(),
             effects,
         })
     );

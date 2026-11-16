@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 axum = { version = "0.8", features = ["ws", "http2"] }
 bytes = "1"
+http-body = "1"
 prost = "0.14"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }

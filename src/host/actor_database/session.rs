@@ -4,6 +4,7 @@ use super::{
 };
 use crate::host::HostEndpoint;
 use crate::node_cache::NodeCacheClient;
+use crate::payload::JsonText;
 use crate::{
     actor::{
         ActorExecutionResult, ActorInvocation, ActorInvocationFailure, DatabaseCall,
@@ -15,7 +16,6 @@ use crate::{
     storage::{SnapshotRef, WritePlan},
 };
 use anyhow::{Context, Result, ensure};
-use serde_json::Value;
 use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
@@ -259,7 +259,7 @@ impl DatabaseSession {
         &mut self,
         invocation: &ActorInvocation,
         owner_epoch: Option<u64>,
-        result: Value,
+        result: JsonText,
         committed: Option<u64>,
         origin: CommitOrigin,
     ) -> Result<u64> {
@@ -434,7 +434,7 @@ impl DatabaseSession {
         invocation: &ActorInvocation,
         owner_epoch: u64,
         cached: &mut ResidentDatabase,
-        result: Value,
+        result: JsonText,
         txid: u64,
         origin: CommitOrigin,
     ) -> Result<()> {
@@ -666,7 +666,7 @@ struct ResidentDatabase {
     published: Option<u64>,
     synced: u64,
     last_request_id: Option<String>,
-    last_result: Option<Value>,
+    last_result: Option<JsonText>,
     next_write: Option<WritePlan>,
     pending: Option<PendingStateCommit>,
 }
@@ -742,7 +742,7 @@ impl ResidentDatabase {
         self.last_result = completion.map(|completion| completion.result);
     }
 
-    fn replay(&self, request_id: &str) -> Option<Value> {
+    fn replay(&self, request_id: &str) -> Option<JsonText> {
         (self.last_request_id.as_deref() == Some(request_id))
             .then(|| self.last_result.clone())
             .flatten()

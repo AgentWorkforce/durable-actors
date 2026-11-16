@@ -71,7 +71,7 @@ async fn assignment_is_authenticated_single_use_and_waits_for_readiness() -> any
                 .ready
                 .send(Ok(super::super::process::HostReadiness {
                     initial_reply: with_operation
-                        .then(|| serde_json::json!({"type":"completed", "result":7})),
+                        .then(|| serde_json::json!({"type":"completed", "result":7}).into()),
                     host_id: HostId::new("host.v3.test.one"),
                     session_id: "session".into(),
                     route: "https://host.test".into(),

@@ -1,6 +1,47 @@
-use crate::payload::{Spool, Text, encode};
+use crate::payload::{JsonBody, JsonText, Spool, Text, encode};
 use anyhow::Result;
+use serde_json::{Value, json};
 use std::io::Write;
+
+#[test]
+fn json_text_keeps_the_buffer_it_was_read_into() -> Result<()> {
+    let bytes = br#"{"rows":[1,2,3]}"#.to_vec();
+    let address = bytes.as_ptr();
+    let text = JsonText::from_vec(bytes)?;
+    assert_eq!(text.get().as_ptr(), address);
+    assert_eq!(text.clone().bytes().as_ptr(), address);
+    assert!(JsonText::from_vec(br#"{"rows":"#.to_vec()).is_err());
+    assert!(JsonText::from_vec(b"1 2".to_vec()).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn json_bodies_send_a_field_from_its_own_text() -> Result<()> {
+    use http_body::Body as _;
+    let rows = JsonText::from(json!([1, 2]));
+    for (object, expected) in [
+        (json!({}), json!({"rows": [1, 2]})),
+        (
+            json!({"type": "completed"}),
+            json!({"type": "completed", "rows": [1, 2]}),
+        ),
+    ] {
+        let body = JsonBody::with_field(&object, "rows", &rows)?;
+        assert_eq!(body.0[1].as_ptr(), rows.get().as_ptr());
+        let length = body.size_hint().exact();
+        let bytes = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX).await?;
+        assert_eq!(length, Some(bytes.len() as u64));
+        assert_eq!(serde_json::from_slice::<Value>(&bytes)?, expected);
+    }
+    assert_eq!(
+        JsonBody::with_field(&json!({}), "rows", &rows)?
+            .into_text()?
+            .get(),
+        r#"{"rows":[1,2]}"#
+    );
+    assert!(JsonBody::with_field(&json!([]), "rows", &rows).is_err());
+    Ok(())
+}
 
 #[test]
 fn large_payloads_spill_and_survive_slicing_and_cloning() -> Result<()> {

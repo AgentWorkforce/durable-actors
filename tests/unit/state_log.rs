@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn round_trips_sqlite_commit_and_result() -> Result<()> {

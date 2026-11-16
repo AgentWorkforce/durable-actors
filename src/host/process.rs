@@ -39,7 +39,7 @@ const EXECUTOR_STARTUP_TIMEOUT: Duration = RAPID_OPERATION_TIMEOUT.saturating_mu
 #[serde(rename_all = "camelCase")]
 pub(super) struct HostReadiness {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub initial_reply: Option<serde_json::Value>,
+    pub initial_reply: Option<crate::payload::JsonText>,
     pub host_id: super::HostId,
     pub session_id: String,
     pub route: String,
