@@ -4,7 +4,8 @@ use crate::state_log::{SqliteSnapshot, StateSnapshot};
 use crate::storage::SnapshotRef;
 
 // Below this a checkpoint saves less than its own upload costs.
-const MIN_LOG_BYTES: u64 = 1024 * 1024;
+const MIN_LOG_BYTES: u64 = 1024 * 1024; // 1 MB
+const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024; // 32 MB
 // Bounds the history a restore replays when commits are tiny. Tests write tiny commits, so they
 // exercise this bound.
 const MAX_LOG_VERSIONS: u64 = if cfg!(test) { 32 } else { 256 };
@@ -289,8 +290,12 @@ impl Progress {
 
     fn due(&self, version: u64) -> bool {
         let logged: u64 = self.logged.iter().map(|(_, bytes)| bytes).sum();
-        version.saturating_sub(self.completed) >= MAX_LOG_VERSIONS
-            || (version > self.completed && logged >= self.base_bytes.max(MIN_LOG_BYTES))
+        let max_ltx_files_reached = version.saturating_sub(self.completed) >= MAX_LOG_VERSIONS;
+        let max_log_bytes_reached = version > self.completed
+            && logged >= self.base_bytes.clamp(MIN_LOG_BYTES, MAX_LOG_BYTES);
+
+        // Trigger compaction if we have max # of ltx files, or total bytes exceeds MAX_LOG_BYTES.
+        max_ltx_files_reached || max_log_bytes_reached
     }
 
     fn completed(&mut self, version: u64, base_bytes: Option<u64>) {
