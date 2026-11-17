@@ -21,7 +21,7 @@ export function ActorTypeEventsCard({ actorName, timeWindow }: ActorTypeEventsCa
     const kills = history?.events.map(event => event.item)
     const events = kills && killEvents(kills, timeWindow)
     return (
-        <SectionCard title="Events" description="Sandbox kills across all instances." busy={!events && !isError} className="pb-3">
+        <SectionCard title="Events" busy={!events && !isError} className="pb-3">
             {isError ? (
                 <p className="py-4 text-[13px] text-muted-foreground">Couldn't reach the observer API.</p>
             ) : events ? (

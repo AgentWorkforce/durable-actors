@@ -24,7 +24,7 @@ const levels: Record<KillReason, LogLevel> = {
     killed: "warn"
 }
 const messages: Record<KillReason, string> = {
-    out_of_memory: "Sandbox used more memory than its limit.",
+    out_of_memory: "Actor used more memory than it's limit",
     out_of_disk: "Sandbox used more disk than its limit.",
     evicted: "Sandbox evicted by its node.",
     killed: "Sandbox killed by a signal the platform didn't send."
