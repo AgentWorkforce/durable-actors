@@ -1,27 +1,25 @@
 //! Asynchronous checkpointing of a single-zone bucket (S3 Express One Zone) to a regional
 //! S3 Standard bucket.
 //!
-//! An Express directory bucket stores its data in one Availability Zone, so losing that zone loses
-//! every actor's state. [`CheckpointedBucket`] wraps the Express bucket: reads go to Express only,
-//! and every successful write is queued for a background [`Checkpointer`] that copies the same
-//! bytes and generation to the Standard bucket. The write path never waits on the copy.
+//! [`CheckpointedBucket`] wraps the Express bucket: reads go to Express only, and every successful
+//! write is queued for a background [`Checkpointer`] that copies the same bytes and generation to
+//! the Standard bucket. The write path never waits on the copy. The copy keeps the bucket layout
+//! and `da-generation` metadata, so the Standard bucket is itself a valid durable-actors bucket.
 //!
-//! The copy keeps the bucket layout and the `da-generation` metadata, so the Standard bucket is
-//! itself a valid durable-actors bucket. Recovery either points `DURABLE_ACTORS_BUCKET` at it
-//! directly, or [`restore`]s it into a new Express bucket in another zone.
+//! Consistency: each actor's writes are copied strictly in write order, one at a time; actors copy
+//! in parallel. A copy holds an exact generation, and a read-back that finds a newer one goes to
+//! the back of its lane. A host's startup reconciliation runs before anything else in its lane.
+//! So the copy never holds a snapshot without its SQLite parent, or an owner record naming a
+//! snapshot it lacks. [`verify`] proves this for a whole bucket.
 //!
-//! Ordering: the queue is flushed oldest write first, and new objects (snapshots, first owner
-//! records) are copied before replaced objects (owner records) in each batch. A replace is copied
-//! only once every earlier create in its batch has been copied. So the copy never holds an owner
-//! record that points at a snapshot it does not have.
-//!
-//! RPO: the copy trails Express by the time the queue takes to drain, normally one Standard PUT
-//! (tens of milliseconds). `lag_ms` reports the age of the oldest write not yet copied. A warning
-//! is logged when it exceeds `max_lag`. The queue is never allowed to slow writes. Writes still
-//! queued when a host dies without a clean shutdown are lost from the copy (they stay on Express).
+//! RPO: `lag_ms` is the age of the oldest write not yet copied. Writes still queued when a host
+//! dies are recovered from Express by the next activation's reconciliation, unless the zone is
+//! lost first.
+
+mod queue;
+mod restore;
 
 use std::{
-    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -29,11 +27,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
+
+use queue::{Expect, Job, Outcome, Pending, Queue};
+pub use restore::{RestoreReport, VerifyReport, restore, verify};
 
 use super::{Bucket, BucketObject};
 
@@ -49,13 +49,15 @@ pub trait Mirror: Bucket {
 pub struct CheckpointConfig {
     /// The lag above which a warning is logged. It is an alert threshold, not backpressure.
     pub max_lag: Duration,
-    /// Queued payload bytes kept in memory. Past this, queued writes keep only their key and the
-    /// checkpointer reads the current object back from the source.
+    /// Queued payload bytes kept in memory. Past this, queued writes keep only their key and
+    /// generation, and the checkpointer reads the object back from the source.
     pub max_pending_bytes: usize,
-    /// Objects copied concurrently.
+    /// Lanes (actors) copied concurrently.
     pub concurrency: usize,
-    /// Objects taken from the queue per batch.
-    pub batch: usize,
+    /// Before copying an owner record, copy any of its actor's snapshots the mirror lacks. The
+    /// control plane writes owner records (takeover, recovery) naming snapshots another process
+    /// wrote, which its own queue never saw.
+    pub reconcile_owners: bool,
 }
 
 impl Default for CheckpointConfig {
@@ -63,8 +65,8 @@ impl Default for CheckpointConfig {
         Self {
             max_lag: Duration::from_secs(5),
             max_pending_bytes: 64 << 20,
-            concurrency: 8,
-            batch: 128,
+            concurrency: 16,
+            reconcile_owners: false,
         }
     }
 }
@@ -72,100 +74,13 @@ impl Default for CheckpointConfig {
 /// Point-in-time checkpoint metrics, also logged as `event = "storage_checkpoint"`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CheckpointStats {
-    /// Objects written to the source but not yet copied.
+    /// Writes not yet copied.
     pub pending: u64,
     pub pending_bytes: u64,
     /// Age of the oldest write not yet copied, or 0 when the copy is current.
     pub lag_ms: u64,
     pub copied_total: u64,
     pub failures_total: u64,
-}
-
-struct Pending {
-    key: String,
-    generation: i64,
-    /// `None` when the payload was dropped to bound memory, or the write's outcome is unknown.
-    bytes: Option<bytes::Bytes>,
-    created: bool,
-    since: Instant,
-}
-
-#[derive(Default)]
-struct Queue {
-    next: u64,
-    entries: BTreeMap<u64, Pending>,
-    keys: HashMap<String, u64>,
-    bytes: usize,
-    in_flight: usize,
-    oldest_in_flight: Option<Instant>,
-}
-
-impl Queue {
-    fn push(&mut self, mut entry: Pending, max_bytes: usize) {
-        if let Some(sequence) = self.keys.remove(&entry.key)
-            && let Some(previous) = self.entries.remove(&sequence)
-        {
-            // A newer write supersedes the queued one, but the copy has been stale since then.
-            entry.since = entry.since.min(previous.since);
-            entry.created &= previous.created;
-            self.bytes -= previous.bytes.as_ref().map_or(0, bytes::Bytes::len);
-        }
-        if let Some(bytes) = &entry.bytes {
-            if self.bytes + bytes.len() > max_bytes {
-                entry.bytes = None;
-            } else {
-                self.bytes += bytes.len();
-            }
-        }
-        let sequence = self.next;
-        self.next += 1;
-        self.keys.insert(entry.key.clone(), sequence);
-        self.entries.insert(sequence, entry);
-    }
-
-    fn take(&mut self, limit: usize) -> Vec<(u64, Pending)> {
-        let sequences: Vec<u64> = self.entries.keys().take(limit).copied().collect();
-        let batch: Vec<_> = sequences
-            .into_iter()
-            .filter_map(|sequence| {
-                let entry = self.entries.remove(&sequence)?;
-                self.keys.remove(&entry.key);
-                self.bytes -= entry.bytes.as_ref().map_or(0, bytes::Bytes::len);
-                Some((sequence, entry))
-            })
-            .collect();
-        self.in_flight = batch.len();
-        self.oldest_in_flight = batch.iter().map(|(_, entry)| entry.since).min();
-        batch
-    }
-
-    /// Puts back a write that was not copied, unless a newer write of the key is already queued.
-    fn retry(&mut self, sequence: u64, entry: Pending) {
-        if let Some(newer) = self
-            .keys
-            .get(&entry.key)
-            .and_then(|sequence| self.entries.get_mut(sequence))
-        {
-            newer.since = newer.since.min(entry.since);
-            newer.created &= entry.created;
-            return;
-        }
-        self.bytes += entry.bytes.as_ref().map_or(0, bytes::Bytes::len);
-        self.keys.insert(entry.key.clone(), sequence);
-        self.entries.insert(sequence, entry);
-    }
-
-    fn oldest(&self) -> Option<Instant> {
-        let queued = self.entries.values().map(|entry| entry.since).min();
-        match (queued, self.oldest_in_flight) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-    }
-
-    fn is_idle(&self) -> bool {
-        self.entries.is_empty() && self.in_flight == 0
-    }
 }
 
 struct Shared {
@@ -210,48 +125,25 @@ impl Checkpointer {
     }
 
     /// Queues a successful write. Never blocks on the mirror.
-    pub fn record(&self, key: &str, generation: i64, bytes: bytes::Bytes, created: bool) {
-        self.push(key, generation, Some(bytes), created);
+    pub fn record(&self, key: &str, generation: i64, bytes: bytes::Bytes) {
+        self.push(key, Expect::Exact(generation), Some(bytes));
     }
 
-    /// Queues a key whose last write has an unknown outcome; the current object is copied.
+    /// Queues a key whose last write has an unknown outcome.
     pub fn record_uncertain(&self, key: &str) {
-        self.push(key, 0, None, false);
+        self.push(key, Expect::Unknown, None);
     }
 
-    fn push(&self, key: &str, generation: i64, bytes: Option<bytes::Bytes>, created: bool) {
-        self.shared.queue.lock().unwrap().push(
-            Pending {
-                key: key.into(),
-                generation,
-                bytes,
-                created,
-                since: Instant::now(),
-            },
-            self.shared.config.max_pending_bytes,
-        );
-        self.shared.queued.notify_one();
-    }
-
-    /// Queues every object under `prefix` that the source holds and the mirror lacks. A host that
-    /// died before draining its queue leaves immutable snapshots that are never written again, so
-    /// the next activation of the actor reconciles its snapshot prefix (one LIST on each side).
-    pub async fn reconcile(&self, prefix: &str) -> Result<usize> {
-        let (source, copied) = tokio::try_join!(
-            self.shared.source.list(prefix),
-            self.shared.target.list(prefix)
-        )?;
-        let copied: std::collections::HashSet<_> = copied.into_iter().collect();
-        let mut missing = 0;
-        for key in source.into_iter().filter(|key| !copied.contains(key)) {
-            // Snapshots are created once, so they keep their place ahead of owner records.
-            self.push(&key, 0, None, true);
-            missing += 1;
-        }
-        if missing > 0 {
-            tracing::info!(event = "storage_checkpoint_reconciled", prefix, missing,);
-        }
-        Ok(missing)
+    /// Holds `prefix`'s lane until every object under it that the mirror lacks is queued ahead of
+    /// the lane's other writes. A host that died before draining its queue leaves snapshots that
+    /// are never written again; its successor's owner record must not reach the mirror before
+    /// them. Retries until it succeeds or the checkpointer stops.
+    pub fn reconcile_in_background(self: &Arc<Self>, prefix: &str) {
+        let lane = queue::lane_of(prefix);
+        self.shared.queue.lock().unwrap().gate(&lane);
+        let checkpointer = self.clone();
+        let prefix = prefix.to_owned();
+        tokio::spawn(async move { checkpointer.reconcile_until_done(&prefix, &lane).await });
     }
 
     pub fn stats(&self) -> CheckpointStats {
@@ -280,6 +172,76 @@ impl Checkpointer {
             }
         }
     }
+
+    fn push(&self, key: &str, expect: Expect, bytes: Option<bytes::Bytes>) {
+        let entry = Pending {
+            key: key.into(),
+            expect,
+            bytes,
+            since: Instant::now(),
+        };
+        let max = self.shared.config.max_pending_bytes;
+        self.shared.queue.lock().unwrap().push(entry, max);
+        self.shared.queued.notify_one();
+    }
+
+    async fn reconcile_until_done(&self, prefix: &str, lane: &str) {
+        let mut failures: u32 = 0;
+        loop {
+            match self.reconcile(prefix, lane).await {
+                Ok(()) => break,
+                Err(error) => {
+                    failures += 1;
+                    tracing::warn!(
+                        event = "storage_checkpoint_reconcile_failed",
+                        prefix,
+                        failures,
+                        error = format!("{error:#}"),
+                    );
+                    let pause = Duration::from_millis(250 * u64::from(failures.min(20)));
+                    tokio::select! {
+                        () = self.stop.cancelled() => return,
+                        () = tokio::time::sleep(pause) => {}
+                    }
+                }
+            }
+        }
+        self.shared.queue.lock().unwrap().ungate(lane);
+        self.shared.queued.notify_one();
+    }
+
+    async fn reconcile(&self, prefix: &str, lane: &str) -> Result<()> {
+        let (source, copied) = tokio::try_join!(
+            self.shared.source.list(prefix),
+            self.shared.target.list(prefix)
+        )?;
+        let copied: std::collections::HashSet<_> = copied.into_iter().collect();
+        let mut missing: Vec<_> = source
+            .into_iter()
+            .filter(|key| !copied.contains(key))
+            .collect();
+        missing.sort();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            event = "storage_checkpoint_reconciled",
+            prefix,
+            missing = missing.len(),
+        );
+        let now = Instant::now();
+        let entries = missing
+            .into_iter()
+            .map(|key| Pending {
+                key,
+                expect: Expect::Current,
+                bytes: None,
+                since: now,
+            })
+            .collect();
+        self.shared.queue.lock().unwrap().push_front(lane, entries);
+        Ok(())
+    }
 }
 
 impl Drop for Checkpointer {
@@ -291,8 +253,8 @@ impl Drop for Checkpointer {
 fn stats(shared: &Shared) -> CheckpointStats {
     let queue = shared.queue.lock().unwrap();
     CheckpointStats {
-        pending: (queue.entries.len() + queue.in_flight) as u64,
-        pending_bytes: queue.bytes as u64,
+        pending: queue.pending() as u64,
+        pending_bytes: queue.bytes() as u64,
         lag_ms: queue
             .oldest()
             .map_or(0, |since| since.elapsed().as_millis() as u64),
@@ -301,130 +263,141 @@ fn stats(shared: &Shared) -> CheckpointStats {
     }
 }
 
-const RETRY_MIN: Duration = Duration::from_millis(100);
-const RETRY_MAX: Duration = Duration::from_secs(5);
-
 async fn run(shared: Arc<Shared>, stop: CancellationToken) {
-    let mut backoff = RETRY_MIN;
     loop {
         let queued = shared.queued.notified();
         tokio::pin!(queued);
         queued.as_mut().enable();
-        let batch = shared.queue.lock().unwrap().take(shared.config.batch);
-        if batch.is_empty() {
-            shared.drained.notify_waiters();
-            tokio::select! {
-                () = stop.cancelled() => return,
-                () = &mut queued => continue,
-            }
-        }
-        let failed = copy_batch(&shared, batch).await;
-        let had_failures = !failed.is_empty();
-        let idle = {
+        let (jobs, retry, idle) = {
             let mut queue = shared.queue.lock().unwrap();
-            for (sequence, entry) in failed {
-                queue.retry(sequence, entry);
-            }
-            queue.in_flight = 0;
-            queue.oldest_in_flight = None;
-            queue.is_idle()
+            let jobs = queue.take(shared.config.concurrency.max(1), Instant::now());
+            (jobs, queue.next_retry(), queue.is_idle())
         };
-        if idle {
-            shared.drained.notify_waiters();
-        }
-        if had_failures {
+        if jobs.is_empty() {
+            if idle {
+                shared.drained.notify_waiters();
+            }
+            let wake = retry.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 () = stop.cancelled() => return,
-                () = tokio::time::sleep(backoff) => {}
+                () = &mut queued => {}
+                () = tokio::time::sleep_until(wake) => {}
             }
-            backoff = (backoff * 2).min(RETRY_MAX);
-        } else {
-            backoff = RETRY_MIN;
+            continue;
+        }
+        let outcomes =
+            futures_util::future::join_all(jobs.iter().map(|job| copy(&shared, job))).await;
+        let mut queue = shared.queue.lock().unwrap();
+        let now = Instant::now();
+        for (job, outcome) in jobs.iter().zip(outcomes) {
+            queue.complete(job, outcome, now);
         }
     }
 }
 
-/// Copies creates, then replaces; replaces wait for the next batch when any create failed.
-async fn copy_batch(shared: &Shared, batch: Vec<(u64, Pending)>) -> Vec<(u64, Pending)> {
-    let (creates, replaces): (Vec<_>, Vec<_>) =
-        batch.into_iter().partition(|(_, entry)| entry.created);
-    let mut failed = copy_all(shared, creates).await;
-    if failed.is_empty() {
-        failed = copy_all(shared, replaces).await;
-    } else {
-        failed.extend(replaces);
-    }
-    failed
-}
-
-async fn copy_all(shared: &Shared, entries: Vec<(u64, Pending)>) -> Vec<(u64, Pending)> {
-    stream::iter(entries)
-        .map(|(sequence, entry)| async move {
-            match copy(shared, &entry).await {
-                Ok(()) => {
-                    shared.copied.fetch_add(1, Ordering::Relaxed);
-                    None
-                }
-                Err(error) => {
-                    shared.failures.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        event = "storage_checkpoint_copy_failed",
-                        key = entry.key,
-                        error = format!("{error:#}"),
-                    );
-                    Some((sequence, entry))
-                }
+async fn copy(shared: &Shared, job: &Job) -> Outcome {
+    match attempt(shared, job).await {
+        Ok(outcome) => {
+            if let Outcome::Copied = outcome {
+                shared.copied.fetch_add(1, Ordering::Relaxed);
             }
-        })
-        .buffer_unordered(shared.config.concurrency.max(1))
-        .filter_map(std::future::ready)
-        .collect()
-        .await
+            outcome
+        }
+        Err(error) => {
+            shared.failures.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                event = "storage_checkpoint_copy_failed",
+                key = job.key,
+                error = format!("{error:#}"),
+            );
+            Outcome::Failed
+        }
+    }
 }
 
-async fn copy(shared: &Shared, entry: &Pending) -> Result<()> {
-    let (generation, bytes) = match &entry.bytes {
-        Some(bytes) => (entry.generation, bytes.clone()),
-        None => match shared.source.get(&entry.key).await? {
-            Some(BucketObject { generation, bytes }) => (generation, bytes),
-            // Nothing was written (an uncertain write that failed); nothing to copy.
-            None => return Ok(()),
-        },
+async fn attempt(shared: &Shared, job: &Job) -> Result<Outcome> {
+    if shared.config.reconcile_owners
+        && let Some(prefix) = queue::owner_snapshots(&job.key)
+    {
+        copy_missing(shared, &prefix).await?;
+    }
+    if let (Expect::Exact(generation), Some(bytes)) = (job.expect, &job.bytes) {
+        shared
+            .target
+            .mirror(&job.key, generation, bytes.clone())
+            .await?;
+        return Ok(Outcome::Copied);
+    }
+    let Some(BucketObject { generation, bytes }) = shared.source.get(&job.key).await? else {
+        return Ok(Outcome::Dropped);
     };
-    shared.target.mirror(&entry.key, generation, bytes).await
+    let copy = match job.expect {
+        Expect::Current => true,
+        Expect::Exact(expected) => generation == expected,
+        Expect::Unknown => false,
+    };
+    if !copy {
+        // A generation this entry did not record may depend on writes queued after it.
+        return Ok(Outcome::Requeue(generation));
+    }
+    shared.target.mirror(&job.key, generation, bytes).await?;
+    Ok(Outcome::Copied)
+}
+
+/// Copies, in key order, every object under `prefix` that the source holds and the mirror lacks.
+async fn copy_missing(shared: &Shared, prefix: &str) -> Result<()> {
+    let (source, copied) =
+        tokio::try_join!(shared.source.list(prefix), shared.target.list(prefix))?;
+    let copied: std::collections::HashSet<_> = copied.into_iter().collect();
+    let mut missing: Vec<_> = source
+        .into_iter()
+        .filter(|key| !copied.contains(key))
+        .collect();
+    missing.sort();
+    for key in missing {
+        if let Some(object) = shared.source.get(&key).await? {
+            shared
+                .target
+                .mirror(&key, object.generation, object.bytes)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn report(shared: Arc<Shared>, stop: CancellationToken) {
-    const INTERVAL: Duration = Duration::from_secs(10);
-    let mut ticker = tokio::time::interval(INTERVAL);
+    let mut ticker = tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             () = stop.cancelled() => return,
             _ = ticker.tick() => {}
         }
-        let stats = stats(&shared);
-        let over = stats.lag_ms > shared.config.max_lag.as_millis() as u64;
-        tracing::event!(
-            target: "durable_actors::checkpoint",
-            tracing::Level::INFO,
-            event = "storage_checkpoint",
-            pending = stats.pending,
-            pending_bytes = stats.pending_bytes,
+        log_stats(&shared);
+    }
+}
+
+fn log_stats(shared: &Shared) {
+    let stats = stats(shared);
+    let max_lag_ms = shared.config.max_lag.as_millis() as u64;
+    let over = stats.lag_ms > max_lag_ms;
+    tracing::info!(
+        event = "storage_checkpoint",
+        pending = stats.pending,
+        pending_bytes = stats.pending_bytes,
+        lag_ms = stats.lag_ms,
+        lag_exceeded = over,
+        copied_total = stats.copied_total,
+        failures_total = stats.failures_total,
+    );
+    if over {
+        tracing::warn!(
+            event = "storage_checkpoint_lag_exceeded",
             lag_ms = stats.lag_ms,
-            lag_exceeded = over,
-            copied_total = stats.copied_total,
-            failures_total = stats.failures_total,
+            max_lag_ms,
+            pending = stats.pending,
+            "regional checkpoint copy is behind the single-zone bucket"
         );
-        if over {
-            tracing::warn!(
-                event = "storage_checkpoint_lag_exceeded",
-                lag_ms = stats.lag_ms,
-                max_lag_ms = shared.config.max_lag.as_millis() as u64,
-                pending = stats.pending,
-                "regional checkpoint copy is behind the single-zone bucket"
-            );
-        }
     }
 }
 
@@ -440,6 +413,19 @@ impl CheckpointedBucket {
         Self {
             source,
             checkpointer,
+        }
+    }
+
+    /// After a write with an unknown outcome, queues what the source now holds in the write's
+    /// place: a retried request can report a lost precondition after the first one succeeded
+    /// (see `super::replace`), and later writes may depend on it.
+    async fn record_current(&self, key: &str) {
+        match self.source.get(key).await {
+            Ok(Some(object)) => self
+                .checkpointer
+                .record(key, object.generation, object.bytes),
+            Ok(None) => {}
+            Err(_) => self.checkpointer.record_uncertain(key),
         }
     }
 }
@@ -464,15 +450,10 @@ impl Bucket for CheckpointedBucket {
             .source
             .compare_and_swap(key, generation, bytes.clone())
             .await;
-        match (&result, generation) {
-            (Ok(true), None) => self.checkpointer.record(key, 1, bytes, true),
-            (Ok(true), Some(expected)) => match expected.checked_add(1) {
-                Some(next) => self.checkpointer.record(key, next, bytes, false),
-                None => self.checkpointer.record_uncertain(key),
-            },
-            // A retried request can report a lost precondition after the first one succeeded
-            // (see `super::replace`), so copy whatever the source now holds.
-            _ => self.checkpointer.record_uncertain(key),
+        let next = generation.map_or(Some(1), |expected| expected.checked_add(1));
+        match (&result, next) {
+            (Ok(true), Some(next)) => self.checkpointer.record(key, next, bytes),
+            _ => self.record_current(key).await,
         }
         result
     }
@@ -480,59 +461,6 @@ impl Bucket for CheckpointedBucket {
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.source.list(prefix).await
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RestoreReport {
-    pub listed: u64,
-    pub copied: u64,
-    pub missing: u64,
-}
-
-/// Copies every object under `prefix` from `source` into `target`, keeping generations. Objects
-/// the target already holds at the same or a later generation are left alone, so a restore can
-/// be re-run after an interruption.
-pub async fn restore(
-    source: &dyn Bucket,
-    target: &dyn Mirror,
-    prefix: &str,
-    concurrency: usize,
-) -> Result<RestoreReport> {
-    ensure!(
-        prefix.starts_with(crate::storage_paths::ROOT),
-        "restore prefix must be under {}",
-        crate::storage_paths::ROOT
-    );
-    let keys = source.list(prefix).await?;
-    let listed = keys.len() as u64;
-    let copied = AtomicU64::new(0);
-    let missing = AtomicU64::new(0);
-    stream::iter(keys)
-        .map(|key| {
-            let (copied, missing) = (&copied, &missing);
-            async move {
-                match source.get(&key).await? {
-                    Some(object) => {
-                        target.mirror(&key, object.generation, object.bytes).await?;
-                        copied.fetch_add(1, Ordering::Relaxed);
-                    }
-                    None => {
-                        missing.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                anyhow::Ok(())
-            }
-        })
-        .buffer_unordered(concurrency.max(1))
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RestoreReport {
-        listed,
-        copied: copied.into_inner(),
-        missing: missing.into_inner(),
-    })
 }
 
 #[cfg(test)]

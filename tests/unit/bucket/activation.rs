@@ -108,6 +108,66 @@ async fn sqlite_dependencies_must_exist_in_the_snapshot_backend_before_publicati
 }
 
 #[tokio::test]
+async fn verify_finds_actors_whose_sqlite_chain_is_incomplete() -> Result<()> {
+    use crate::litestream::{Litestream, Replicator, storage::SqliteCapture};
+    use crate::state_log::{SqliteSnapshot, StateSnapshot};
+    use crate::state_transport::SnapshotWriter;
+
+    let f = Fixture::new()?;
+    let active = f
+        .runtime
+        .register_activation(&f.actor, &request("first"), "us-east", true, None)
+        .await?;
+    let lease = &active.placement.lease;
+    let first_plan = f.runtime.prepare_actor_write(&f.actor, lease, 1, 1).await?;
+    let next_plan = f.runtime.prepare_actor_write(&f.actor, lease, 1, 2).await?;
+    let replication = Arc::new(Litestream::default());
+    let mut capture = SqliteCapture::new(replication.clone()).await?;
+    let initial = capture.txid();
+    let first = StateSnapshot::new(
+        1,
+        1,
+        "sql".into(),
+        SqliteSnapshot {
+            txid: initial,
+            parent: None,
+            files: capture.capture(initial).await?,
+        },
+        serde_json::Value::Null,
+    )?;
+    let first_bytes = first.encode()?;
+    rusqlite::Connection::open(capture.path())?
+        .execute("INSERT INTO __terse_fields VALUES ('count', '1')", [])?;
+    let changed = replication.sync(&capture.path()).await?;
+    let next = StateSnapshot::new(
+        2,
+        1,
+        "fields".into(),
+        SqliteSnapshot {
+            txid: changed,
+            parent: Some(first_plan.stream.snapshot(&first_bytes)?),
+            files: capture.capture(changed).await?,
+        },
+        serde_json::Value::Null,
+    )?;
+    f.runtime.write_snapshot(&first_plan, first_bytes).await?;
+    f.runtime.write_snapshot(&next_plan, next.encode()?).await?;
+
+    let report = crate::bucket::checkpoint::verify(f.bucket.clone(), 4).await?;
+    assert_eq!((report.owners, report.restorable), (1, 1), "{report:?}");
+
+    // What a zone loss would leave if the parent never reached the copy.
+    std::fs::remove_file(f._directory.path().join(&first_plan.object_name))?;
+    let report = crate::bucket::checkpoint::verify(f.bucket.clone(), 4).await?;
+    assert_eq!(report.unrestorable_total, 1, "{report:?}");
+    assert!(
+        report.unrestorable[0].1.contains("SQLite dependency"),
+        "{report:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn ownership_and_state_can_use_independent_backends() -> Result<()> {
     use crate::state_transport::SnapshotWriter;
     let mut f = Fixture::new()?;
