@@ -10,7 +10,8 @@ import type { JsonValue } from "../json.js"
 import { DescriptorStream } from "../payload/blocking-stream.js"
 import { DatabaseChannel, DatabaseChannelError } from "../payload/database-channel.js"
 import { GarbageCollection } from "../payload/garbage-collection.js"
-import { SessionLines } from "../payload/session-lines.js"
+import { SessionFrames } from "../payload/session-frames.js"
+import type { SessionFrame } from "../payload/session-frames.js"
 import { SessionWriter } from "../payload/session-writer.js"
 import type { SessionText } from "../payload/session-writer.js"
 
@@ -104,7 +105,7 @@ async function discoverActorNames(actor: Pick<SessionActor, "ready">, timeoutMs:
 class ActorSessionConnection {
     private unsubscribeActivity: (() => void) | undefined
     private activityTimer: NodeJS.Timeout | undefined
-    private readonly lines = new SessionLines()
+    private readonly frames: SessionFrames
     private readonly writer: SessionWriter
     private attachedResolve: (() => void) | undefined
     private attachedReject: ((error: Error) => void) | undefined
@@ -133,12 +134,13 @@ class ActorSessionConnection {
         this.closedPromise = new Promise<void>(resolve => {
             this.closedResolve = resolve
         })
+        this.frames = new SessionFrames(collection)
         this.writer = new SessionWriter(socket, collection)
         this.bindSocket()
     }
 
     async attach(actorNames: readonly string[], timeoutMs: number): Promise<void> {
-        this.send({ type: "attach", protocol: 33, actor_names: actorNames })
+        this.send({ type: "attach", protocol: 34, actor_names: actorNames })
         await this.waitUntilAttached(timeoutMs)
     }
 
@@ -181,15 +183,15 @@ class ActorSessionConnection {
 
     private acceptChunk(chunk: Buffer): void {
         try {
-            for (const line of this.lines.accept(chunk)) void this.handle(line)
+            for (const frame of this.frames.accept(chunk)) void this.handle(frame)
         } catch (error) {
             this.fail(sessionError(error))
         }
     }
 
-    private async handle(line: unknown): Promise<void> {
+    private async handle(frame: SessionFrame): Promise<void> {
         try {
-            const message = parseActorSessionServerMessage(line)
+            const message = parseActorSessionServerMessage(frame)
             switch (message.type) {
                 case "attached":
                     this.actor.assign(

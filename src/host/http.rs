@@ -9,11 +9,10 @@ use axum::{
     routing::post,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::{
-    actor::{ActorExecutionResult, ActorInvocation, ActorKey, ActorSocketPublisher},
+    actor::{ActorArgs, ActorExecutionResult, ActorInvocation, ActorKey, ActorSocketPublisher},
     control_plane::{ActorJwtVerifier, ActorPrincipal, OUTCOME_HEADER},
     host::{ActorHost, HostId, sockets::HostSockets},
     payload::{JsonBody, JsonPayload, JsonText},
@@ -352,7 +351,8 @@ struct InvokeRequest {
     request_id: String,
     owner_epoch: u64,
     method: String,
-    args: Vec<Value>,
+    #[serde(deserialize_with = "ActorArgs::deserialize_text")]
+    args: ActorArgs,
 }
 
 #[derive(Serialize)]

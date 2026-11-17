@@ -8,11 +8,41 @@ import { ActorProtocolError } from "../errors.js"
 import type { JsonValue } from "../json.js"
 import { jsonValueSchema, serializeJson } from "../json.js"
 import type { JsonText } from "../payload/json-text.js"
+import type { SessionFrame } from "../payload/session-frames.js"
 
-function parseActorSessionServerMessage(head: unknown): ActorSessionServerMessage {
+function parseActorSessionServerMessage({ head, parts }: SessionFrame): ActorSessionServerMessage {
     const result = actorSessionServerMessageSchema.safeParse(head)
     if (!result.success) throw new ActorProtocolError(`actor session message is invalid: ${result.error.message}`)
-    return result.data
+    const message = attachArguments(result.data, parts)
+    if (parts.length > 0) throw new ActorProtocolError("actor session message has a part left over")
+    return message
+}
+
+// What can be large follows a command's line as a part, so it is never escaped into the line: an invocation's
+// arguments. The part is taken out of the frame, so its text is garbage as soon as it is parsed.
+function attachArguments(message: ActorSessionServerLine, parts: string[]): ActorSessionServerMessage {
+    if (message.type !== "command") return message
+    const { command } = message
+    if (command.type !== "invoke") return { ...message, command }
+    const text = parts.shift()
+    if (text === undefined) throw new ActorProtocolError("an invocation's arguments are missing")
+    return { ...message, command: { ...command, args: parseArguments(text) } }
+}
+
+function parseArguments(text: string): JsonValue[] {
+    let args: unknown
+    try {
+        args = JSON.parse(text, withoutPrototypeMembers)
+    } catch (error) {
+        throw new ActorProtocolError("an invocation's arguments are not valid JSON", { cause: error })
+    }
+    if (!Array.isArray(args)) throw new ActorProtocolError("an invocation's arguments are not an array")
+    return args
+}
+
+// Assigning a `__proto__` member to an object replaces the object's prototype rather than adding the member.
+function withoutPrototypeMembers(key: string, value: unknown): unknown {
+    return key === "__proto__" ? undefined : value
 }
 
 // What can be large follows a reply's line as parts, so it is never escaped into the line: the result, then the
@@ -58,8 +88,7 @@ function failedReply(code: string, message: string): FailedReply {
 const invokeCommandSchema = z.object({
     type: z.literal("invoke"),
     request_id: actorComponentSchema,
-    method: actorComponentSchema,
-    args: z.array(jsonValueSchema)
+    method: actorComponentSchema
 })
 
 const websocketEventCommandSchema = z.object({
@@ -81,7 +110,7 @@ const executorCommandSchema = z.discriminatedUnion("type", [
 ])
 
 const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("attached"), protocol: z.literal(33), actor: actorIdentitySchema }),
+    z.object({ type: z.literal("attached"), protocol: z.literal(34), actor: actorIdentitySchema }),
     z.object({
         type: z.literal("actor_result"),
         call_id: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -100,13 +129,19 @@ const actorSessionServerMessageSchema = z.discriminatedUnion("type", [
     })
 ])
 
-type InvokeCommand = z.infer<typeof invokeCommandSchema> & AssignedActor
+type InvokeCommand = z.infer<typeof invokeCommandSchema> & InvocationArguments & AssignedActor
 type EvictCommand = z.infer<typeof evictCommandSchema>
-type ActorExecutorCommand = z.infer<typeof executorCommandSchema>
+/** A command as its line has it, without the parts that follow. */
+type CommandLine = z.infer<typeof executorCommandSchema>
+type ActorExecutorCommand =
+    Exclude<CommandLine, { type: "invoke" }> | (Extract<CommandLine, { type: "invoke" }> & InvocationArguments)
 type ActorExecutionCommand = Exclude<ActorExecutorCommand, EvictCommand>
 /** A command with the actor this process was assigned. */
 type AssignedCommand = ActorExecutorCommand & AssignedActor
-type ActorSessionServerMessage = z.infer<typeof actorSessionServerMessageSchema>
+type ActorSessionServerLine = z.infer<typeof actorSessionServerMessageSchema>
+type ActorSessionServerMessage =
+    | Exclude<ActorSessionServerLine, { type: "command" }>
+    | (Omit<Extract<ActorSessionServerLine, { type: "command" }>, "command"> & { command: ActorExecutorCommand })
 type ActorExecutorReply =
     InvokedReply | WebSocketHandledReply | FailedReply | EvictedReply | { readonly type: "hydrated" }
 type ReplyHead =
@@ -129,8 +164,13 @@ type ActorSessionClientMessage =
 
 interface AttachMessage {
     readonly type: "attach"
-    readonly protocol: 33
+    readonly protocol: 34
     readonly actor_names: readonly string[]
+}
+
+/** An invocation's arguments, which follow its command's line as a part. */
+interface InvocationArguments {
+    readonly args: JsonValue[]
 }
 
 interface ActorCallRequest {

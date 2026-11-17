@@ -441,7 +441,7 @@ impl Actor {
                 actor: self.actor.clone(),
                 request_id: "evict".into(),
                 method: "evict".into(),
-                args: vec![],
+                args: Default::default(),
             },
             self.owner_epoch,
             Default::default(),
@@ -578,7 +578,7 @@ async fn run_request(
             actor: actor.clone(),
             request_id: "activate".into(),
             method: "activate".into(),
-            args: vec![],
+            args: Default::default(),
         });
         let result = activate(actor, &executor, &database).await;
         let recovery = match &result {
@@ -692,7 +692,7 @@ async fn activate(
             actor,
             request_id: "activate".into(),
             method: "activate".into(),
-            args: vec![],
+            args: Default::default(),
         },
         activation.owner_epoch,
         Default::default(),
@@ -929,14 +929,14 @@ impl ActorOperation {
                 request_id: "activate".into(),
                 actor: actor.clone(),
                 method: "activate".into(),
-                args: vec![],
+                args: Default::default(),
             }),
             Self::Method(invocation) => Cow::Borrowed(invocation),
             Self::Socket(invocation) => Cow::Owned(ActorInvocation {
                 request_id: invocation.request_id.clone(),
                 actor: invocation.actor.clone(),
                 method: socket_event_name(&invocation.event).into(),
-                args: Vec::new(),
+                args: Default::default(),
             }),
         }
     }

@@ -28,13 +28,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    ActorCall, ActorDatabase, ActorInvocationFailure, ActorKey, ActorLogRecord, ActorLogSink,
-    ActorSocketSource, LogLevel, StdioLogSink,
+    ActorArgs, ActorCall, ActorDatabase, ActorInvocationFailure, ActorKey, ActorLogRecord,
+    ActorLogSink, ActorSocketSource, LogLevel, StdioLogSink,
     database_channel::{self, DatabaseScopes},
 };
 use crate::payload::{ARRIVING_BYTES, BUFFER_BYTES, JsonPayload, JsonStream, JsonText};
 
-const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 33;
+const ACTOR_EXECUTOR_PROTOCOL_VERSION: u32 = 34;
 const DATABASE_FD: i32 = 3;
 const NO_EFFECTS: &[u8] = b"[]";
 const ARRIVING_RESULT_CHUNKS: usize = 16;
@@ -44,7 +44,8 @@ const ARRIVING_RESULT_STALL: Duration = Duration::from_secs(30);
 pub struct ActorMethodInvocation {
     pub request_id: String,
     pub method: String,
-    pub args: Vec<Value>,
+    #[serde(skip)]
+    pub args: ActorArgs,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -814,6 +815,7 @@ impl ExecutorDriver {
                             protocol: ACTOR_EXECUTOR_PROTOCOL_VERSION,
                             actor,
                         })?,
+                        parts: Vec::new(),
                         written: Some(written),
                     })
                     .map_err(|_| anyhow::anyhow!("actor executor writer stopped"))
@@ -932,17 +934,19 @@ impl ExecutorDriver {
         self.next_message_id = message_id
             .checked_add(1)
             .context("actor executor message ID overflow")?;
-        let bytes = encode_server_message(&ActorExecutorServerMessage::Command {
+        let parts = pending.command.parts();
+        let line = encode_server_message(&ActorExecutorServerMessage::Command {
             message_id,
             command: &pending.command,
+            parts: parts.iter().map(Bytes::len).collect(),
         });
-        match bytes {
-            Ok(bytes) => {
+        match line {
+            Ok(line) => {
                 // The command's database calls can arrive as soon as it is written.
                 if let Some(database) = pending.database.take() {
                     self.scopes.open(message_id, database);
                 }
-                self.write(bytes)?;
+                self.write_parts(line, parts)?;
                 self.pending.insert(message_id, pending);
             }
             Err(error) => {
@@ -953,9 +957,14 @@ impl ExecutorDriver {
     }
 
     fn write(&self, bytes: Vec<u8>) -> Result<()> {
+        self.write_parts(bytes, Vec::new())
+    }
+
+    fn write_parts(&self, bytes: Vec<u8>, parts: Vec<Bytes>) -> Result<()> {
         self.outbound
             .send(ExecutorWrite {
                 bytes,
+                parts,
                 written: None,
             })
             .map_err(|_| anyhow::anyhow!("actor executor writer stopped"))
@@ -1055,8 +1064,7 @@ async fn write_executor_messages(
     mut writes: mpsc::UnboundedReceiver<ExecutorWrite>,
 ) -> Result<()> {
     while let Some(write) = writes.recv().await {
-        let result = writer
-            .write_all(&write.bytes)
+        let result = write_message(&mut writer, &write)
             .await
             .context("write actor executor command");
         if let Some(written) = write.written {
@@ -1068,6 +1076,14 @@ async fn write_executor_messages(
             );
         }
         result?;
+    }
+    Ok(())
+}
+
+async fn write_message(writer: &mut OwnedWriteHalf, write: &ExecutorWrite) -> std::io::Result<()> {
+    writer.write_all(&write.bytes).await?;
+    for part in &write.parts {
+        writer.write_all(part).await?;
     }
     Ok(())
 }
@@ -1092,8 +1108,10 @@ struct PendingCommand {
     reply: oneshot::Sender<Result<ExecutorReply>>,
 }
 
+/// A line, then the parts whose sizes it announces.
 struct ExecutorWrite {
     bytes: Vec<u8>,
+    parts: Vec<Bytes>,
     written: Option<oneshot::Sender<Result<()>>>,
 }
 
@@ -1195,6 +1213,8 @@ enum ActorExecutorServerMessage<'a> {
     Command {
         message_id: u64,
         command: &'a ExecutorCommand,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<usize>,
     },
 }
 
@@ -1354,6 +1374,14 @@ enum ExecutorCommand {
 }
 
 impl ExecutorCommand {
+    /// What can be large follows the command's line as parts, so it is never escaped into the line.
+    fn parts(&self) -> Vec<Bytes> {
+        match self {
+            Self::Invoke(invocation) => vec![invocation.args.text().bytes()],
+            _ => Vec::new(),
+        }
+    }
+
     fn request_id(&self) -> Option<&str> {
         match self {
             Self::Hydrate { request_id } | Self::WebsocketEvent { request_id, .. } => {

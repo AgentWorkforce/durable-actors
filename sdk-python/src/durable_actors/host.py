@@ -55,7 +55,7 @@ class Session(Channel):
                 while not path.is_file():
                     await asyncio.sleep(0.01)
             actors = {actor.__name__: actor for actor in load_artifact(path)}
-            await self.send({"type": "attach", "protocol": 33, "actor_names": sorted(actors)})
+            await self.send({"type": "attach", "protocol": 34, "actor_names": sorted(actors)})
             identity = attached_actor(await self.read(), actors)
             capture_output(self)
             database = DatabaseProxy(self.call_database, asyncio.get_running_loop())
@@ -226,7 +226,7 @@ def running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 def attached_actor(message: Document, actor_names: Collection[str]) -> Document:
-    if message.get("type") != "attached" or message.get("protocol") != 33:
+    if message.get("type") != "attached" or message.get("protocol") != 34:
         raise ValueError("unsupported executor protocol")
     actor = cast(Document, message["actor"])
     for field, size in (("project_id", 64), ("actor_name", 255), ("actor_id", 128)):

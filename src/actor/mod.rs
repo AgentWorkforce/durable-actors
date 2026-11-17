@@ -13,7 +13,8 @@ pub use self::{
         ActorSocketMessage, ActorSocketOutcome, ActorSocketTagMatch,
     },
     protocol::{
-        ActorCall, ActorExecutionResult, ActorInvocation, ActorInvocationFailure, ActorKey,
+        ActorArgs, ActorCall, ActorExecutionResult, ActorInvocation, ActorInvocationFailure,
+        ActorKey,
     },
 };
 pub(crate) use executor_connection::{

@@ -36,8 +36,16 @@ export function sessionReader(socket: Socket): () => Promise<any> {
         })
 }
 
+/** Writes a message as the Rust host does: an invocation's arguments follow the line as a part. */
 export function writeSession(socket: Socket, message: object): void {
-    socket.write(`${JSON.stringify(message)}\n`)
+    const { command } = message as { command?: { type: string; args?: unknown } }
+    if (command?.type !== "invoke") {
+        socket.write(`${JSON.stringify(message)}\n`)
+        return
+    }
+    const { args, ...line } = command
+    const part = JSON.stringify(args)
+    socket.write(`${JSON.stringify({ ...message, command: line, parts: [Buffer.byteLength(part)] })}\n${part}`)
 }
 
 // A message is a line of JSON, then the parts whose sizes the line announces.

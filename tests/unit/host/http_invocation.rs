@@ -69,7 +69,7 @@ fn diagnostic_logs_use_finalized_request_timing() -> Result<()> {
             },
             request_id: "timed".into(),
             method: "increment".into(),
-            args: vec![],
+            args: Default::default(),
         },
         tracker.completion(),
         &result,

@@ -32,7 +32,7 @@ test("attaches with the actors that its artifact exports", { timeout: 5_000 }, a
         const lines = createInterface({ input: socket })
         lines.once("line", line => {
             assert.deepEqual(JSON.parse(line).actor_names, ["SessionCounter"])
-            socket.write(`${JSON.stringify({ type: "attached", protocol: 33, actor: actorIdentity() })}\n`)
+            socket.write(`${JSON.stringify({ type: "attached", protocol: 34, actor: actorIdentity() })}\n`)
             socket.end()
         })
     })
@@ -113,25 +113,18 @@ test("the actor session carries only owned execution commands", async t => {
 
         assert.deepEqual(await read(), {
             type: "attach",
-            protocol: 33,
+            protocol: 34,
             actor_names: ["SessionCounter"]
         })
-        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 33, actor: actorIdentity() })}\n`)
+        customerSocket.write(`${JSON.stringify({ type: "attached", protocol: 34, actor: actorIdentity() })}\n`)
         await startup
 
         const invoke = (messageId: number, method: string, args: number[]) =>
-            customerSocket.write(
-                `${JSON.stringify({
-                    type: "command",
-                    message_id: messageId,
-                    command: {
-                        type: "invoke",
-                        request_id: `request-${messageId}`,
-                        method,
-                        args
-                    }
-                })}\n`
-            )
+            writeSession(customerSocket, {
+                type: "command",
+                message_id: messageId,
+                command: { type: "invoke", request_id: `request-${messageId}`, method, args }
+            })
         invoke(1, "increment", [4])
         assertSessionReply(await next(), 1, { type: "invoked", result: 4 })
         assert.deepEqual(database.fields(), { count: 4 })
@@ -200,7 +193,7 @@ test("a large database result and the socket message built from it cross the ses
             const send = (message: object) => writeSession(socket, message)
             const handle = (message: { type: string }) => {
                 if (message.type === "attach") {
-                    send({ type: "attached", protocol: 33, actor: actorIdentity() })
+                    send({ type: "attached", protocol: 34, actor: actorIdentity() })
                     send({
                         type: "command",
                         message_id: 1,
@@ -258,7 +251,7 @@ test("a database channel that stops answering ends the session", { timeout: 5_00
     const server = createServer(socket => {
         readSession(socket, message => {
             if (message.type !== "attach") return
-            writeSession(socket, { type: "attached", protocol: 33, actor: actorIdentity() })
+            writeSession(socket, { type: "attached", protocol: 34, actor: actorIdentity() })
             writeSession(socket, {
                 type: "command",
                 message_id: 1,
@@ -321,7 +314,7 @@ test("assigns the attached actor and reports whether it is resident", { timeout:
         lines.on("line", line => {
             const message = JSON.parse(line)
             if (message.type === "attach")
-                socket.write(`${JSON.stringify({ type: "attached", protocol: 33, actor })}\n`)
+                socket.write(`${JSON.stringify({ type: "attached", protocol: 34, actor })}\n`)
             else if (message.type === "residency") {
                 received = message
                 socket.end()
@@ -389,7 +382,7 @@ for (const outcome of ["success", "rejection", "atomic", "method_failure", "atom
             readSession(socket, message => {
                 void (async () => {
                     if (message.type === "attach") {
-                        send({ type: "attached", protocol: 33, actor: actorIdentity() })
+                        send({ type: "attached", protocol: 34, actor: actorIdentity() })
                         invoke(
                             17,
                             outcome === "atomic_failure"

@@ -51,7 +51,7 @@ async fn assignment_returns_invocation_outcomes_without_a_second_host_request() 
             panic!("expected invocation")
         };
         assert_eq!(invocation.request_id, "first");
-        assert_eq!(invocation.args, vec![json!("hello")]);
+        assert_eq!(invocation.args, vec![json!("hello")].into());
         assert_eq!(grant.as_ref().unwrap().subject, "subject");
     }
     Ok(())

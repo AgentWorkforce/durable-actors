@@ -142,7 +142,7 @@ impl HostDatabase {
             actor,
             request_id: "background".into(),
             method: "background".into(),
-            args: vec![],
+            args: Default::default(),
         };
         self.scope(invocation, None, CommitOrigin::default())
     }

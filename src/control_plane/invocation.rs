@@ -21,7 +21,7 @@ use super::public_api::{
     ActorPath, ApiError, FindActorRequest, PublicApiState, resolve_actor_target,
 };
 use super::service::ActorTarget;
-use crate::actor::ActorInvocation;
+use crate::actor::{ActorArgs, ActorInvocation};
 
 pub(super) async fn invoke_alarm(
     service: &super::ControlPlaneService,
@@ -37,7 +37,7 @@ pub(super) async fn invoke_alarm(
         actor: alarm.actor.clone(),
         request_id: format!("alarm-{}", alarm.revision),
         method: "onAlarm".into(),
-        args: vec![],
+        args: ActorArgs::default(),
     };
     let outcome = dispatch(
         service,
@@ -282,13 +282,17 @@ async fn send_invocation(
         actor.actor_name,
         actor.actor_id
     );
+    let fields = json!({
+        "requestId":invocation.request_id, "ownerEpoch":target.owner_epoch,
+        "method":invocation.method, "hostState":host_state, "routingMs":routing_ms,
+    });
+    let body = JsonBody::with_field(&fields, "args", invocation.args.text().clone().into())
+        .map_err(ApiError::internal)?;
     let response = client
         .post(url)
         .bearer_auth(&target.token)
-        .json(&json!({
-            "requestId":invocation.request_id, "ownerEpoch":target.owner_epoch,
-            "method":invocation.method, "args":invocation.args, "hostState":host_state, "routingMs":routing_ms,
-        }))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .await;
     let response = match response {
@@ -412,6 +416,7 @@ fn outcome_unknown() -> ApiError {
 pub(super) struct InvokeRequest {
     request_id: String,
     method: String,
-    args: Vec<Value>,
+    #[serde(deserialize_with = "ActorArgs::deserialize_text")]
+    args: ActorArgs,
     home_region: Option<String>,
 }

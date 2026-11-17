@@ -18,7 +18,7 @@ async fn completed_requests_become_one_span_with_request_attributes() -> Result<
             actor_id: "lobby".into(),
         },
         method: "onConnect".into(),
-        args: vec![],
+        args: Default::default(),
     };
     let recorder = TraceRecorder::new(
         provider.tracer("test"),

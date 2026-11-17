@@ -80,21 +80,14 @@ try {
             if (message.type !== "residency") return attach(message, parts)
         }
     }
-    assert.deepEqual(await receive(), { type: "warm", protocol: 33 })
+    assert.deepEqual(await receive(), { type: "warm", protocol: 34 })
     send({ type: "load", entrypoint, environment: {} })
-    assert.deepEqual(await receive(), { type: "attach", protocol: 33, actor_names: ["Counter"] })
-    send({ type: "attached", protocol: 33, actor: { project_id: "default", actor_name: "Counter", actor_id: "one" } })
+    assert.deepEqual(await receive(), { type: "attach", protocol: 34, actor_names: ["Counter"] })
+    send({ type: "attached", protocol: 34, actor: { project_id: "default", actor_name: "Counter", actor_id: "one" } })
     for (let expected = 1; expected <= 2; expected++) {
-        send({
-            type: "command",
-            message_id: expected,
-            command: {
-                type: "invoke",
-                request_id: `request-${expected}`,
-                method: "add",
-                args: []
-            }
-        })
+        // An invocation's arguments follow its line as a part.
+        const command = { type: "invoke", request_id: `request-${expected}`, method: "add" }
+        socket.write(`${JSON.stringify({ type: "command", message_id: expected, command, parts: [2] })}\n[]`)
         const result = await receive()
         assert.equal(result.reply.type, "invoked", JSON.stringify(result))
         assert.equal(result.reply.result, expected)

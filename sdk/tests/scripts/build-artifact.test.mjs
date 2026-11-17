@@ -204,9 +204,9 @@ test("built actors run without source, compiler, or TypeScript loader", { timeou
             if (message.type !== "residency") return message
         }
     }
-    assert.deepEqual(await receive(), { type: "attach", protocol: 33, actor_names: ["BuiltCounter"] })
+    assert.deepEqual(await receive(), { type: "attach", protocol: 34, actor_names: ["BuiltCounter"] })
     const send = message => writeSession(socket, message)
-    send({ type: "attached", protocol: 33, actor: { project_id: "default", actor_name: "BuiltCounter", actor_id: "counter" } })
+    send({ type: "attached", protocol: 34, actor: { project_id: "default", actor_name: "BuiltCounter", actor_id: "counter" } })
     const invoke = messageId =>
         send({
             type: "command",

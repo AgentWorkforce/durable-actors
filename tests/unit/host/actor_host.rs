@@ -716,7 +716,7 @@ impl ActorExecutor for ControlledExecutor {
                 ActorMethodInvocation {
                     request_id: invocation.request_id,
                     method: "onMessage".into(),
-                    args: Vec::new(),
+                    args: Default::default(),
                 },
                 database,
             )
@@ -1257,7 +1257,7 @@ async fn activation_acquires_on_host_without_preparing_a_write() -> Result<()> {
         request_id: request_id.into(),
         actor: actor.clone(),
         method: "increment".into(),
-        args: vec![],
+        args: Default::default(),
     };
     assert_eq!(
         host.invoke_actor(invoke("one"), 7, HostState::Warm, 0.0)
@@ -1359,7 +1359,7 @@ async fn activation_services_immediate_writes_during_hydration() -> Result<()> {
                     request_id: "during-hydration".into(),
                     actor: invocation_actor,
                     method: "read".into(),
-                    args: vec![],
+                    args: Default::default(),
                 },
                 7,
                 HostState::Warm,
@@ -1499,7 +1499,7 @@ async fn activation_reuses_recovered_bytes_and_publishes_readiness_without_a_wri
                 actor,
                 request_id: "next".into(),
                 method: "increment".into(),
-                args: vec![],
+                args: Default::default(),
             },
             7,
             HostState::Warm,
@@ -2644,7 +2644,7 @@ async fn background_database_follows_the_owner_epoch_across_activations() -> Res
                 request_id: method.into(),
                 actor: counter(),
                 method: method.into(),
-                args: Vec::new(),
+                args: Default::default(),
             },
             owner_epoch,
             HostState::Warm,
@@ -2682,7 +2682,7 @@ async fn invoke(host: &ActorHost, request_id: &str) -> Result<ActorExecutionResu
                 actor_id: "counter-1".into(),
             },
             method: "increment".into(),
-            args: Vec::new(),
+            args: Default::default(),
         },
         1,
         HostState::Warm,

@@ -1,8 +1,8 @@
 """Internal executor messages shared by the host and its worker.
 
 A message is a line of JSON followed by the parts whose sizes the line lists under ``parts``.
-The result of an invocation, socket effects and the text of each socket message travel as
-parts, so none of them is nested inside the line.
+The arguments and result of an invocation, socket effects and the text of each socket message
+travel as parts, so none of them is nested inside the line.
 """
 
 from __future__ import annotations
@@ -46,6 +46,9 @@ def serialize(message: Document) -> bytes:
 
 def detach(message: Document) -> tuple[Document, list[bytes]]:
     kind = message["type"]
+    if is_invocation(message):
+        command = message["command"]
+        return {**message, "command": without(command, "args")}, [encode(command["args"])]
     if kind == "socket_effects":
         return without(message, "effects"), detach_effects(message["effects"])
     if kind == "reply" and message["reply"]["type"] in REPLIES_WITH_EFFECTS:
@@ -71,7 +74,9 @@ def detach_text(effect: Document, texts: list[bytes]) -> Document:
 
 def attach(head: Document, parts: list[bytes]) -> Document:
     kind = head["type"]
-    if kind == "socket_effects":
+    if is_invocation(head):
+        head["command"]["args"] = json.loads(take(parts))
+    elif kind == "socket_effects":
         head["effects"] = attach_effects(parts)
     elif kind == "reply" and head["reply"]["type"] in REPLIES_WITH_EFFECTS:
         attach_reply(head["reply"], parts)
@@ -95,6 +100,10 @@ def attach_effects(parts: list[bytes]) -> list[Document]:
         if message is not None and message["type"] == "text":
             message["data"] = take(parts).decode()
     return effects
+
+
+def is_invocation(message: Document) -> bool:
+    return bool(message["type"] == "command" and message["command"]["type"] == "invoke")
 
 
 def take(parts: list[bytes]) -> bytes:

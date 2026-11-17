@@ -13,20 +13,20 @@ async fn generic_executor_connects_before_code_and_hydrates_after_assignment() -
     let listener = ActorExecutorListener::bind(&path).await?;
     let peer = tokio::spawn(async move {
         let mut socket = BufReader::new(tokio::net::UnixStream::connect(&path).await?);
-        write_message(&mut socket, &json!({"type":"warm","protocol":33})).await?;
+        write_message(&mut socket, &json!({"type":"warm","protocol":34})).await?;
         let load = read_message(&mut socket).await?;
         assert_eq!(load["entrypoint"], "/customer/actors.mjs");
         assert_eq!(load["environment"]["CUSTOMER_KEY"], "value");
         write_message(
             &mut socket,
-            &json!({"type":"attach","protocol":33,"actor_names":["counter"]}),
+            &json!({"type":"attach","protocol":34,"actor_names":["counter"]}),
         )
         .await?;
         assert_eq!(
             read_message(&mut socket).await?,
             json!({
                 "type": "attached",
-                "protocol": 33,
+                "protocol": 34,
                 "actor": {"project_id": "default", "actor_name": "counter", "actor_id": "one"}
             })
         );
@@ -82,7 +82,7 @@ async fn generic_executor_connects_before_code_and_hydrates_after_assignment() -
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     time::{Duration, timeout},
 };
@@ -95,7 +95,7 @@ async fn residency_reports_are_separate_from_invocation_cache_hints() -> Result<
     let mut peer = BufReader::new(UnixStream::connect(&socket).await?);
     write_message(
         &mut peer,
-        &json!({"type":"attach", "protocol":33, "actor_names":["Room"]}),
+        &json!({"type":"attach", "protocol":34, "actor_names":["Room"]}),
     )
     .await?;
     let connection = listener.accept().await?;
@@ -333,7 +333,7 @@ async fn shutdown_does_not_wait_for_a_peer_that_stopped_reading() -> Result<()> 
         let mut stream = BufReader::new(stream);
         write_message(
             &mut stream,
-            &json!({"type":"attach", "protocol":33, "actor_names":["counter"]}),
+            &json!({"type":"attach", "protocol":34, "actor_names":["counter"]}),
         )
         .await?;
         let _ = read_message(&mut stream).await?;
@@ -348,7 +348,7 @@ async fn shutdown_does_not_wait_for_a_peer_that_stopped_reading() -> Result<()> 
     let mut running = tokio::spawn(connection.run(shutdown.clone()));
     let mut call = tokio::spawn(async move {
         let mut blocked = invocation("blocked-write", "accept");
-        blocked.args = vec![json!("x".repeat(8 * 1024 * 1024))];
+        blocked.args = vec![json!("x".repeat(8 * 1024 * 1024))].into();
         executor.invoke(blocked, actor_database::unused()).await
     });
     assert!(timeout(Duration::from_millis(30), &mut call).await.is_err());
@@ -377,7 +377,7 @@ async fn one_javascript_executor_runs_until_host_shutdown() -> Result<()> {
     let shutdown = CancellationToken::new();
     let connection_task = tokio::spawn(connection.run(shutdown.clone()));
     let mut increment = invocation("request-1", "increment");
-    increment.args = vec![json!(2)];
+    increment.args = vec![json!(2)].into();
     let outcome = executor.invoke(increment, actor_database::unused()).await?;
     assert_eq!(
         outcome,
@@ -469,6 +469,50 @@ async fn commands_carry_no_sqlite_state() -> Result<()> {
             );
         }
         anyhow::Ok(())
+    };
+    let result = timeout(Duration::from_secs(5), async {
+        tokio::try_join!(customer, invoke)
+    })
+    .await;
+    running.abort();
+    result??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invocation_arguments_follow_the_command_line_as_they_arrived() -> Result<()> {
+    const ARGS: &str = "[\"a\",\n {\"n\": 1.50}]";
+    let (host, customer) = UnixStream::pair()?;
+    let (reader, writer) = host.into_split();
+    let (executor, running) = JsActorExecutor::start(
+        BufReader::new(reader),
+        writer,
+        vec!["counter".into()],
+        Arc::default(),
+    );
+    let customer = async {
+        let mut reader = BufReader::new(customer);
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        let head: Value = serde_json::from_str(&line)?;
+        assert_eq!(
+            head["command"],
+            json!({"type": "invoke", "request_id": "r", "method": "read"})
+        );
+        assert_eq!(head["parts"], json!([ARGS.len()]));
+        let mut args = vec![0; ARGS.len()];
+        reader.read_exact(&mut args).await?;
+        assert_eq!(args, ARGS.as_bytes());
+        write_message(
+            &mut reader,
+            &json!({"type": "reply", "message_id": head["message_id"], "reply": {"type": "invoked", "result": 1}}),
+        )
+        .await
+    };
+    let invoke = async {
+        let mut call = invocation("r", "read");
+        call.args = ActorArgs::deserialize_text(&mut serde_json::Deserializer::from_str(ARGS))?;
+        executor.invoke(call, actor_database::unused()).await
     };
     let result = timeout(Duration::from_secs(5), async {
         tokio::try_join!(customer, invoke)
@@ -1009,7 +1053,7 @@ fn invocation(id: &str, method: &str) -> ActorMethodInvocation {
     ActorMethodInvocation {
         request_id: id.into(),
         method: method.into(),
-        args: vec![],
+        args: Default::default(),
     }
 }
 
@@ -1018,13 +1062,13 @@ async fn run_incrementing_customer(socket: PathBuf) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     writer
-        .write_all(b"{\"type\":\"attach\",\"protocol\":33,\"actor_names\":[\"counter\"]}\n")
+        .write_all(b"{\"type\":\"attach\",\"protocol\":34,\"actor_names\":[\"counter\"]}\n")
         .await?;
     ensure!(
         read_message(&mut reader).await?
             == json!({
                 "type": "attached",
-                "protocol": 33,
+                "protocol": 34,
                 "actor": {"project_id": "default", "actor_name": "counter", "actor_id": "one"}
             })
     );
@@ -1077,13 +1121,28 @@ async fn run_incrementing_customer(socket: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Reads a message as an SDK does: an invocation's arguments follow the line as a part.
 async fn read_message<R>(reader: &mut R) -> Result<Value>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     let mut line = String::new();
     ensure!(reader.read_line(&mut line).await? > 0, "expected a message");
-    Ok(serde_json::from_str(line.trim_end())?)
+    let mut message: Value = serde_json::from_str(line.trim_end())?;
+    let Some(sizes) = message
+        .as_object_mut()
+        .and_then(|fields| fields.remove("parts"))
+    else {
+        return Ok(message);
+    };
+    ensure!(
+        message["command"]["type"] == "invoke" && sizes == json!([sizes[0]]),
+        "only an invocation's arguments follow a line"
+    );
+    let mut args = vec![0; sizes[0].as_u64().context("part size")? as usize];
+    reader.read_exact(&mut args).await?;
+    message["command"]["args"] = serde_json::from_slice(&args)?;
+    Ok(message)
 }
 
 /// Writes a message as an SDK does: a result, socket effects and the text of each message

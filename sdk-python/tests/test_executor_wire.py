@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 
 import pytest
 
@@ -30,6 +31,11 @@ MESSAGES = [
     {"type": "reply", "message_id": 6, "reply": {"type": "evicted"}},
     {"type": "socket_effects", "message_id": 7, "effects": EFFECTS},
     {"type": "command", "message_id": 8, "command": {"type": "evict"}},
+    {
+        "type": "command",
+        "message_id": 9,
+        "command": {"type": "invoke", "request_id": "r", "method": "m", "args": [TEXT, 1]},
+    },
 ]
 
 
@@ -46,6 +52,15 @@ def test_a_reply_is_a_line_followed_by_its_result_effects_and_message_texts():
         b'"parts":[4,%d,%d,0]}\n' % (len(effects), len(text))
     )
     assert serialize(MESSAGES[1]) == line + b"null" + effects + text
+
+
+def test_an_invocation_is_a_line_followed_by_its_arguments():
+    args = json.dumps([TEXT, 1], separators=(",", ":")).encode()
+    line = (
+        b'{"type":"command","message_id":9,"command":{"type":"invoke","request_id":"r","method":"m"},'
+        b'"parts":[%d]}\n' % len(args)
+    )
+    assert serialize(MESSAGES[8]) == line + args
 
 
 def test_messages_without_a_result_or_effects_are_a_single_line():

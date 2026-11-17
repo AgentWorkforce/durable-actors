@@ -16,9 +16,33 @@ test("rejects malformed actor session messages", () => {
     assert.throws(
         () =>
             parseActorSessionServerMessage({
-                type: "command",
-                message_id: 1,
-                command: { type: "invoke", request_id: false }
+                head: { type: "command", message_id: 1, command: { type: "invoke", request_id: false } },
+                parts: ["[]"]
+            }),
+        ActorProtocolError
+    )
+})
+
+test("an invocation's arguments are the part after its line, without prototype members", () => {
+    const parts = ['[{"__proto__":{"polluted":true},"name":"ada"},[1]]']
+    const message = parseActorSessionServerMessage({ head: invoke({ args: ["ignored"] }), parts })
+    assert.ok(message.type === "command" && message.command.type === "invoke")
+    assert.deepEqual(message.command.args, [{ name: "ada" }, [1]])
+    assert.deepEqual(parts, [])
+})
+
+test("rejects an invocation whose arguments are missing, not an array, or followed by another part", () => {
+    for (const parts of [[], ["{}"], ["[1"], ["[]", "[]"]])
+        assert.throws(
+            () => parseActorSessionServerMessage({ head: invoke(), parts }),
+            ActorProtocolError,
+            JSON.stringify(parts)
+        )
+    assert.throws(
+        () =>
+            parseActorSessionServerMessage({
+                head: { type: "command", message_id: 1, command: { type: "hydrate" } },
+                parts: ["[]"]
             }),
         ActorProtocolError
     )
@@ -52,6 +76,10 @@ test("only replies that carry a result or effects have parts", () => {
     ] as const)
         assert.equal(detachReply(reply).parts, undefined)
 })
+
+function invoke(fields: object = {}): object {
+    return { type: "command", message_id: 1, command: { type: "invoke", request_id: "r", method: "m", ...fields } }
+}
 
 function socketEffects([first, empty, last]: JsonText[]): HostSocketEffect[] {
     return [

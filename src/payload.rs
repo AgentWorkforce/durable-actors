@@ -387,6 +387,16 @@ impl JsonBody {
     fn len(&self) -> usize {
         self.0.iter().map(Piece::len).sum()
     }
+
+    fn poll_bytes(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<Bytes>>> {
+        while let Some(piece) = self.0.front_mut() {
+            match ready!(piece.poll_next(context)) {
+                Some(bytes) => return Poll::Ready(Some(bytes)),
+                None => drop(self.0.pop_front()),
+            }
+        }
+        Poll::Ready(None)
+    }
 }
 
 enum Piece {
@@ -430,13 +440,8 @@ impl http_body::Body for JsonBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>>>> {
-        while let Some(piece) = self.0.front_mut() {
-            match ready!(piece.poll_next(context)) {
-                Some(bytes) => return Poll::Ready(Some(bytes.map(Frame::data))),
-                None => drop(self.0.pop_front()),
-            }
-        }
-        Poll::Ready(None)
+        self.poll_bytes(context)
+            .map(|bytes| bytes.map(|bytes| bytes.map(Frame::data)))
     }
 
     fn is_end_stream(&self) -> bool {
@@ -445,6 +450,14 @@ impl http_body::Body for JsonBody {
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::with_exact(self.len() as u64)
+    }
+}
+
+impl From<JsonBody> for reqwest::Body {
+    fn from(mut body: JsonBody) -> Self {
+        Self::wrap_stream(futures_util::stream::poll_fn(move |context| {
+            body.poll_bytes(context)
+        }))
     }
 }
 

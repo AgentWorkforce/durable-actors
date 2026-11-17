@@ -118,7 +118,7 @@ async def executor(database, *arguments, **environment):
 async def warm_executor(entrypoint, environment):
     async with executor(HostDatabase(), "--generic") as (host, _):
         async with asyncio.timeout(10):
-            assert await host.receive() == {"type": "warm", "protocol": 33}
+            assert await host.receive() == {"type": "warm", "protocol": 34}
             host.send({"type": "load", "entrypoint": entrypoint, "environment": environment})
             attach = await host.receive()
             assert attach["type"] == "attach"
@@ -126,7 +126,7 @@ async def warm_executor(entrypoint, environment):
             host.send(
                 {
                     "type": "attached",
-                    "protocol": 33,
+                    "protocol": 34,
                     "actor": {"project_id": "local", "actor_name": actor_name, "actor_id": "one"},
                 }
             )

@@ -182,14 +182,14 @@ class Counter(Actor):
         ) as (host, _):
             async with asyncio.timeout(10):
                 if generic:
-                    assert await host.receive() == {"type": "warm", "protocol": 33}
+                    assert await host.receive() == {"type": "warm", "protocol": 34}
                     host.send({"type": "load", "entrypoint": entrypoint, "environment": {}})
                 assert await host.receive() == {
                     "type": "attach",
-                    "protocol": 33,
+                    "protocol": 34,
                     "actor_names": ["Counter"],
                 }
-                host.send({"type": "attached", "protocol": 33, "actor": actor})
+                host.send({"type": "attached", "protocol": 34, "actor": actor})
                 host.send({"type": "command", "message_id": 1, "command": increment})
                 reply = await host.receive()
                 assert reply["reply"] == {"type": "invoked", "result": expected}
@@ -223,7 +223,7 @@ class Counter(Actor):
                 receive, send = host.receive, host.send
                 assert (await receive())["type"] == "attach"
                 actor = {"project_id": "local", "actor_name": "Counter", "actor_id": "one"}
-                send({"type": "attached", "protocol": 33, "actor": actor})
+                send({"type": "attached", "protocol": 34, "actor": actor})
                 invocation = {
                     "type": "invoke",
                     "request_id": "r1",

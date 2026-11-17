@@ -743,7 +743,7 @@ impl Stack {
                     request_id: uuid::Uuid::new_v4().to_string(),
                     actor: self.actor.clone(),
                     method: method.into(),
-                    args,
+                    args: args.into(),
                 },
                 1,
                 HostState::Warm,

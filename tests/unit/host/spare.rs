@@ -137,7 +137,7 @@ async fn run_activation(
                         } else {
                             "read".into()
                         },
-                        args: vec![],
+                        args: Default::default(),
                     },
                     grant: None,
                 }

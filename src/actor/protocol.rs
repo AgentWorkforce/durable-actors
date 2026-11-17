@@ -1,8 +1,12 @@
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
-use crate::{actor::ActorSocketEffect, actor_state::ActorStorageKey, payload::JsonPayload};
+use crate::{
+    actor::ActorSocketEffect,
+    actor_state::ActorStorageKey,
+    payload::{JsonPayload, JsonText},
+};
 
 const MAX_ACTOR_NAME_BYTES: usize = 48;
 const MAX_ACTOR_ID_BYTES: usize = 128;
@@ -40,7 +44,7 @@ pub struct ActorInvocation {
     pub request_id: String,
     pub actor: ActorKey,
     pub method: String,
-    pub args: Vec<Value>,
+    pub args: ActorArgs,
 }
 
 impl ActorInvocation {
@@ -56,6 +60,48 @@ impl ActorInvocation {
     }
 }
 
+/// A call's arguments as the text of their JSON array.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ActorArgs(JsonText);
+
+impl ActorArgs {
+    pub fn text(&self) -> &JsonText {
+        &self.0
+    }
+
+    /// Keeps the arguments as the text that arrived, without parsing them.
+    pub(crate) fn deserialize_text<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let text = JsonText::deserialize(deserializer)?;
+        if !text.get().starts_with('[') {
+            return Err(de::Error::custom("args must be a JSON array"));
+        }
+        Ok(Self(text))
+    }
+}
+
+impl Default for ActorArgs {
+    fn default() -> Self {
+        Vec::new().into()
+    }
+}
+
+impl From<Vec<Value>> for ActorArgs {
+    fn from(args: Vec<Value>) -> Self {
+        Self(Value::Array(args).into())
+    }
+}
+
+// Tagged and untagged enums buffer their fields, which loses the text, so only a top-level
+// field can use `deserialize_text`.
+impl<'de> Deserialize<'de> for ActorArgs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<Value>::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// An invocation an actor makes of another actor in its own project.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,7 +110,7 @@ pub struct ActorCall {
     pub actor_name: String,
     pub actor_id: String,
     pub method: String,
-    pub args: Vec<Value>,
+    pub args: ActorArgs,
 }
 
 impl ActorCall {
