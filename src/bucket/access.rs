@@ -39,10 +39,30 @@ pub(crate) enum BucketLocation {
         bucket: String,
         artifact_bucket: String,
         s3: super::S3Endpoint,
+        /// The regional bucket that asynchronously checkpoints a single-zone `bucket`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<CheckpointLocation>,
     },
     File {
         directory: PathBuf,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointLocation {
+    pub bucket: String,
+    /// Lag above which hosts and the control plane log `storage_checkpoint_lag_exceeded`.
+    pub max_lag_ms: u64,
+}
+
+impl CheckpointLocation {
+    pub(crate) fn config(&self) -> super::checkpoint::CheckpointConfig {
+        super::checkpoint::CheckpointConfig {
+            max_lag: Duration::from_millis(self.max_lag_ms),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -174,13 +194,20 @@ impl RuntimeAccess {
         let code = code_snapshot
             .map(crate::bundle::ActorBundle::decode)
             .transpose()?;
-        let scopes = scopes(
+        let mut scopes = scopes(
             bucket,
             &self.persistence,
             Some(artifact_bucket),
             actor,
             code.as_ref(),
         )?;
+        if let BucketLocation::S3 {
+            checkpoint: Some(checkpoint),
+            ..
+        } = &self.location
+        {
+            scopes = with_checkpoint(scopes, &checkpoint.bucket, &self.persistence, actor)?;
+        }
         let source = self
             .token_source
             .as_ref()
@@ -346,6 +373,25 @@ fn scopes(
         ownership,
         state: state_rules(bucket, persistence, actor)?,
     })
+}
+
+/// Hosts copy their own owner record and snapshots to the checkpoint bucket, with the same
+/// prefixes and permissions they hold on the primary bucket.
+fn with_checkpoint(
+    mut scopes: Scopes,
+    checkpoint: &str,
+    persistence: &super::SnapshotStoreConfig,
+    actor: &crate::actor::ActorKey,
+) -> Result<Scopes> {
+    scopes.ownership.push(rule(
+        checkpoint,
+        crate::storage_paths::owner(&actor.storage_key())?,
+        Permissions::OBJECT_USER,
+    ));
+    scopes
+        .state
+        .extend(state_rules(checkpoint, persistence, actor)?);
+    Ok(scopes)
 }
 
 fn state_rules(

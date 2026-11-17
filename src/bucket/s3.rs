@@ -232,6 +232,58 @@ impl Bucket for S3Bucket {
     }
 }
 
+#[async_trait]
+impl super::checkpoint::Mirror for S3Bucket {
+    /// One PUT per copy in the common case: new objects (every snapshot) are created with
+    /// `If-None-Match: *`, and replacements use the ETag this bucket cached from its own last
+    /// write. Only a failed precondition re-reads the copy with a HEAD.
+    async fn mirror(&self, key: &str, generation: i64, bytes: bytes::Bytes) -> Result<()> {
+        ensure!(generation > 0, "S3 object generation is invalid");
+        let mut current = self.versions.get(key).await;
+        for _ in 0..MIRROR_ATTEMPTS {
+            let mut request = self.client.put_object().bucket(&self.bucket).key(key);
+            request = match &current {
+                Some((copied, _)) if *copied >= generation => return Ok(()),
+                Some((_, etag)) => request.if_match(etag),
+                None => request.if_none_match("*"),
+            };
+            let _transfer = self.transfer(bytes.len() as u64).await?;
+            match request
+                .metadata(GENERATION, generation.to_string())
+                .content_length(bytes.len() as i64)
+                .body(ByteStream::from(bytes.clone()))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    match response.e_tag() {
+                        Some(etag) => {
+                            self.versions
+                                .insert(key.into(), (generation, etag.into()))
+                                .await
+                        }
+                        None => self.versions.invalidate(key).await,
+                    }
+                    return Ok(());
+                }
+                Err(error) if lost_precondition(status(&error)) => {
+                    self.versions.invalidate(key).await;
+                    current = self.head(key).await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("checkpoint copy of {key} kept racing another writer")
+    }
+}
+
+const MIRROR_ATTEMPTS: usize = 4;
+
+/// Whether `bucket` is an S3 Express One Zone directory bucket (`name--<zone id>--x-s3`).
+pub fn is_directory_bucket(bucket: &str) -> bool {
+    bucket.ends_with("--x-s3")
+}
+
 /// 412 is a failed `If-Match`/`If-None-Match`; 409 is a conditional write that raced another;
 /// 404 is an `If-Match` on an object that no longer exists.
 fn lost_precondition(status: Option<u16>) -> bool {
