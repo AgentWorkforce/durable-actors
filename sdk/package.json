@@ -92,7 +92,7 @@
         "clean": "rm -rf dist .test-dist",
         "package:check": "bun test --timeout 60000 tests/scripts/codegen-api.test.mjs tests/scripts/build-artifact.test.mjs tests/scripts/standalone-client.test.mjs tests/scripts/host-runtime.test.mjs",
         "prepack": "bun run --bun clean && bun run --bun build && bun run --bun package:check",
-        "test": "bun run --bun clean && bun run --bun build && bun tests/prepare.mjs && tsc -p tsconfig.test.json && bun test --parallel=1 --timeout 60000 ./.test-dist/tests",
+        "test": "bun run --bun clean && bun run --bun build && bun tests/prepare.mjs && tsc -p tsconfig.test.json && bun test --parallel --timeout 60000 ./.test-dist/tests",
         "format": "prettier --config ../.prettierrc --write \"src/**/*.ts\" \"tests/**/*.ts\" \"scripts/*.mjs\" \"tests/**/*.mjs\"",
         "format:check": "prettier --config ../.prettierrc --check \"src/**/*.ts\" \"tests/**/*.ts\" \"scripts/*.mjs\" \"tests/**/*.mjs\"",
         "build:observer": "bun run --bun --cwd ../packages/observer-ui build",

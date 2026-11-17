@@ -1,11 +1,14 @@
 name: Install upstream Litestream for tests
-description: Install the Go CLI used by Rust SQLite test fixtures; the runtime embeds terse-litestream through Cargo.
+description: Install the Litestream CLI used by Rust SQLite test fixtures; the runtime embeds terse-litestream through Cargo.
 runs:
     using: composite
     steps:
-        - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-          with:
-              go-version: "1.27.1"
-              cache: false
         - shell: bash
-          run: go install github.com/benbjohnson/litestream/cmd/litestream@v0.5.17
+          env:
+              ARCHIVE: litestream-0.5.17-linux-x86_64.tar.gz
+          run: |
+              cd "$RUNNER_TEMP"
+              curl -fsSLO "https://github.com/benbjohnson/litestream/releases/download/v0.5.17/$ARCHIVE"
+              echo "cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d  $ARCHIVE" | sha256sum --check
+              tar -xzf "$ARCHIVE" litestream
+              sudo install litestream /usr/local/bin/litestream

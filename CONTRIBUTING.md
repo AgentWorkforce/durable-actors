@@ -108,11 +108,13 @@ uv run --no-sync ruff check src tests
 uv run --no-sync ruff format --check src tests
 uv run --no-sync mypy src/durable_actors
 uv run --no-sync pyright
-DURABLE_ACTORS_TEST_RUNTIME="$(cd .. && pwd)/target/debug/durable-actors" uv run --no-sync pytest -q
+DURABLE_ACTORS_TEST_RUNTIME="$(cd .. && pwd)/target/debug/durable-actors" uv run --no-sync pytest -q -n auto
 uv build --no-sources
 ```
 
-The `native-build.yml` workflow builds `durable-actors-runtime` wheels with Maturin for Linux/macOS on x64/ARM64. It builds the observer UI once per wheel, includes the prebuilt assets and third-party license notices, then installs both wheels in a clean environment. CLI acceptance tests clear PATH to verify initialization, development, reloads, persistence, code generation, and the observer without Bun or Node. The release publishes runtime wheels before the SDK; configure the new runtime project's trusted publisher before its first release.
+The `native-build.yml` workflow builds `durable-actors-runtime` wheels with Maturin for Linux/macOS on x64/ARM64. It packages the same compiled executable as the native CLI tarball with `bun scripts/build-runtime.mjs --binary target/release/durable-actors-native`; both executable names use `src/main.rs`. It builds the observer UI once per wheel, includes the prebuilt assets and third-party license notices, then installs both wheels in a clean environment. CLI acceptance tests clear PATH to verify initialization, development, reloads, persistence, code generation, and the observer without Bun or Node. The release publishes runtime wheels before the SDK; configure the new runtime project's trusted publisher before its first release.
+
+Only the release workflow runs `native-build.yml`. Pull request and main CI run tests only, and superseded pull request runs are cancelled. Releases do not rerun the test suites: publishing waits for main CI to pass on the tagged commit.
 
 To build and test the native Python package locally, from the repository root:
 
@@ -153,7 +155,7 @@ docker build --target typescript -t durable-actors:typescript .
 bash scripts/test-runtime-image.sh durable-actors:typescript typescript
 ```
 
-Repeat for `python` and `control-plane`. CI runs each target on amd64 and arm64. The TypeScript execution package bundles only the actor and host modules, collects dependency licenses, and is checked by `sdk package:check`. Examples, the CLI, compiler, and observer UI are excluded from that image. SQL migrations and `docs/reference/openapi.yaml` are Rust build inputs embedded in the executable; their source directories are not copied into the final images.
+Repeat for `python` and `control-plane`. Releases build and check each target on amd64 and arm64; pull request and main CI run tests only, and the WebSocket and restart integration tests run on main. The TypeScript execution package bundles only the actor and host modules, collects dependency licenses, and is checked by `sdk package:check`. Examples, the CLI, compiler, and observer UI are excluded from that image. SQL migrations and `docs/reference/openapi.yaml` are Rust build inputs embedded in the executable; their source directories are not copied into the final images.
 
 ## Open a pull request
 

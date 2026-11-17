@@ -94,6 +94,19 @@ nix = { version = "0.31", features = ["process"] }
 [features]
 python-cli = []
 
+[lib]
+doctest = false
+
+[[bin]]
+name = "durable-actors"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "durable-actors-host"
+path = "src/bin/durable-actors-host.rs"
+test = false
+
 [[bin]]
 name = "durable-actors-native"
 path = "src/bin/durable-actors-native.rs"

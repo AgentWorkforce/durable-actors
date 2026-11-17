@@ -3,12 +3,14 @@ import { createHash } from "node:crypto"
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { parseArgs } from "node:util"
 
 export class RuntimeBuilder {
-    constructor({ root, platform = process.platform, arch = process.arch }, run = runCommand) {
+    constructor({ root, platform = process.platform, arch = process.arch, binary }, run = runCommand) {
         this.root = root
         this.platform = platform
         this.arch = arch
+        this.binary = binary
         this.run = run
     }
 
@@ -29,8 +31,10 @@ export class RuntimeBuilder {
     }
 
     async compile(staging) {
-        await this.run("cargo", ["build", "--locked", "--release", "--bin", "durable-actors"], { cwd: this.root })
-        await copyFile(path.join(this.root, "target/release/durable-actors"), path.join(staging, "durable-actors"))
+        if (!this.binary) {
+            await this.run("cargo", ["build", "--locked", "--release", "--bin", "durable-actors"], { cwd: this.root })
+        }
+        await copyFile(path.resolve(this.root, this.binary ?? "target/release/durable-actors"), path.join(staging, "durable-actors"))
     }
 
     async package(staging, output) {
@@ -56,5 +60,6 @@ function runCommand(command, args, options) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-    console.log(await new RuntimeBuilder({ root: fileURLToPath(new URL("../", import.meta.url)) }).build())
+    const { values } = parseArgs({ options: { binary: { type: "string" } } })
+    console.log(await new RuntimeBuilder({ root: fileURLToPath(new URL("../", import.meta.url)), binary: values.binary }).build())
 }

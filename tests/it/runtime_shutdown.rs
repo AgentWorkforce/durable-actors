@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
-#[path = "support/local_project.rs"]
-mod local_project;
+use crate::local_project;
 
 use std::{process::Stdio, time::Duration};
 

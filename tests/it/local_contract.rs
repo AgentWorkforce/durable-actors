@@ -1,5 +1,4 @@
-#[path = "support/local_project.rs"]
-mod local_project;
+use crate::local_project;
 
 use std::{path::Path, process::Stdio, time::Duration};
 

@@ -235,76 +235,52 @@ jobs:
                       exit 1
                   fi
 
-    rust:
-        name: Test Rust runtime
+    main-ci:
+        name: Wait for main CI
+        needs: preflight
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 60
+        permissions:
+            actions: read
+        steps:
+            - name: Require a successful CI run on main for the tagged commit
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  for attempt in $(seq 1 20); do
+                      run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --commit "$GITHUB_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')
+                      [ -n "$run" ] && break
+                      sleep 15
+                  done
+                  if [ -z "$run" ]; then
+                      echo "::error::No main CI run found for $GITHUB_SHA"
+                      exit 1
+                  fi
+                  gh run watch "$run" --repo "$GITHUB_REPOSITORY" --exit-status --interval 30
+
+    crate-check:
+        name: Verify crate package
         needs: [preflight, litestream, modal]
         runs-on: blacksmith-4vcpu-ubuntu-2404
-        services:
-            clickhouse:
-                image: clickhouse/clickhouse-server:26.6
-                env:
-                    CLICKHOUSE_DB: trace_test
-                    CLICKHOUSE_USER: trace_test
-                    CLICKHOUSE_PASSWORD: local-test-only
-                    CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-                ports:
-                    - 8123:8123
-                options: >-
-                    --health-cmd "wget -q -O - http://localhost:8123/ping"
-                    --health-interval 5s
-                    --health-timeout 5s
-                    --health-retries 10
-            postgres:
-                image: postgres:16
-                env:
-                    POSTGRES_DB: durable_actors_test
-                    POSTGRES_PASSWORD: postgres
-                    POSTGRES_USER: postgres
-                ports:
-                    - 5432:5432
-                options: >-
-                    --health-cmd "pg_isready -U postgres -d durable_actors_test"
-                    --health-interval 5s
-                    --health-timeout 5s
-                    --health-retries 10
         steps:
-            - uses: oven-sh/setup-bun@v2
-              with:
-                  bun-version: "1.4.2"
             - name: Checkout the tagged commit
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                   ref: ${{ github.sha }}
 
             - name: Install Rust toolchain
-              run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt && rustup default 1.91.0
+              run: rustup toolchain install 1.91.0 --profile minimal && rustup default 1.91.0
 
             - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
               with:
                   shared-key: validation-ubuntu-24.04
                   save-if: ${{ github.ref == 'refs/heads/main' }}
 
-            - uses: ./.github/actions/setup-test-litestream
-            - name: Check formatting
-              run: cargo fmt --all -- --check
-
-            - name: Run tests
-              env:
-                  DURABLE_ACTORS_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/durable_actors_test?sslmode=disable
-                  DURABLE_ACTORS_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
-              run: cargo test --locked --no-fail-fast
-
             - name: Verify crate package
               run: cargo publish --locked --dry-run
 
-            - run: bun install --frozen-lockfile
-            - run: bun run --bun --cwd sdk build
-            - run: cargo build --locked
-            - name: Run WebSocket and restart integration tests
-              run: cargo test --locked -- --ignored
-
-    npm-ci:
-        name: Test npm package
+    npm-package:
+        name: Pack npm packages
         needs: preflight
         runs-on: blacksmith-4vcpu-ubuntu-2404
         steps:
@@ -319,15 +295,9 @@ jobs:
             - name: Install dependencies
               run: bun install --frozen-lockfile
 
-            - name: Check formatting
-              run: bun run --bun --cwd sdk format:check
-
-            - name: Run tests
-              run: bun run --bun --cwd sdk test
-
-            - name: Check and pack the tested npm packages
+            - name: Build and pack the npm packages
               run: |
-                  bun run --bun --cwd sdk package:check
+                  bun run --bun --cwd sdk build
                   bun pm --cwd packages/observer-ui pack --ignore-scripts --destination ../../dist-tarballs
                   bun pm --cwd sdk pack --ignore-scripts --destination ../dist-tarballs
             - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -337,9 +307,27 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
-    python-ci:
+    python-package:
+        name: Build Python SDK package
         needs: preflight
-        uses: ./.github/workflows/python.yml
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        steps:
+            - name: Checkout the tagged commit
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ github.sha }}
+            - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+              with:
+                  python-version: "3.14"
+            - name: Build distributions
+              working-directory: sdk-python
+              run: uv build --no-sources
+            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                  name: python-package
+                  path: sdk-python/dist/*
+                  if-no-files-found: error
+                  retention-days: 7
 
     native:
         needs: preflight
@@ -353,7 +341,7 @@ jobs:
             runners: '["macos-15-intel"]'
 
     native-publish:
-        needs: [preflight, rust, npm-ci, python-ci, native]
+        needs: [preflight, main-ci, npm-package, native]
         permissions:
             contents: write
         uses: ./.github/workflows/native-publish.yml
@@ -361,7 +349,7 @@ jobs:
             version: ${{ needs.preflight.outputs.version }}
 
     native-intel-publish:
-        needs: [preflight, rust, npm-ci, python-ci, native-intel]
+        needs: [preflight, main-ci, npm-package, native-intel]
         permissions:
             contents: write
         uses: ./.github/workflows/native-publish.yml
@@ -511,7 +499,7 @@ jobs:
 
     image-push:
         name: Push runtime image (${{ matrix.target }}, ${{ matrix.arch }})
-        needs: [preflight, rust, npm-ci, python-ci, image-build]
+        needs: [preflight, main-ci, image-build]
         strategy:
             fail-fast: false
             matrix:
@@ -708,7 +696,7 @@ jobs:
 
     crate:
         name: Publish crate
-        needs: [preflight, image, native-publish]
+        needs: [preflight, main-ci, crate-check]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 30
         steps:
@@ -733,7 +721,7 @@ jobs:
                   if [ "$status" = "200" ]; then
                       echo "durable-actors@$RELEASE_VERSION already published"
                   elif [ "$status" = "404" ]; then
-                      # The rust job already verified this tagged source with cargo publish --dry-run.
+                      # The crate-check job already verified this tagged source with cargo publish --dry-run.
                       cargo publish --locked --no-verify
                   else
                       echo "::error::crates.io returned HTTP $status"
@@ -742,7 +730,7 @@ jobs:
 
     python-runtime:
         name: Publish Python native runtime wheels
-        needs: [preflight, native, python-ci, image, native-publish]
+        needs: [preflight, native, image, native-publish]
         runs-on: ubuntu-latest
         environment: pypi
         permissions:
@@ -759,7 +747,7 @@ jobs:
 
     python:
         name: Publish Python SDK
-        needs: [preflight, python-ci, image, native-publish, python-runtime]
+        needs: [preflight, python-package, image, native-publish, python-runtime]
         runs-on: ubuntu-latest
         environment: pypi
         permissions:

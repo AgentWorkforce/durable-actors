@@ -1,5 +1,4 @@
-#[path = "fixtures/sqlite.rs"]
-mod sqlite;
+use crate::sqlite;
 use anyhow::Result;
 use durable_actors::state_log::StateSnapshot;
 use serde_json::json;

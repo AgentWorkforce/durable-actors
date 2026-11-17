@@ -1,5 +1,4 @@
-#[path = "fixtures/sqlite.rs"]
-mod sqlite;
+use crate::sqlite;
 use std::{
     collections::BTreeMap,
     sync::{

@@ -5,77 +5,16 @@ on:
         branches: [main]
     pull_request:
 
+concurrency:
+    group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
     contents: read
 
 jobs:
     python:
         uses: ./.github/workflows/python.yml
-
-    image:
-        name: Runtime images (${{ matrix.arch }})
-        strategy:
-            fail-fast: false
-            matrix:
-                arch: [amd64, arm64]
-                include:
-                    - arch: amd64
-                      platform: linux/amd64
-                      runner: blacksmith-4vcpu-ubuntu-2404
-                    - arch: arm64
-                      platform: linux/arm64
-                      runner: blacksmith-4vcpu-ubuntu-2404-arm
-        runs-on: ${{ matrix.runner }}
-        timeout-minutes: 60
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-            - name: Set up Blacksmith Docker builder
-              uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
-              with:
-                  cache-key: durable-actors/runtime-${{ matrix.arch }}
-                  nofallback: false
-                  platforms: ${{ matrix.platform }}
-            - name: Build control-plane image
-              uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
-              with:
-                  context: .
-                  target: control-plane
-                  platforms: ${{ matrix.platform }}
-                  load: true
-                  tags: durable-actors:ci-control-plane
-            - name: Check the control-plane image runtime
-              run: bash scripts/test-runtime-image.sh durable-actors:ci-control-plane "control-plane"
-
-            - name: Build typescript image
-              uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
-              with:
-                  context: .
-                  target: typescript
-                  platforms: ${{ matrix.platform }}
-                  load: true
-                  tags: durable-actors:ci-typescript
-            - name: Check the typescript image runtime
-              run: bash scripts/test-runtime-image.sh durable-actors:ci-typescript "typescript"
-
-            - name: Build python image
-              uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
-              with:
-                  context: .
-                  target: python
-                  platforms: ${{ matrix.platform }}
-                  load: true
-                  tags: durable-actors:ci-python
-            - name: Check the python image runtime
-              run: bash scripts/test-runtime-image.sh durable-actors:ci-python "python"
-
-            - name: Build collector image
-              uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
-              with:
-                  context: .
-                  target: collector
-                  platforms: ${{ matrix.platform }}
-                  load: true
-                  tags: durable-actors:ci-collector
 
     collector:
         name: Collector exporter
@@ -93,6 +32,8 @@ jobs:
     rust:
         name: Rust runtime
         runs-on: blacksmith-4vcpu-ubuntu-2404
+        env:
+            CARGO_PROFILE_DEV_DEBUG: line-tables-only
         services:
             clickhouse:
                 image: clickhouse/clickhouse-server:26.6
@@ -139,7 +80,7 @@ jobs:
               run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt && rustup default 1.91.0
             - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
               with:
-                  shared-key: validation-ubuntu-24.04
+                  shared-key: rust-tests-ubuntu-24.04
                   save-if: ${{ github.ref == 'refs/heads/main' }}
             - uses: ./.github/actions/setup-test-litestream
             - name: Check formatting
@@ -152,10 +93,12 @@ jobs:
               run: cargo test --locked --no-fail-fast
             - run: bun install --frozen-lockfile
             - run: bun run --bun --cwd sdk build
-            - name: Check packaged actors on Bun
-              run: bun test --timeout 60000 sdk/tests/scripts/build-artifact.test.mjs sdk/tests/scripts/host-runtime.test.mjs
-            - run: cargo build --locked
+            - name: Check the npm package and packaged actors on Bun
+              run: bun run --bun --cwd sdk package:check
+            - if: github.event_name == 'push'
+              run: cargo build --locked
             - name: Run WebSocket and restart integration tests
+              if: github.event_name == 'push'
               run: cargo test --locked -- --ignored
             - name: Check the Express and React example
               working-directory: examples/chat
@@ -184,7 +127,7 @@ jobs:
             - run: bun run --bun --cwd packages/observer-ui format:check
             - run: bun run --bun --cwd sdk test
             - name: Validate HTTP and build TypeScript documentation
-              run: bun run --bun docs:build
+              run: bun run --bun docs:check && bun run --bun --cwd sdk docs
             - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
               with:
                   name: typescript-api
@@ -193,7 +136,7 @@ jobs:
                   if-no-files-found: error
             - name: Verify npm package
               working-directory: sdk
-              run: bun pm pack --dry-run
+              run: bun pm pack --dry-run --ignore-scripts
 
     helm:
         name: Kubernetes chart
@@ -219,6 +162,3 @@ jobs:
                   path: .artifacts/charts/*.tgz
                   include-hidden-files: true
                   if-no-files-found: error
-
-    native:
-        uses: ./.github/workflows/native-build.yml

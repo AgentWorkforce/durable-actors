@@ -36,16 +36,6 @@ jobs:
               with:
                   shared-key: native-${{ matrix.runner }}
                   save-if: ${{ github.ref == 'refs/heads/main' }}
-            - name: Build Rust runtime
-              run: bun scripts/build-runtime.mjs
-            - name: Check the native executable
-              run: target/release/durable-actors --version
-            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-              with:
-                  name: native-${{ matrix.runner }}
-                  path: dist-runtime/*
-                  if-no-files-found: error
-                  retention-days: 7
             - name: Build Python runtime wheel and observer assets
               shell: bash
               run: |
@@ -55,6 +45,22 @@ jobs:
                   cp -R packages/observer-ui/dist/standalone/. python-runtime/durable_actors_runtime/observer/
                   uvx --from 'maturin>=1.15,<2' --with patchelf maturin build --release --out dist-python-runtime
                   uv build --wheel --no-sources sdk-python --out-dir dist-python-sdk
+            # Both CLIs use src/main.rs; package Maturin's binary instead of linking it twice.
+            - name: Package the compiled native runtime
+              run: bun scripts/build-runtime.mjs --binary target/release/durable-actors-native
+            - name: Check the native bundle
+              shell: bash
+              run: |
+                  mkdir -p .artifacts/native-check
+                  tar -xzf dist-runtime/*.tar.gz -C .artifacts/native-check
+                  .artifacts/native-check/durable-actors --version
+                  bun test --timeout 60000 tests/scripts/build-runtime.test.mjs
+            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                  name: native-${{ matrix.runner }}
+                  path: dist-runtime/*
+                  if-no-files-found: error
+                  retention-days: 7
             - name: Install wheels and test Python-only workflows
               shell: bash
               env:
