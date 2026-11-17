@@ -211,16 +211,7 @@ impl HostStorage {
                     });
                     let checkpointer =
                         Checkpointer::spawn(primary.clone(), copy, checkpoint.config(), stop);
-                    let reconcile = checkpointer.clone();
-                    let snapshots = primary.snapshots.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = reconcile.reconcile(&snapshots).await {
-                            tracing::warn!(
-                                event = "storage_checkpoint_reconcile_failed",
-                                error = format!("{error:#}"),
-                            );
-                        }
-                    });
+                    checkpointer.reconcile_in_background(&primary.snapshots);
                     (
                         Arc::new(CheckpointedBucket::new(
                             primary.ownership.clone(),

@@ -364,8 +364,11 @@ async fn object_storage(
                 let copy = Arc::new(
                     crate::bucket::S3Bucket::from_environment(&checkpoint.bucket, endpoint).await?,
                 );
-                let checkpointer =
-                    Checkpointer::spawn(authority.clone(), copy, checkpoint.config(), &stop);
+                let config = crate::bucket::checkpoint::CheckpointConfig {
+                    reconcile_owners: true,
+                    ..checkpoint.config()
+                };
+                let checkpointer = Checkpointer::spawn(authority.clone(), copy, config, &stop);
                 authority = Arc::new(CheckpointedBucket::new(authority, checkpointer));
             }
             Ok((
