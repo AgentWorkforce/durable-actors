@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use crate::{
     bucket::{GcsBucket, RuntimeStorageReader},
-    platform_events::{NoPlatformEvents, PlatformEvents},
+    platform_events::{NoPlatformEvents, PlatformEvents, sandboxes::SandboxKill},
     postgres::PostgresDatabase,
     redis_client::{Redis, RedisConfig},
     request_traces::{
@@ -15,8 +15,9 @@ use crate::{
     },
     sandbox::{
         HostSandboxRuntimeConfig,
-        gke::{GKE_RUNTIME_CLASS, GkeConfig},
+        gke::{GKE_RUNTIME_CLASS, GkeConfig, KillReporting},
         modal::ModalConfig,
+        pool::claims::PoolClaims,
     },
 };
 
@@ -48,6 +49,8 @@ pub struct ControlPlaneProcessConfig {
     /// unset turns them off.
     pub platform_telemetry: Option<super::PlatformTelemetryConfig>,
     pub usage_topic: Option<String>,
+    /// Where platform events are also published for services outside the control plane.
+    pub events_topic: Option<String>,
     pub region: Option<String>,
     pub alarm_poll_interval: Duration,
     pub redis: Option<RedisConfig>,
@@ -259,18 +262,7 @@ async fn control_plane_routes(
         )?,
         None => super::socket_bus::MemorySocketHub::default().join(config.max_socket_connections),
     };
-    // A fresh ID per process: a restarted gateway must not vouch for the connections it lost.
-    let platform_events = config
-        .platform_telemetry
-        .as_ref()
-        .map(|telemetry| {
-            super::platform_telemetry::OtlpPlatformEvents::connect(
-                telemetry,
-                &uuid::Uuid::new_v4().to_string(),
-            )
-        })
-        .transpose()?
-        .map(Arc::new);
+    let platform_events = platform_events(config.platform_telemetry.as_ref())?;
     let socket_events: Arc<dyn PlatformEvents<crate::platform_events::sockets::SocketEvent>> =
         match &platform_events {
             Some(events) => events.clone(),
@@ -406,7 +398,8 @@ async fn sandbox_provisioner(
     stop: tokio_util::sync::CancellationToken,
     connections: crate::sandbox::connections::HostConnections,
 ) -> Result<super::service::SandboxHostProvisioner> {
-    let provider = sandbox_provider(&config, connections).await?;
+    // Every replica watches the same pods, so only the pool manager reports their kills.
+    let provider = sandbox_provider(&config, connections, None).await?;
     let pool = crate::sandbox::pool::SparePool::with_runtime_images(
         database,
         provider.clone(),
@@ -429,13 +422,14 @@ async fn sandbox_provisioner(
 async fn sandbox_provider(
     config: &SandboxProviderConfig,
     connections: crate::sandbox::connections::HostConnections,
+    kills: Option<KillReporting>,
 ) -> Result<Arc<dyn crate::sandbox::SandboxProvider>> {
     let secrets = Arc::new(crate::sandbox::secrets::KubernetesSecrets::new(
         config.secret_namespace.clone(),
     ));
     Ok(Arc::new(match &config.backend {
         SandboxBackend::Gke(gke) => {
-            crate::sandbox::gke::provider(gke.clone(), secrets, connections).await?
+            crate::sandbox::gke::provider(gke.clone(), secrets, connections, kills).await?
         }
         SandboxBackend::Modal(modal) => {
             crate::sandbox::modal::provider(
@@ -464,9 +458,11 @@ pub async fn serve_pool_manager(
     let registry = Arc::new(super::PostgresAdminRegistry::from_database(
         database.clone(),
     ));
+    let kills = kill_reporting(&config, &database).await?;
     let provider = sandbox_provider(
         &config.sandbox_provider,
         crate::sandbox::connections::HostConnections::new()?,
+        kills,
     )
     .await?;
     let pool = crate::sandbox::pool::SparePool::with_runtime_images(
@@ -503,6 +499,27 @@ pub async fn serve_pool_manager(
     stop.cancel();
     housekeeping.await?;
     Ok(())
+}
+
+/// Kills are reported only where something takes them: platform telemetry, the events topic, or
+/// both.
+async fn kill_reporting(
+    config: &ControlPlaneProcessConfig,
+    database: &PostgresDatabase,
+) -> Result<Option<KillReporting>> {
+    let recorded = platform_events(config.platform_telemetry.as_ref())?;
+    if recorded.is_none() && config.events_topic.is_none() {
+        return Ok(None);
+    }
+    let recorded: Arc<dyn PlatformEvents<SandboxKill>> = match recorded {
+        Some(events) => events,
+        None => Arc::new(NoPlatformEvents),
+    };
+    let topic = config.events_topic.as_deref();
+    Ok(Some(KillReporting {
+        claims: Arc::new(PoolClaims(database.clone())),
+        events: super::event_topic::published(recorded, topic).await?,
+    }))
 }
 
 impl ControlPlaneProcessConfig {
@@ -614,6 +631,7 @@ impl ControlPlaneProcessConfig {
             socket_event_sink,
             platform_telemetry: platform_telemetry_config(&mut get)?,
             usage_topic: get("DURABLE_ACTORS_USAGE_TOPIC"),
+            events_topic: get("DURABLE_ACTORS_EVENTS_TOPIC"),
             region,
             alarm_poll_interval,
             redis: redis_config(&mut get)?,
@@ -764,6 +782,21 @@ fn republish_deployments(service: ControlPlaneService) {
             warn!(error = %format!("{error:#}"), "deployments were not republished");
         }
     });
+}
+
+// A fresh ID per process: a restarted gateway must not vouch for the connections it lost.
+fn platform_events(
+    config: Option<&super::PlatformTelemetryConfig>,
+) -> Result<Option<Arc<super::platform_telemetry::OtlpPlatformEvents>>> {
+    config
+        .map(|telemetry| {
+            super::platform_telemetry::OtlpPlatformEvents::connect(
+                telemetry,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .map(Arc::new)
+        })
+        .transpose()
 }
 
 fn platform_telemetry_config(

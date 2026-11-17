@@ -252,6 +252,16 @@
         }
       }
     },
+    "events": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "topic": {
+          "type": "string",
+          "pattern": "^$|^projects/[^/\\s]+/topics/[^/\\s]+$"
+        }
+      }
+    },
     "postgres": {
       "type": "object",
       "additionalProperties": false,

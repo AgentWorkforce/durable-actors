@@ -7,7 +7,9 @@ mod contract_api;
 pub(crate) mod contracts;
 pub(crate) use client::{HostAuthorization, LeaseFence};
 mod discovery;
+mod event_history;
 mod event_sink;
+mod event_topic;
 mod gateway;
 mod inspection;
 #[cfg(test)]

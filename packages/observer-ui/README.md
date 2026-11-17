@@ -56,6 +56,10 @@ Residency uses lifecycle reports, including immediate notifications when the exe
 
 Custom observer clients can implement `listResidency` to enable the timeline. `HttpObserverClient` and the TypeScript and Python observer proxies use the authenticated project endpoint `/v1/projects/{project_id}/observe/residency?actorName=…`. `ResidencyTimeline` and its props and data types are also exported for embedding.
 
+## Events
+
+An actor's page and each instance's page list its sandbox kills, newest first: sandboxes that stopped without the platform asking, which needs Kubernetes sandboxes. They are read from `/v1/projects/{project_id}/observe/events/history?types=kill`, which the TypeScript and Python observer proxies serve as `events/history`, and arrive live as `kill` events.
+
 ## Persisted actor state
 
 Select an actor instance in `ActorObserver` to inspect persisted fields, JSON types, nested values, and version diffs. Request and connection links filter the existing request history. The standard `HttpObserverClient` and `durable-actors observe` include this capability; custom clients implement `getState` and `listStateHistory` to enable it.

@@ -259,6 +259,10 @@ def test_observer_assets_proxy_streaming_and_browser_boundaries(tmp_path, cli_en
                     "periods": [],
                     "truncated": False,
                 }
+                assert http.get("/api/observe/events/history").json() == {
+                    "events": [],
+                    "truncated": False,
+                }
                 assert http.get("/", headers={"host": "evil.example"}).status_code == 403
                 assert http.get("/", headers={"origin": "https://evil.example"}).status_code == 403
                 assert http.get("/", headers={"sec-fetch-site": "cross-site"}).status_code == 403

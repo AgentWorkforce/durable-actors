@@ -1,4 +1,5 @@
 import type { ActorResidency, WaitingOperation } from "./Actors.js"
+import type { ActorKill } from "./Kills.js"
 import type { ActorLog } from "./Logs.js"
 import type { RequestTrace } from "./Requests.js"
 
@@ -57,5 +58,15 @@ export type ObserveEvent =
     | { type: "connectionClosed"; item: ConnectionClosed }
     | { type: "gatewayAlive"; item: GatewayAlive }
     | { type: "deployment"; item: Deployment }
+    | { type: "kill"; item: ActorKill }
 
-export const observeEventTypes: ObserveEvent["type"][] = ["request", "log", "instance", "connectionOpened", "connectionClosed", "gatewayAlive", "deployment"]
+export const observeEventTypes: ObserveEvent["type"][] = ["request", "log", "instance", "connectionOpened", "connectionClosed", "gatewayAlive", "deployment", "kill"]
+
+/** An event `observe/events/history` keeps: one that happens once. The other types have their own views. */
+export type RecordedEvent = Extract<ObserveEvent, { type: "kill" }>
+
+/** Past events, newest first, each as the stream sent it. */
+export interface EventHistory {
+    truncated: boolean
+    events: RecordedEvent[]
+}

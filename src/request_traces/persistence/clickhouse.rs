@@ -9,9 +9,11 @@ use tokio_util::sync::CancellationToken;
 use super::TraceQueries;
 use crate::request_traces::{
     TracePage,
+    events::EventQuery,
     history::HistoryQuery,
     logs::{LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
+    otlp::PlatformLog,
 };
 
 mod lifecycle;
@@ -108,6 +110,14 @@ impl TraceQueries for ClickHouseTracePersistence {
         project_id: &str,
     ) -> Result<std::collections::HashMap<String, u64>> {
         self.read_gateway_heartbeats(project_id).await
+    }
+
+    async fn platform_events(
+        &self,
+        project_id: &str,
+        query: &EventQuery,
+    ) -> Result<Vec<PlatformLog>> {
+        self.read_platform_events(project_id, query).await
     }
 
     async fn deployed_contract(&self, project_id: &str) -> Result<Option<serde_json::Value>> {

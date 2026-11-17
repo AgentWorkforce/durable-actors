@@ -578,3 +578,114 @@ async fn the_latest_deployment_event_holds_the_deployed_contract() -> Result<()>
     assert_eq!(store.deployed_contract(&project).await?, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn stored_platform_events_read_back_by_name_once_each() -> Result<()> {
+    use crate::{
+        platform_events::{sandboxes::KILLED, sockets::OPENED},
+        request_traces::otlp,
+    };
+    let Ok(url) = std::env::var("DURABLE_ACTORS_TEST_CLICKHOUSE_URL") else {
+        return Ok(());
+    };
+    let stop = CancellationToken::new();
+    let _guard = stop.clone().drop_guard();
+    let store = ClickHouseTracePersistence::start(config(url), Duration::from_secs(86400), stop)?;
+    schema::initialize(&store.client, 86400).await?;
+    let project = format!("events-{}", uuid::Uuid::new_v4());
+    // As the collector's ClickHouse exporter writes them: attribute values are text.
+    let row = |at_ms: u64, event: &str, actor_id: &str, attributes: &str| {
+        format!(
+            "(fromUnixTimestamp64Milli({at_ms}), '{event}', map('durable_actors.project_id', \
+             '{project}', 'durable_actors.actor_name', 'Room', 'durable_actors.actor_id', \
+             '{actor_id}', {attributes}))"
+        )
+    };
+    let killed = |at_ms: u64, actor_id: &str, sandbox: &str, reason: &str| {
+        row(
+            at_ms,
+            KILLED,
+            actor_id,
+            &format!(
+                "'durable_actors.sandbox_id', '{sandbox}', 'durable_actors.kill_reason', '{reason}'"
+            ),
+        )
+    };
+    let values = [
+        killed(1000, "one", "a", "out_of_memory"),
+        // A control plane that restarts reports the killed pod it still sees.
+        killed(1000, "one", "a", "out_of_memory"),
+        killed(2000, "two", "b", "killed"),
+        killed(3000, "one", "c", "out_of_disk"),
+        row(
+            2500,
+            OPENED,
+            "one",
+            "'durable_actors.connection_id', 'open'",
+        ),
+    ]
+    .join(", ");
+    store
+        .client
+        .query(&format!(
+            "INSERT INTO platform_events (Timestamp, EventName, LogAttributes) VALUES {values}"
+        ))
+        .execute()
+        .await?;
+    let query =
+        |names: &[&'static str], actor: Option<(&str, Option<&str>)>, from_ms, to_ms| EventQuery {
+            names: names.to_vec(),
+            actor_name: actor.map(|(name, _)| name.to_owned()),
+            actor_id: actor.and_then(|(_, id)| id.map(str::to_owned)),
+            from_ms,
+            to_ms,
+        };
+    let subject = |event: &PlatformLog| {
+        let subject = event.string(otlp::SANDBOX_ID);
+        (
+            event.at_ms,
+            subject.or_else(|| event.string(otlp::CONNECTION_ID)),
+        )
+    };
+    let read = |at_ms: u64, subject: &str| (at_ms, Some(subject.to_owned()));
+    for (query, expected) in [
+        (
+            query(&[KILLED], None, None, None),
+            vec![read(3000, "c"), read(2000, "b"), read(1000, "a")],
+        ),
+        (
+            query(&[KILLED, OPENED], None, None, None),
+            vec![
+                read(3000, "c"),
+                read(2500, "open"),
+                read(2000, "b"),
+                read(1000, "a"),
+            ],
+        ),
+        (
+            query(&[KILLED], Some(("Room", Some("one"))), None, None),
+            vec![read(3000, "c"), read(1000, "a")],
+        ),
+        (query(&[KILLED], Some(("Other", None)), None, None), vec![]),
+        (
+            query(&[KILLED], None, Some(1500), Some(2500)),
+            vec![read(2000, "b")],
+        ),
+    ] {
+        let events = store.platform_events(&project, &query).await?;
+        assert_eq!(events.iter().map(subject).collect::<Vec<_>>(), expected);
+    }
+    let kills = query(&[KILLED], None, None, None);
+    let latest = &store.platform_events(&project, &kills).await?[0];
+    assert_eq!(latest.name, KILLED);
+    assert_eq!(latest.body, None);
+    for (attribute, value) in [
+        (otlp::ACTOR_NAME, "Room"),
+        (otlp::ACTOR_ID, "one"),
+        (otlp::KILL_REASON, "out_of_disk"),
+    ] {
+        assert_eq!(latest.string(attribute).as_deref(), Some(value));
+    }
+    assert!(store.platform_events("other", &kills).await?.is_empty());
+    Ok(())
+}

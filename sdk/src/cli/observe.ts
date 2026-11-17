@@ -51,7 +51,12 @@ class Observer {
             Partial<
                 Pick<
                     ControlPlaneClient,
-                    "openEventStream" | "listRequests" | "listResidency" | "listLogs" | "getLogHistogram"
+                    | "openEventStream"
+                    | "listEventHistory"
+                    | "listRequests"
+                    | "listResidency"
+                    | "listLogs"
+                    | "getLogHistogram"
                 >
             >,
         private readonly openBrowser: (url: string) => Promise<unknown>,
@@ -145,6 +150,7 @@ class Observer {
         }
         const history = {
             "/api/observe/residency": this.client.listResidency,
+            "/api/observe/events/history": this.client.listEventHistory,
             "/api/observe/state": this.client.getState,
             "/api/observe/state/history": this.client.listStateHistory,
             "/api/observe/requests": this.client.listRequests,

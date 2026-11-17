@@ -7,6 +7,7 @@ use super::{
 use crate::platform_events::sockets::SocketClose;
 use crate::request_traces::{
     RequestTrace, TraceEvent, TraceRecord,
+    events::EVENT_LIMIT,
     logs::{ActorLog, LogHistogram, LogHistogramQuery},
     metrics::ClassMetrics,
     sockets::SocketRecord,
@@ -212,6 +213,26 @@ impl ClickHouseTracePersistence {
             .collect())
     }
 
+    pub(super) async fn read_platform_events(
+        &self,
+        project: &str,
+        query: &EventQuery,
+    ) -> Result<Vec<PlatformLog>> {
+        let rows = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.query(include_str!("event_history.sql"), project)
+                .param("names", query.names.join(","))
+                .param("actor_name", query.actor_name.as_deref().unwrap_or(""))
+                .param("actor_id", query.actor_id.as_deref().unwrap_or(""))
+                .param("from", millis(query.from_ms.unwrap_or(0)))
+                .param("to", millis(query.to_ms.unwrap_or(u64::MAX)))
+                .param("limit", EVENT_LIMIT + 1)
+                .fetch_all::<EventRow>(),
+        )
+        .await??;
+        Ok(rows.into_iter().map(PlatformLog::from).collect())
+    }
+
     pub(super) async fn read_deployed_contract(
         &self,
         project: &str,
@@ -403,4 +424,25 @@ impl From<SocketRow> for SocketRecord {
 struct HeartbeatRow {
     gateway_id: String,
     alive_at_ms: u64,
+}
+
+#[derive(Row, Deserialize)]
+struct EventRow {
+    name: String,
+    gateway_id: String,
+    at_ms: u64,
+    attributes: Vec<(String, String)>,
+    body: String,
+}
+
+impl From<EventRow> for PlatformLog {
+    fn from(row: EventRow) -> Self {
+        Self::stored(
+            row.name,
+            row.gateway_id,
+            row.at_ms,
+            row.attributes,
+            Some(row.body),
+        )
+    }
 }

@@ -23,6 +23,7 @@ pub mod storage_paths;
 
 pub(crate) mod bundle;
 mod platform_events;
+mod pubsub;
 mod request_traces;
 mod request_tracking;
 mod sockets;

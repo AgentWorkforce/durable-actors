@@ -161,6 +161,7 @@ for (const [method, path] of [
     ["getMetrics", "metrics"],
     ["listQueueWaits", "queue-waits"],
     ["listWebSockets", "websockets"],
+    ["listEventHistory", "events/history"],
     ["getState", "state"],
     ["listStateHistory", "state/history"]
 ] as const) {

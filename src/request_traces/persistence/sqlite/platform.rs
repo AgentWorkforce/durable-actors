@@ -12,7 +12,11 @@ use crate::{
         PlatformRecord, deployments,
         sockets::{ALIVE, CLOSED, OPENED, SocketClose},
     },
-    request_traces::{otlp, sockets::SocketRecord},
+    request_traces::{
+        events::{EVENT_LIMIT, EventQuery},
+        otlp::{self, PlatformLog},
+        sockets::SocketRecord,
+    },
 };
 
 pub(super) fn append(
@@ -128,6 +132,43 @@ pub(super) fn heartbeats(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The table holds one record per actor, connection and event name, so each keeps its latest.
+pub(super) fn events(
+    connection: &mut Connection,
+    project_id: &str,
+    query: &EventQuery,
+) -> Result<Vec<PlatformLog>> {
+    let mut statement = connection.prepare(
+        "SELECT name, gateway_id, at_ms, attributes, body FROM platform_events
+         WHERE project_id = ?1 AND name IN (SELECT value FROM json_each(?2))
+             AND (?3 = '' OR actor_name = ?3) AND (?4 = '' OR actor_id = ?4)
+             AND at_ms BETWEEN ?5 AND ?6
+         ORDER BY at_ms DESC, name, actor_name, actor_id, connection_id
+         LIMIT ?7",
+    )?;
+    let rows = statement.query_map(
+        params![
+            project_id,
+            serde_json::to_string(&query.names)?,
+            query.actor_name.as_deref().unwrap_or_default(),
+            query.actor_id.as_deref().unwrap_or_default(),
+            i64::try_from(query.from_ms.unwrap_or(0))?,
+            i64::try_from(query.to_ms.unwrap_or(u64::MAX)).unwrap_or(i64::MAX),
+            EVENT_LIMIT as i64 + 1,
+        ],
+        |row| {
+            Ok(PlatformLog::stored(
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)? as u64,
+                text_attributes(&row.get::<_, String>(3)?),
+                row.get(4)?,
+            ))
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub(super) fn deployed_contract(
     connection: &mut Connection,
     project_id: &str,
@@ -189,4 +230,16 @@ fn close(attributes: &Map<String, Value>) -> SocketClose {
         bytes_out: count(otlp::BYTES_OUT),
         duration_ms: count(otlp::DURATION_MS),
     }
+}
+
+/// Attribute values as the analytics store keeps them.
+fn text_attributes(json: &str) -> Vec<(String, String)> {
+    parse(json)
+        .into_iter()
+        .filter_map(|(key, value)| match value {
+            Value::Null => None,
+            Value::String(text) => Some((key, text)),
+            other => Some((key, other.to_string())),
+        })
+        .collect()
 }

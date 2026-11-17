@@ -8,6 +8,7 @@ pub(crate) use crate::request_tracking::RequestOutcome;
 
 use crate::clock::{Clock, SystemClock};
 
+pub(crate) mod events;
 pub(crate) mod history;
 pub(crate) mod live;
 pub(crate) mod logs;
@@ -196,6 +197,18 @@ impl TraceStore {
         let mut sessions = sockets::sessions(records, &heartbeats, SystemClock.now_ms()?);
         sessions.retain(|session| sockets::overlaps(session, from_ms, to_ms));
         Ok(sessions)
+    }
+
+    /// The project's stored platform events that the query covers, newest first.
+    pub(crate) async fn platform_events(
+        &self,
+        project_id: &str,
+        query: &events::EventQuery,
+    ) -> Result<events::StoredEvents> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        let events = self.queries.platform_events(project_id, query).await?;
+        Ok(events::StoredEvents::from_read(events))
     }
 
     /// The public actor contract of the project's latest deployment.

@@ -35,6 +35,12 @@ test("enables usage publishing only when a topic is configured", () => {
     assert.match(output, /DURABLE_ACTORS_USAGE_TOPIC, value: "projects\/example\/topics\/actor-usage"/)
 })
 
+test("enables event publishing only when a topic is configured", () => {
+    assert.doesNotMatch(manifests(), /DURABLE_ACTORS_EVENTS_TOPIC/)
+    const output = manifests({ events: { topic: "projects/example/topics/actor-events" } })
+    assert.match(output, /DURABLE_ACTORS_EVENTS_TOPIC, value: "projects\/example\/topics\/actor-events"/)
+})
+
 test("configures ClickHouse analytics with a password from the credentials secret", () => {
     const output = manifests({ analytics: { backend: "clickhouse", clickhouse: {
         url: "https://clickhouse.example.com:8443", database: "actors", user: "writer",
@@ -228,8 +234,9 @@ test("the control plane reports platform events on a port sandboxes cannot reach
     assert.match(output, /\{name: otlp-internal, port: 4319, targetPort: otlp-internal, appProtocol: grpc\}/)
     assert.match(output, new RegExp(`PLATFORM_TOKEN_ISSUER, value: "${issuer}"`))
     assert.match(output, /serviceAccountToken: \{audience: durable-actors-platform-telemetry, expirationSeconds: 3600, path: token\}/)
-    // Only the control plane serves WebSockets and deployments, so the pool manager gets no token.
-    assert.equal(output.match(/DURABLE_ACTORS_PLATFORM_TELEMETRY_ENDPOINT/g).length, 1)
+    // The control plane reports connections and deployments; the pool manager reports sandbox kills.
+    assert.equal(output.match(/DURABLE_ACTORS_PLATFORM_TELEMETRY_ENDPOINT/g).length, 2)
+    assert.equal(output.match(/name: platform-telemetry, mountPath/g).length, 2)
     assert.doesNotMatch(output, /port: 4319\}\n[^\n]*\n[^\n]*sandbox/)
     assert.match(output, /\{protocol: TCP, port: 4317\}/)
     assert.doesNotMatch(output, /\{protocol: TCP, port: 4319\}/)

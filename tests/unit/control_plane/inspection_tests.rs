@@ -166,6 +166,7 @@ async fn project_observability_isolates_history_metrics_and_streams() -> Result<
         "metrics",
         "queue-waits",
         "websockets",
+        "events/history",
     ] {
         let url = format!("/v1/projects/bad!/observe/{route}");
         assert_eq!(fixture.get(&url).await?.status(), StatusCode::BAD_REQUEST);
@@ -208,6 +209,7 @@ async fn observability_requires_admin_credentials() -> Result<()> {
         "/v1/projects/default/observe/state?actorName=Room&actorId=one",
         "/v1/projects/default/observe/state/history?actorName=Room&actorId=one",
         "/v1/projects/default/observe/residency",
+        "/v1/projects/default/observe/events/history",
     ] {
         for credential in [
             None,
@@ -451,21 +453,102 @@ async fn platform_events_stream_live_and_the_inventory_reads_them() -> Result<()
 }
 
 async fn inventory_when(fixture: &Fixture, ready: impl Fn(&Value) -> bool) -> Result<Value> {
+    read_when(fixture, "/v1/projects/default/observe/actors", ready).await
+}
+
+async fn read_when(fixture: &Fixture, path: &str, ready: impl Fn(&Value) -> bool) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let inventory: Value = fixture
-                .get("/v1/projects/default/observe/actors")
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            if ready(&inventory) {
-                return Ok(inventory);
+            let read: Value = fixture.get(path).await?.error_for_status()?.json().await?;
+            if ready(&read) {
+                return Ok(read);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await?
+}
+
+#[tokio::test]
+async fn sandbox_kills_stream_live_and_the_event_history_reads_them_back() -> Result<()> {
+    use crate::platform_events::{
+        PlatformEvents,
+        sandboxes::{KillReason, SandboxKill},
+    };
+    let fixture = Fixture::start().await?;
+    let mut events = EventReader::open(
+        &fixture,
+        "/v1/projects/default/observe/events?signals=platform",
+    )
+    .await?;
+    let platform = super::local_telemetry::LocalPlatformEvents::new(
+        fixture.telemetry.clone(),
+        fixture.live.clone(),
+    );
+    for (id, reason, at_ms) in [
+        ("one", KillReason::OutOfMemory, 1000),
+        ("two", KillReason::OutOfDisk, 2000),
+    ] {
+        platform.record(SandboxKill {
+            actor: fixture.actor(id),
+            sandbox_id: format!("sandboxes/{id}/uid"),
+            reason,
+            at_ms,
+        });
+    }
+    let kill = |id: &str, at_ms: u64, reason: &str| json!({"actorName": "Room.with.dots", "actorId": id, "atMs": at_ms, "reason": reason});
+    let first = kill("one", 1000, "out_of_memory");
+    let second = kill("two", 2000, "out_of_disk");
+    for expected in [&first, &second] {
+        let (name, streamed) = events.next().await?;
+        assert_eq!((name.as_str(), &streamed[0]), ("kill", expected));
+    }
+
+    // The history holds each event as the stream sent it, under the stream's name for it.
+    let [first, second] = [first, second].map(|item| json!({"type": "kill", "item": item}));
+    let base = "/v1/projects/default/observe/events/history";
+    let history = read_when(&fixture, base, |history| history["events"][1].is_object()).await?;
+    assert_eq!(
+        history,
+        json!({"events": [second, first], "truncated": false})
+    );
+    for (query, expected) in [
+        ("?types=kill", json!([second, first])),
+        ("?actorName=Room.with.dots", json!([second, first])),
+        ("?actorName=Room.with.dots&actorId=one", json!([first])),
+        ("?actorName=Other", json!([])),
+        ("?fromMs=1500", json!([second])),
+        ("?toMs=1500", json!([first])),
+    ] {
+        let history: Value = fixture
+            .get(&format!("{base}{query}"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(history["events"], expected, "{query}");
+    }
+    let other: Value = fixture
+        .get("/v1/projects/other/observe/events/history")
+        .await?
+        .json()
+        .await?;
+    assert_eq!(other["events"], json!([]));
+    // Lifecycle reports are stored too, but the residency view reads their history.
+    for query in [
+        "?types=instance",
+        "?types=kill,unknown",
+        "?actorId=one",
+        "?fromMs=20&toMs=10",
+        "?extra=1",
+    ] {
+        assert_eq!(
+            fixture.get(&format!("{base}{query}")).await?.status(),
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
+    Ok(())
 }
 
 /// Reads a stream's server-sent events one message at a time.

@@ -1279,6 +1279,7 @@ impl SandboxHostProvisioner {
                         request.host_id.as_str(),
                         &request.resources,
                         node,
+                        Some(actor),
                     )
                     .await
                 }
@@ -1293,6 +1294,7 @@ impl SandboxHostProvisioner {
                     &request.session_id,
                     request.host_id.as_str(),
                     &spec.host_config_key(),
+                    Some(actor),
                 )
                 .await?;
             }

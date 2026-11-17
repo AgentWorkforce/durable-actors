@@ -17,7 +17,7 @@ use kube::{
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
-use super::*;
+use super::{kills::KillReports, *};
 use crate::sandbox::kube_retry::retry_throttled;
 
 const MANAGED: &str = "app.kubernetes.io/managed-by=terse";
@@ -39,19 +39,27 @@ pub(super) struct Kubernetes {
     observed: Store<Pod>,
     changes: watch::Receiver<()>,
     config: GkeConfig,
+    kills: Option<Arc<KillReports>>,
     _watch: AbortOnDropHandle<()>,
 }
 impl Kubernetes {
-    pub fn new(client: Client, config: GkeConfig) -> Self {
+    pub fn new(client: Client, config: GkeConfig, kills: Option<KillReporting>) -> Self {
         let pods = Api::namespaced(client, &config.namespace);
         let (observed, writer) = reflector::store();
         let (changed, changes) = watch::channel(());
-        let watch = AbortOnDropHandle::new(tokio::spawn(observe(pods.clone(), writer, changed)));
+        let kills = kills.map(|reporting| Arc::new(KillReports::new(observed.clone(), reporting)));
+        let watch = AbortOnDropHandle::new(tokio::spawn(observe(
+            pods.clone(),
+            writer,
+            changed,
+            kills.clone(),
+        )));
         Self {
             pods,
             observed,
             changes,
             config,
+            kills,
             _watch: watch,
         }
     }
@@ -158,6 +166,9 @@ impl SandboxCluster for Kubernetes {
     }
 
     async fn retire_spare(&self, spare: &SpareHandle) -> Result<()> {
+        if let Some(kills) = &self.kills {
+            kills.keep_claim(&spare.name).await;
+        }
         if spare.resource_id.is_empty() {
             let Some(pod) = retry_throttled(|| self.pods.get_opt(&spare.name)).await? else {
                 return Ok(());
@@ -221,7 +232,13 @@ impl SandboxCluster for Kubernetes {
     }
 }
 
-async fn observe(pods: Api<Pod>, writer: Writer<Pod>, changed: watch::Sender<()>) {
+async fn observe(
+    pods: Api<Pod>,
+    writer: Writer<Pod>,
+    changed: watch::Sender<()>,
+    kills: Option<Arc<KillReports>>,
+) {
+    let kills = kills.as_deref();
     watcher(pods, watcher::Config::default().labels(MANAGED))
         .default_backoff()
         .modify(|pod| {
@@ -230,6 +247,15 @@ async fn observe(pods: Api<Pod>, writer: Writer<Pod>, changed: watch::Sender<()>
                 node_name: spec.node_name,
                 ..PodSpec::default()
             });
+        })
+        // Ahead of the store, as `KillReports::report` needs.
+        .then(|event| async move {
+            if let (Some(kills), Ok(watcher::Event::Apply(pod) | watcher::Event::InitApply(pod))) =
+                (kills, &event)
+            {
+                kills.report(pod).await;
+            }
+            event
         })
         .reflect(writer)
         .for_each(|event| {

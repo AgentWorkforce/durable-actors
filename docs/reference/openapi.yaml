@@ -434,6 +434,8 @@ paths:
                   report, its open connections are lost.
                 - deployment (signal platform): atMs and actors, the deployed classes with their
                   methods; empty once the deployment is removed.
+                - kill (signal platform): a SandboxKill, sent once per sandbox. A pool manager that
+                  restarts sends the kills it still sees again, each unchanged.
             parameters:
                 - name: signals
                   in: query
@@ -450,6 +452,40 @@ paths:
                 "400": { $ref: "#/components/responses/InvalidRequest" }
                 "401": { $ref: "#/components/responses/Unauthenticated" }
                 "503": { $ref: "#/components/responses/Unavailable" }
+    /v1/projects/{project_id}/observe/events/history:
+        parameters:
+            - { $ref: "#/components/parameters/ProjectId" }
+        get:
+            operationId: listEventHistory
+            tags: [Observability]
+            summary: Get past events
+            description: Past events in the range, newest first, each as the event stream sends it. Holds the event types that happen once, which is kill so far; the other types keep their history in their own views. Keeps the newest 500 in the range.
+            parameters:
+                - name: types
+                  in: query
+                  description: Comma-separated event types to read. Every type with a history when left out.
+                  schema: { type: string, example: "kill" }
+                - name: actorName
+                  in: query
+                  description: Only this actor class.
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,48}$" }
+                - name: actorId
+                  in: query
+                  description: Only this instance; requires actorName.
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
+                - { $ref: "#/components/parameters/FromMs" }
+                - { $ref: "#/components/parameters/ToMs" }
+            responses:
+                "200":
+                    description: Events in the range, and whether older ones were left out to stay within the limit.
+                    headers:
+                        Cache-Control: { $ref: "#/components/headers/NoStore" }
+                    content:
+                        application/json:
+                            schema: { $ref: "#/components/schemas/EventHistory" }
+                "400": { $ref: "#/components/responses/InvalidRequest" }
+                "401": { $ref: "#/components/responses/Unauthenticated" }
+                "500": { $ref: "#/components/responses/Internal" }
     /v1/projects/{project_id}/observe/state:
         parameters:
             - { $ref: "#/components/parameters/ProjectId" }
@@ -1384,6 +1420,35 @@ components:
                             status: { type: string, enum: [live, dormant, unknown] }
                             fromMs: { type: integer, minimum: 0 }
                             toMs: { type: integer, minimum: 0 }
+        EventHistory:
+            type: object
+            required: [events, truncated]
+            properties:
+                truncated: { type: boolean }
+                events:
+                    type: array
+                    maxItems: 500
+                    items:
+                        type: object
+                        description: One event under the type the event stream sends it as.
+                        required: [type, item]
+                        properties:
+                            type: { type: string, enum: [kill] }
+                            item: { $ref: "#/components/schemas/SandboxKill" }
+        SandboxKill:
+            type: object
+            required: [actorName, actorId, atMs, reason]
+            properties:
+                actorName: { type: string }
+                actorId: { type: string }
+                atMs:
+                    type: integer
+                    minimum: 0
+                    description: When the sandbox stopped.
+                reason:
+                    type: string
+                    enum: [out_of_memory, out_of_disk, evicted, killed]
+                    description: out_of_memory when the actor exceeded its memory limit, out_of_disk when it exceeded its disk limit, evicted when its node reclaimed the sandbox for something the node was short of, killed for any other SIGKILL the platform didn't send.
         TracePage:
             type: object
             required: [records, nextCursor]

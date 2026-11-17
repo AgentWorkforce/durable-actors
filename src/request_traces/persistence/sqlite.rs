@@ -13,9 +13,11 @@ use crate::{
     platform_events::PlatformRecord,
     request_traces::{
         TraceEvent, TracePage,
+        events::EventQuery,
         history::HistoryQuery,
         logs::{ActorLog, LogHistogram, LogHistogramQuery, LogPage, LogQuery},
         metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
+        otlp::PlatformLog,
     },
 };
 
@@ -140,6 +142,16 @@ impl TraceQueries for SqliteTracePersistence {
     ) -> Result<std::collections::HashMap<String, u64>> {
         let project_id = project_id.to_owned();
         self.run(move |connection| platform::heartbeats(connection, &project_id))
+            .await
+    }
+
+    async fn platform_events(
+        &self,
+        project_id: &str,
+        query: &EventQuery,
+    ) -> Result<Vec<PlatformLog>> {
+        let (project_id, query) = (project_id.to_owned(), query.clone());
+        self.run(move |connection| platform::events(connection, &project_id, &query))
             .await
     }
 

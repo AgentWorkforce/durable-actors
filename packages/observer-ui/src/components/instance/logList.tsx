@@ -26,12 +26,6 @@ const badge: Record<LogLevel, string> = {
     warn: "border-warning/35 bg-warning/10 text-warning",
     error: "border-danger/40 bg-danger/15 text-danger"
 }
-const rowTint: Record<LogLevel, string> = {
-    debug: "",
-    info: "",
-    warn: "shadow-[inset_2px_0_0_color-mix(in_oklab,var(--warning)_75%,transparent)]",
-    error: "bg-[linear-gradient(90deg,color-mix(in_oklab,var(--danger)_10%,transparent),transparent_70%)] shadow-[inset_2px_0_0_var(--danger)]"
-}
 // A quoted key with its colon, a quoted string, or a number, boolean, or null in pretty-printed JSON.
 const jsonToken = /("(?:\\.|[^"\\])*")(?=\s*:)\s*:|("(?:\\.|[^"\\])*")|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/gu
 
@@ -146,12 +140,10 @@ type LogRowProps = {
 function LogRow({ line, layout, expanded, onToggle, search, onFilterRequest }: LogRowProps) {
     const parsed = parseLogMessage(line.message)
     return (
-        <li className={cn("border-b border-border/55 px-2 last:border-b-0", rowTint[line.level])}>
+        <li className="border-b border-border/55 px-2 last:border-b-0">
             <div onClick={onToggle} className={`${rowGrid} min-h-8.5 cursor-pointer text-[12.5px]`} style={{ gridTemplateColumns: layout.gridTemplateColumns }}>
                 <span className="font-mono text-xs text-muted-foreground tabular-nums">{formatLogClock(line.timestampMs)}</span>
-                {layout.columns.level && (
-                    <span className={cn("justify-self-start rounded-sm border px-1.5 py-px text-[9.5px] font-bold tracking-[0.07em] uppercase", badge[line.level])}>{line.level}</span>
-                )}
+                {layout.columns.level && <LevelBadge level={line.level}>{line.level}</LevelBadge>}
                 {layout.columns.request && <RequestCell requestId={line.requestId} onFilter={onFilterRequest} />}
                 <MessagePreview parsed={parsed} level={line.level} search={search} />
                 <button
@@ -170,6 +162,10 @@ function LogRow({ line, layout, expanded, onToggle, search, onFilterRequest }: L
             {expanded && <LogDetail line={line} parsed={parsed} indent={layout.messageOffset} />}
         </li>
     )
+}
+
+export function LevelBadge({ level, className, children }: { level: LogLevel; className?: string; children: ReactNode }) {
+    return <span className={cn("justify-self-start rounded-sm border px-1.5 py-px text-[9.5px] font-bold tracking-[0.07em] whitespace-nowrap uppercase", badge[level], className)}>{children}</span>
 }
 
 function RequestCell({ requestId, onFilter }: { requestId: string | null; onFilter: (requestId: string) => void }) {

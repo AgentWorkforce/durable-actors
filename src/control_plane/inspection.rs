@@ -41,6 +41,10 @@ pub(super) fn local_router(inspector: ActorInspector) -> Router {
             get(project_events),
         )
         .route(
+            "/v1/projects/{project_id}/observe/events/history",
+            get(event_history),
+        )
+        .route(
             "/v1/projects/{project_id}/observe/requests",
             get(request_history),
         )
@@ -161,6 +165,21 @@ async fn project_events(
         Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))),
     )
         .into_response())
+}
+
+/// The project's past events, in the shapes `project_events` streams them.
+async fn event_history(
+    State(state): State<InspectionApi>,
+    path: Path<ProjectPath>,
+    query: Result<Query<super::event_history::EventHistoryQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let project = path.0.project_id;
+    let Query(query) = query.map_err(ApiError::bad_request)?;
+    let stored = query.stored().map_err(ApiError::bad_request)?;
+    let history = super::event_history::read(&state.inspector.traces, &project, &stored)
+        .await
+        .map_err(trace_query_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(history)).into_response())
 }
 
 #[derive(Deserialize)]

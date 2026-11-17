@@ -38,6 +38,8 @@ pub(crate) const MESSAGES_OUT: &str = "durable_actors.messages_out";
 pub(crate) const BYTES_IN: &str = "durable_actors.bytes_in";
 pub(crate) const BYTES_OUT: &str = "durable_actors.bytes_out";
 pub(crate) const DURATION_MS: &str = "durable_actors.duration_ms";
+pub(crate) const SANDBOX_ID: &str = "durable_actors.sandbox_id";
+pub(crate) const KILL_REASON: &str = "durable_actors.kill_reason";
 
 const TENANT_PREFIX: &str = "durable_actors.";
 
@@ -124,7 +126,7 @@ pub(crate) fn actor_logs(request: ExportLogsServiceRequest) -> Vec<ActorLog> {
 }
 
 /// One platform event (a connection change, a gateway heartbeat, a deployment) as the collector
-/// publishes it.
+/// publishes or stores it.
 pub(crate) struct PlatformLog {
     pub name: String,
     pub gateway_id: String,
@@ -134,6 +136,26 @@ pub(crate) struct PlatformLog {
 }
 
 impl PlatformLog {
+    /// An event read back from a store, which keeps every attribute value as text.
+    pub(crate) fn stored(
+        name: String,
+        gateway_id: String,
+        at_ms: u64,
+        attributes: impl IntoIterator<Item = (String, String)>,
+        body: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            gateway_id,
+            at_ms,
+            attributes: attributes
+                .into_iter()
+                .map(|(key, value)| string_attribute(&key, &value))
+                .collect(),
+            body: body.filter(|body| !body.is_empty()),
+        }
+    }
+
     pub(crate) fn string(&self, key: &str) -> Option<String> {
         string(&self.attributes, key)
     }
@@ -265,7 +287,7 @@ fn parse<T: DeserializeOwned>(value: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

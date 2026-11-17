@@ -58,6 +58,8 @@ analytics:
     passwordSecretKey: ""
 usage:
   topic: ""
+events:
+  topic: ""
 organizationLimits:
   enabled: true
   maxActiveActors: 500

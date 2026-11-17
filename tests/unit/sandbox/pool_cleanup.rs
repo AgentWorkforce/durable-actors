@@ -71,7 +71,7 @@ async fn completed_hosts_are_removed_but_live_hosts_and_uncertain_observations_a
             },
         );
         for name in ["done", "live"] {
-            pool.reserve_host(name, name, "revision").await?;
+            pool.reserve_host(name, name, "revision", None).await?;
             let spare = SpareHandle {
                 node: String::new(),
                 name: format!("do-actor-{name}"),
@@ -83,7 +83,7 @@ async fn completed_hosts_are_removed_but_live_hosts_and_uncertain_observations_a
             };
             pool.remember(name, "revision", &spare).await?;
         }
-        pool.reserve_host("starting", "starting", "revision")
+        pool.reserve_host("starting", "starting", "revision", None)
             .await?;
         assert!(pool.forget_stopped().await.is_err());
         assert!(pool.host("done").await?.is_some());
@@ -159,7 +159,7 @@ async fn stale_cleanup_observation_cannot_remove_a_replacement_identity() -> Res
             control_route: "http://host:7102".into(),
             control_token: "token".into(),
         };
-        pool.reserve_host("done", "old", "revision").await?;
+        pool.reserve_host("done", "old", "revision", None).await?;
         pool.remember("old", "revision", &spare).await?;
         let cleanup = pool.forget_stopped();
         tokio::pin!(cleanup);
@@ -174,7 +174,7 @@ async fn stale_cleanup_observation_cannot_remove_a_replacement_identity() -> Res
                 &[],
             )
             .await?;
-        pool.reserve_host("done", "new", "revision").await?;
+        pool.reserve_host("done", "new", "revision", None).await?;
         spare.resource_id = "sandboxes/do-actor-done/new-uid".into();
         pool.remember("new", "revision", &spare).await?;
         let _ = resume.send(());
@@ -208,8 +208,8 @@ async fn reconciliation_excludes_evicted_spares_from_subsequent_claims() -> Resu
             pool.store.0.execute("INSERT INTO durable_actors_spares (name, pool_key, status, handle, expires_at) VALUES ($1, 'warm', 'ready', $2, clock_timestamp() + interval '10 minutes')", &[&spare.name, &serde_json::to_string(&spare)?]).await?;
         }
         pool.forget_stopped().await?;
-        assert_eq!(pool.store.claim("warm", "next", "revision", None).await?.unwrap().name, "do-actor-warm");
-        assert!(pool.store.claim("warm", "another", "revision", None).await?.is_none());
+        assert_eq!(pool.store.claim("warm", "next", "revision", None, None).await?.unwrap().name, "do-actor-warm");
+        assert!(pool.store.claim("warm", "another", "revision", None, None).await?.is_none());
         Ok(())
     }).await
 }

@@ -21,6 +21,7 @@ import { PageHeader } from "../ui/pageHeader.js"
 import { Skeleton } from "../ui/skeleton.js"
 
 import { ConnectionsCard } from "./connectionsCard.js"
+import { EventsCard } from "./eventsCard.js"
 import { LogsCard, logsCardId } from "./logsCard.js"
 // import { MemoryCard } from "./memoryCard.js"
 import { RequestsCard } from "./requestsCard.js"
@@ -86,6 +87,7 @@ export function InstancePage() {
                         timeWindow={timeWindow}
                     />
                     <LogsCard actorName={actorName} actorId={actorId} requests={ownRequests} requestId={logRequestId} onRequestChange={setLogRequestId} timeWindow={timeWindow} />
+                    <EventsCard actorName={actorName} actorId={actorId} timeWindow={timeWindow} />
                 </div>
             )}
         </section>

@@ -5,9 +5,11 @@ use async_trait::async_trait;
 
 use super::{
     TracePage,
+    events::EventQuery,
     history::HistoryQuery,
     logs::{LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
+    otlp::PlatformLog,
     sockets::SocketRecord,
 };
 
@@ -42,6 +44,13 @@ pub(crate) trait TraceQueries: Send + Sync {
     ) -> Result<Vec<SocketRecord>>;
     /// Each gateway's latest heartbeat for the project.
     async fn gateway_heartbeats(&self, project_id: &str) -> Result<HashMap<String, u64>>;
+    /// The stored platform events the query covers, newest first, and one past `EVENT_LIMIT`
+    /// when there are more. A record stored more than once reads once.
+    async fn platform_events(
+        &self,
+        project_id: &str,
+        query: &EventQuery,
+    ) -> Result<Vec<PlatformLog>>;
     /// The public actor contract of the project's latest deployment.
     async fn deployed_contract(&self, project_id: &str) -> Result<Option<serde_json::Value>>;
 }
@@ -87,6 +96,10 @@ impl TraceQueries for NoTraceQueries {
 
     async fn gateway_heartbeats(&self, _: &str) -> Result<HashMap<String, u64>> {
         Ok(HashMap::new())
+    }
+
+    async fn platform_events(&self, _: &str, _: &EventQuery) -> Result<Vec<PlatformLog>> {
+        Ok(Vec::new())
     }
 
     async fn deployed_contract(&self, _: &str) -> Result<Option<serde_json::Value>> {

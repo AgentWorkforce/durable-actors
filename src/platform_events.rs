@@ -1,7 +1,7 @@
 //! Events the control plane reports on the collector's internal pipeline: lifecycle reports,
-//! WebSocket connections and deployments. The collector stores each in `platform_events` and
-//! publishes it on its project's live channel. One process reports for many projects, so each
-//! record carries its project.
+//! WebSocket connections, deployments and sandbox kills. The collector stores each in
+//! `platform_events` and publishes it on its project's live channel. One process reports for many
+//! projects, so each record carries its project.
 
 use opentelemetry::logs::AnyValue;
 use opentelemetry_proto::tonic::{
@@ -15,6 +15,7 @@ use crate::request_traces::otlp;
 
 pub(crate) mod deployments;
 pub(crate) mod lifecycle;
+pub(crate) mod sandboxes;
 pub(crate) mod sockets;
 
 /// An event observers read from the analytics store and the live feed.

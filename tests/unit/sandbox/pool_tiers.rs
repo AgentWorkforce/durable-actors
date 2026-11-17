@@ -165,7 +165,7 @@ async fn actors_claim_only_spares_of_their_own_size() -> Result<()> {
         let claim = async |host: &str, resources: ResourceLimits| {
             let spare = tiers
                 .pool
-                .claim(&tiers.spec, REGION, host, &resources, None)
+                .claim(&tiers.spec, REGION, host, &resources, None, None)
                 .await?;
             anyhow::Ok(spare.map(|spare| spare.resource_id))
         };
@@ -200,7 +200,7 @@ async fn a_claimed_spare_is_replaced_in_its_own_tier() -> Result<()> {
         let small_spares = wait_for_ready(&pool, &small()).await?;
         let large_spares = wait_for_ready(&pool, &large()).await?;
         let claimed = pool
-            .claim(&spec, REGION, "host", &large(), None)
+            .claim(&spec, REGION, "host", &large(), None, None)
             .await?
             .unwrap();
         assert_eq!(large_spares, std::slice::from_ref(&claimed.name));
@@ -271,6 +271,7 @@ async fn concurrent_claims_take_no_more_than_their_tier_holds() -> Result<()> {
                         &format!("host-{index}"),
                         &sized(memory_mib),
                         None,
+                        None,
                     )
                     .await?;
                 anyhow::Ok(spare.map(|spare| (memory_mib, spare.resource_id)))
@@ -339,6 +340,7 @@ async fn a_busy_tier_cannot_starve_another_of_starts() -> Result<()> {
                     REGION,
                     &format!("host-{round}"),
                     &small(),
+                    None,
                     None,
                 )
                 .await?;

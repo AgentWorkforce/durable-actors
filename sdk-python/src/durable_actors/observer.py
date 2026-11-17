@@ -26,6 +26,7 @@ RESOURCES = {
     "actors",
     "residency",
     "events",
+    "events/history",
     "state",
     "state/history",
     "requests",

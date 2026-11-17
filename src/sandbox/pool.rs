@@ -6,10 +6,12 @@ use tracing::warn;
 
 use super::{CreateSpareRequest, ResourceLimits, SandboxProvider, SpareHandle, SpareKind};
 use crate::{
+    actor::ActorKey,
     control_plane::admin::{AdminRegistry, HostLaunchSpec},
     postgres::PostgresDatabase,
 };
 
+pub(crate) mod claims;
 mod cleanup;
 mod prewarming;
 mod replenishment;
@@ -80,6 +82,7 @@ impl SparePool {
         host: &str,
         resources: &ResourceLimits,
         node: Option<&str>,
+        actor: Option<&ActorKey>,
     ) -> Result<Option<SpareHandle>> {
         if spec.code_snapshot.is_none() || !self.has_tier(resources) {
             return Ok(None);
@@ -91,6 +94,7 @@ impl SparePool {
                 host,
                 &spec.host_config_key(),
                 node,
+                actor,
             )
             .await?;
         Ok(result)
@@ -115,9 +119,20 @@ impl SparePool {
             .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
-    pub async fn reserve_host(&self, session: &str, host: &str, config_key: &str) -> Result<()> {
+    pub async fn reserve_host(
+        &self,
+        session: &str,
+        host: &str,
+        config_key: &str,
+        actor: Option<&ActorKey>,
+    ) -> Result<()> {
         let name = format!("do-actor-{session}");
-        self.store.0.execute("INSERT INTO durable_actors_spares (name, pool_key, status, host_id, host_config_key, expires_at) VALUES ($1, '', 'claimed', $2, $3, clock_timestamp() + interval '120 seconds')", &[&name, &host, &config_key]).await?;
+        let [project_id, actor_name, actor_id] = claims::columns(actor);
+        self.store.0.execute(
+            "INSERT INTO durable_actors_spares (name, pool_key, status, host_id, host_config_key, project_id, actor_name, actor_id, expires_at) \
+             VALUES ($1, '', 'claimed', $2, $3, $4, $5, $6, clock_timestamp() + interval '120 seconds')",
+            &[&name, &host, &config_key, &project_id, &actor_name, &actor_id],
+        ).await?;
         Ok(())
     }
 
@@ -474,12 +489,14 @@ impl PoolStore {
         host: &str,
         config_key: &str,
         node: Option<&str>,
+        actor: Option<&ActorKey>,
     ) -> Result<Option<SpareHandle>> {
+        let [project_id, actor_name, actor_id] = claims::columns(actor);
         self.0.query_opt(
-            "UPDATE durable_actors_spares SET status = 'claimed', host_id = $2, host_config_key = $3, expires_at = clock_timestamp() + interval '120 seconds' \
+            "UPDATE durable_actors_spares SET status = 'claimed', host_id = $2, host_config_key = $3, project_id = $5, actor_name = $6, actor_id = $7, expires_at = clock_timestamp() + interval '120 seconds' \
              WHERE name = (SELECT name FROM durable_actors_spares WHERE pool_key = $1 AND status = 'ready' AND expires_at > statement_timestamp() AND expires_at > clock_timestamp() \
              ORDER BY (handle::jsonb ->> 'node' = $4::text) IS TRUE DESC, expires_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING handle",
-            &[&key, &host, &config_key, &node],
+            &[&key, &host, &config_key, &node, &project_id, &actor_name, &actor_id],
         ).await?.map(|row| serde_json::from_str(row.get::<_, &str>(0)).context("decode spare handle")).transpose()
     }
 

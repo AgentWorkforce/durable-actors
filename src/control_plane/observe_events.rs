@@ -2,6 +2,7 @@
 //! when they open; afterwards this stream forwards what the collector publishes on the project's
 //! live channels, decoded into the change each record makes to what an observer sees. Each
 //! message names one event type and carries the records of that type in the order they arrived.
+//! `event_history` reads past events back from the store through the same decoder.
 
 use anyhow::{Result, bail};
 use futures_util::{Stream, StreamExt, stream};
@@ -18,7 +19,11 @@ use crate::{
     clock::{Clock, SystemClock},
     host_leases::WaitingOperation,
     placement::ActorResidency,
-    platform_events::{deployments, lifecycle, sockets},
+    platform_events::{
+        deployments, lifecycle,
+        sandboxes::{self, KillReason},
+        sockets,
+    },
     request_traces::{
         TraceRecord, TraceStore,
         logs::{ActorLog, LogQuery},
@@ -74,6 +79,7 @@ pub(super) enum ObserveEvent {
     ConnectionClosed(ConnectionClosed),
     GatewayAlive(GatewayAlive),
     Deployment(Deployment),
+    Kill(ActorKill),
 }
 
 /// An instance as its latest lifecycle report leaves it.
@@ -138,6 +144,17 @@ pub(super) struct DeployedActor {
     pub methods: Vec<String>,
 }
 
+/// A sandbox that stopped under an actor without the platform asking it to. Only the stored
+/// record names the sandbox: which one ran an actor is the platform's concern, not the observer's.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ActorKill {
+    pub actor_name: String,
+    pub actor_id: String,
+    pub at_ms: u64,
+    pub reason: KillReason,
+}
+
 impl ObserveEvent {
     pub(super) fn name(&self) -> &'static str {
         match self {
@@ -148,6 +165,7 @@ impl ObserveEvent {
             Self::ConnectionClosed(_) => "connectionClosed",
             Self::GatewayAlive(_) => "gatewayAlive",
             Self::Deployment(_) => "deployment",
+            Self::Kill(_) => "kill",
         }
     }
 }
@@ -236,7 +254,7 @@ fn platform(payload: &[u8]) -> Vec<ObserveEvent> {
         .collect()
 }
 
-fn platform_event(log: &PlatformLog) -> Option<ObserveEvent> {
+pub(super) fn platform_event(log: &PlatformLog) -> Option<ObserveEvent> {
     match log.name.as_str() {
         lifecycle::REPORTED => instance_change(log),
         sockets::OPENED => connection_opened(log),
@@ -251,6 +269,7 @@ fn platform_event(log: &PlatformLog) -> Option<ObserveEvent> {
                 actors: deployed_actors(log.body.as_deref()),
             }))
         }
+        sandboxes::KILLED => kill(log),
         _ => None,
     }
 }
@@ -300,6 +319,15 @@ fn connection_closed(log: &PlatformLog) -> Option<ObserveEvent> {
         close_reason: log.string(otlp::CLOSE_REASON),
         messages_in: log.count(otlp::MESSAGES_IN),
         messages_out: log.count(otlp::MESSAGES_OUT),
+    }))
+}
+
+fn kill(log: &PlatformLog) -> Option<ObserveEvent> {
+    Some(ObserveEvent::Kill(ActorKill {
+        actor_name: log.string(otlp::ACTOR_NAME)?,
+        actor_id: log.string(otlp::ACTOR_ID)?,
+        at_ms: log.at_ms,
+        reason: serde_json::from_value(Value::String(log.string(otlp::KILL_REASON)?)).ok()?,
     }))
 }
 

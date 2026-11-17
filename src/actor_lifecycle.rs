@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use moka::{future::Cache, ops::compute::Op};
 use serde::{Deserialize, Serialize};
@@ -197,7 +197,8 @@ impl LifecycleStore {
 
     pub(crate) async fn with_usage_topic(mut self, topic: Option<&str>) -> Result<Self> {
         if let Some(topic) = topic {
-            self = self.with_publisher(Arc::new(pubsub::PubSubPublisher::connect(topic).await?));
+            let topic = crate::pubsub::Topic::connect(topic).await;
+            self = self.with_publisher(Arc::new(topic.context("usage topic")?));
         }
         Ok(self)
     }

@@ -12,7 +12,9 @@ export function useResidency(actorName: string, timeWindow: TimeWindow, actorId?
     const { baseUrl, events } = useData()
     const { data, error, isLoading } = useLiveView(
         [...residencyKey(baseUrl, actorName, actorId), ...windowKey(timeWindow)],
-        () => new HttpObserverClient(baseUrl).listResidency(actorName, currentBounds(timeWindow), actorId),
+        // Reads from the drawn window's start, which a live read's clock has passed, so a period the read
+        // cuts off never starts inside the window and looks like a change there.
+        () => new HttpObserverClient(baseUrl).listResidency(actorName, { ...currentBounds(timeWindow), fromMs: timeWindow.fromMs }, actorId),
         applyResidencyEvents(actorName, actorId),
         timeWindow.live ? events : null
     )
