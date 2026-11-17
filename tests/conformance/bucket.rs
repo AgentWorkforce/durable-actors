@@ -455,5 +455,11 @@ async fn s3_mirror_writes_exact_generations_and_never_regresses() -> Result<()> 
     s3.mirror(&key, 5, Bytes::from_static(b"five")).await?;
     assert!(s3.compare_and_swap(&key, Some(5), unique("six")).await?);
     assert_eq!(s3.get(&key).await?.unwrap().generation, 6);
+    // A second copier with no cached ETag, then the first with a stale one, both recover.
+    let other = S3Bucket::from_environment(&bucket, &endpoint).await?;
+    other.mirror(&key, 7, Bytes::from_static(b"seven")).await?;
+    s3.mirror(&key, 8, Bytes::from_static(b"eight")).await?;
+    let object = other.get(&key).await?.unwrap();
+    assert_eq!((object.generation, &object.bytes[..]), (8, &b"eight"[..]));
     Ok(())
 }

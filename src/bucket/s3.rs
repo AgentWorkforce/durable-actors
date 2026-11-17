@@ -242,13 +242,16 @@ impl Bucket for S3Bucket {
 
 #[async_trait]
 impl super::checkpoint::Mirror for S3Bucket {
+    /// One PUT per copy in the common case: new objects (every snapshot) are created with
+    /// `If-None-Match: *`, and replacements use the ETag this bucket cached from its own last
+    /// write. Only a failed precondition re-reads the copy with a HEAD.
     async fn mirror(&self, key: &str, generation: i64, bytes: bytes::Bytes) -> Result<()> {
         ensure!(generation > 0, "S3 object generation is invalid");
-        // Each attempt re-reads the copy, so a racing writer only costs a retry.
+        let mut current = self.versions.get(key).await;
         for _ in 0..MIRROR_ATTEMPTS {
             let mut request = self.client.put_object().bucket(&self.bucket).key(key);
-            request = match self.head(key).await? {
-                Some((current, _)) if current >= generation => return Ok(()),
+            request = match &current {
+                Some((copied, _)) if *copied >= generation => return Ok(()),
                 Some((_, etag)) => request.if_match(etag),
                 None => request.if_none_match("*"),
             };
@@ -260,12 +263,20 @@ impl super::checkpoint::Mirror for S3Bucket {
                 .send()
                 .await
             {
-                Ok(_) => {
-                    self.versions.invalidate(key).await;
+                Ok(response) => {
+                    match response.e_tag() {
+                        Some(etag) => {
+                            self.versions
+                                .insert(key.into(), (generation, etag.into()))
+                                .await
+                        }
+                        None => self.versions.invalidate(key).await,
+                    }
                     return Ok(());
                 }
                 Err(error) if lost_precondition(status(&error)) => {
                     self.versions.invalidate(key).await;
+                    current = self.head(key).await?;
                 }
                 Err(error) => return Err(error.into()),
             }
