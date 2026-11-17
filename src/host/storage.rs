@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
+use bytes::Bytes;
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, CredentialsProvider, EntityTag,
 };
@@ -344,7 +345,7 @@ impl ActorStorage for HostStorage {
         ))
     }
 
-    async fn read_sqlite(&self, bytes: &[u8]) -> Result<crate::state_log::SqliteSnapshot> {
+    async fn read_sqlite(&self, bytes: &Bytes) -> Result<crate::state_log::SqliteSnapshot> {
         self.ensure_authority()?;
         let snapshot = crate::state_log::StateSnapshot::decode(bytes)?;
         let object = crate::storage::snapshot_object_name(
@@ -354,7 +355,7 @@ impl ActorStorage for HostStorage {
         )?;
         let checkpoint = self.checkpoint.lock().unwrap().take();
         self.runtime
-            .read_sqlite_prefetched(&object, bytes::Bytes::copy_from_slice(bytes), checkpoint)
+            .read_sqlite_prefetched(&object, bytes.clone(), checkpoint)
             .await
     }
 

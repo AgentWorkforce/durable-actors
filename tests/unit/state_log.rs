@@ -31,12 +31,12 @@ fn rejects_invalid_commit_metadata_and_transaction_ranges() -> Result<()> {
     ] {
         let mut invalid = valid.clone();
         invalid[field] = value;
-        assert!(StateSnapshot::decode(&serde_json::to_vec(&invalid)?).is_err());
+        assert!(StateSnapshot::decode(&serde_json::to_vec(&invalid)?.into()).is_err());
     }
     for (field, value) in [("txid", json!(0)), ("files", json!([]))] {
         let mut invalid = valid.clone();
         invalid["sqlite"][field] = value;
-        assert!(StateSnapshot::decode(&serde_json::to_vec(&invalid)?).is_err());
+        assert!(StateSnapshot::decode(&serde_json::to_vec(&invalid)?.into()).is_err());
     }
     for (field, value) in [
         ("first", json!(2)),
@@ -46,7 +46,7 @@ fn rejects_invalid_commit_metadata_and_transaction_ranges() -> Result<()> {
     ] {
         let mut invalid = valid.clone();
         invalid["sqlite"]["files"][0][field] = value;
-        assert!(StateSnapshot::decode(&serde_json::to_vec(&invalid)?).is_err());
+        assert!(StateSnapshot::decode(&serde_json::to_vec(&invalid)?.into()).is_err());
     }
     Ok(())
 }
@@ -87,7 +87,7 @@ fn rejects_completion_without_a_result() -> Result<()> {
         Value::Null,
     )?)?;
     stored["completion"] = json!({});
-    assert!(StateSnapshot::decode(&serde_json::to_vec(&stored)?).is_err());
+    assert!(StateSnapshot::decode(&serde_json::to_vec(&stored)?.into()).is_err());
     Ok(())
 }
 
@@ -98,8 +98,8 @@ fn reads_json_snapshots_and_writes_binary_ones() -> Result<()> {
     let json = serde_json::to_vec(&snapshot)?;
     let binary = snapshot.encode()?;
     assert!(binary.starts_with(b"DAS2") && binary.len() < json.len());
-    for bytes in [json.as_slice(), binary.as_ref()] {
-        let decoded = StateSnapshot::decode(bytes)?;
+    for bytes in [Bytes::from(json), binary] {
+        let decoded = StateSnapshot::decode(&bytes)?;
         assert_eq!(
             serde_json::to_value(&decoded)?,
             serde_json::to_value(&snapshot)?

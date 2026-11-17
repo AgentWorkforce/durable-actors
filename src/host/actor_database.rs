@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -29,7 +30,7 @@ use session::DatabaseSession;
 pub(crate) trait ActorStorage: Send + Sync {
     async fn acquire_actor(&self) -> Result<ActorActivation>;
     async fn load_actor_state(&self, epoch: u64) -> Result<(u64, bytes::Bytes)>;
-    async fn read_sqlite(&self, bytes: &[u8]) -> Result<SqliteSnapshot>;
+    async fn read_sqlite(&self, bytes: &Bytes) -> Result<SqliteSnapshot>;
     async fn get_alarm(&self) -> Result<Option<i64>>;
     async fn update_alarm(&self, timestamp_ms: Option<i64>) -> Result<()>;
     fn ensure_authority(&self) -> Result<()>;

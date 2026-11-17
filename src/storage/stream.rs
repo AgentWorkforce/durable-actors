@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 use aws_lc_rs::digest::{SHA256, digest};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::state_log::StateSnapshot;
@@ -26,7 +27,7 @@ impl StateStream {
         format!("{}{version}.json", self.prefix)
     }
 
-    pub fn snapshot(&self, bytes: &[u8]) -> Result<SnapshotRef> {
+    pub fn snapshot(&self, bytes: &Bytes) -> Result<SnapshotRef> {
         let snapshot = StateSnapshot::decode(bytes)?;
         snapshot.validate_object(&self.object(snapshot.state_version))?;
         ensure!(

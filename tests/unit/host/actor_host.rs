@@ -1656,7 +1656,7 @@ impl ActorStorage for FakeAuthority {
     fn take_saved_database(&self, _digest: &str) -> Option<tempfile::NamedTempFile> {
         self.saved_database.lock().unwrap().take()
     }
-    async fn read_sqlite(&self, bytes: &[u8]) -> Result<crate::state_log::SqliteSnapshot> {
+    async fn read_sqlite(&self, bytes: &bytes::Bytes) -> Result<crate::state_log::SqliteSnapshot> {
         self.sqlite_reads.fetch_add(1, Ordering::SeqCst);
         let snapshot = StateSnapshot::decode(bytes)?;
         let object = crate::storage::snapshot_object_name(
@@ -1667,7 +1667,7 @@ impl ActorStorage for FakeAuthority {
         Ok(crate::bucket::recovery::resolve(
             &mut FakeHistory(&self.history),
             &object,
-            bytes::Bytes::copy_from_slice(bytes),
+            bytes.clone(),
             None,
         )
         .await?

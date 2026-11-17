@@ -1,5 +1,6 @@
 use crate::{litestream::storage::LtxFile, payload::JsonText, storage::SnapshotRef};
 use anyhow::{Context, Result, ensure};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod binary;
@@ -98,7 +99,7 @@ impl StateSnapshot {
     }
 
     /// Reads binary snapshots and the JSON ones written before them.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &Bytes) -> Result<Self> {
         let snapshot = if binary::is_binary(bytes) {
             let (mut snapshot, files): (Self, _) = binary::decode(bytes)?;
             ensure!(snapshot.sqlite.files.is_empty(), "duplicate LTX files");

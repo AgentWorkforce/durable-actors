@@ -45,7 +45,7 @@ pub(crate) fn encode<T: Serialize>(value: &T, files: &[LtxFile]) -> Result<Bytes
     spool.finish()
 }
 
-pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Vec<LtxFile>)> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &Bytes) -> Result<(T, Vec<LtxFile>)> {
     ensure!(
         is_binary(bytes) && bytes.len() >= PREFIX,
         "not a binary state object"
@@ -56,7 +56,7 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Vec<LtxFil
         .filter(|start| *start <= bytes.len())
         .context("truncated state header")?;
     let envelope: Envelope<T> = serde_json::from_slice(&bytes[PREFIX..start])?;
-    let payload = Bytes::copy_from_slice(&bytes[start..]);
+    let payload = bytes.slice(start..);
     let mut offset = 0usize;
     let mut files = Vec::with_capacity(envelope.files.len());
     for file in envelope.files {

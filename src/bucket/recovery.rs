@@ -117,7 +117,7 @@ impl Checkpoint {
     }
 
     /// Reads binary checkpoints and the JSON ones written before them.
-    pub fn decode(bytes: &[u8], source: &SnapshotRef, txid: u64) -> Result<SqliteSnapshot> {
+    pub fn decode(bytes: &Bytes, source: &SnapshotRef, txid: u64) -> Result<SqliteSnapshot> {
         let checkpoint: Self = if crate::state_log::binary::is_binary(bytes) {
             let (mut checkpoint, files): (Self, _) = crate::state_log::binary::decode(bytes)?;
             ensure!(checkpoint.sqlite.files.is_empty(), "duplicate LTX files");

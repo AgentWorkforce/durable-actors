@@ -16,6 +16,7 @@ use crate::{
     storage::{SnapshotRef, WritePlan},
 };
 use anyhow::{Context, Result, ensure};
+use bytes::Bytes;
 use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
@@ -398,7 +399,7 @@ impl DatabaseSession {
     async fn open_sqlite(
         &self,
         snapshot: &StateSnapshot,
-        loaded: &[u8],
+        loaded: &Bytes,
         digest: &str,
         resume: bool,
     ) -> Result<(SqliteCapture, &'static str)> {
