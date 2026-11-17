@@ -43,6 +43,10 @@ impl RapidPlacement {
 pub struct ArchiveBatchConfig {
     pub bytes: usize,
     pub interval_ms: u64,
+    /// Archive lag that raises `rapid_archive_lag_exceeded`; three batch intervals when unset.
+    /// With a single log zone it is the bound to alert on for the zone-loss RPO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lag_ms: Option<u64>,
 }
 
 impl Default for ArchiveBatchConfig {
@@ -50,11 +54,19 @@ impl Default for ArchiveBatchConfig {
         Self {
             bytes: 16 * 1024 * 1024,
             interval_ms: 10_000,
+            max_lag_ms: None,
         }
     }
 }
 
 impl ArchiveBatchConfig {
+    pub(crate) fn max_lag(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.max_lag_ms
+                .unwrap_or_else(|| self.interval_ms.saturating_mul(3)),
+        )
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.bytes > 0 && self.bytes <= usize::MAX - 8 * 1024 * 1024,
@@ -66,6 +78,10 @@ impl ArchiveBatchConfig {
                     .checked_add(std::time::Duration::from_millis(self.interval_ms))
                     .is_some(),
             "archive batch interval must be positive and representable"
+        );
+        ensure!(
+            self.max_lag_ms.is_none_or(|lag| lag > self.interval_ms),
+            "archive max lag must exceed the batch interval"
         );
         Ok(())
     }

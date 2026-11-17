@@ -44,6 +44,48 @@ pub(crate) fn snapshots(
     )
 }
 
+/// Opens one S3 Express session per log bucket at startup, so a controller role without
+/// `s3express:CreateSession` fails here instead of on its first signed upload.
+pub(crate) async fn validate(
+    config: &SnapshotStoreConfig,
+    client: &aws_sdk_s3::Client,
+) -> Result<()> {
+    let Some((buckets, archive)) = config.rapid_settings() else {
+        return Ok(());
+    };
+    for placement in buckets {
+        client
+            .create_session()
+            .bucket(&placement.bucket)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "could not open an S3 Express session on {}: the control-plane role needs s3express:CreateSession on it",
+                    placement.bucket
+                )
+            })?;
+    }
+    if single_zone(config) {
+        tracing::warn!(
+            event = "rapid_single_zone",
+            archive_bucket = archive,
+            "Express logs use one zone: losing it loses writes not yet archived to Standard (see rapid_archive_lag)"
+        );
+    }
+    Ok(())
+}
+
+/// Whether acknowledged writes live in only one Express zone until they are archived.
+pub(crate) fn single_zone(config: &SnapshotStoreConfig) -> bool {
+    match config {
+        SnapshotStoreConfig::Rapid {
+            buckets, placement, ..
+        } => buckets.len() < 2 || *placement == crate::bucket::RapidPlacement::Nearest,
+        SnapshotStoreConfig::Local => false,
+    }
+}
+
 pub(crate) fn validate_zones(config: &SnapshotStoreConfig) -> Result<()> {
     config
         .rapid_settings()

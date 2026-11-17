@@ -111,7 +111,11 @@ fn controlled(
             .map(|z| z.clone() as Arc<dyn LogZone>)
             .collect(),
         f.placement,
-        ArchiveBatchConfig { bytes, interval_ms },
+        ArchiveBatchConfig {
+            bytes,
+            interval_ms,
+            max_lag_ms: None,
+        },
         Arc::new(crate::litestream::compaction::RustCompactor),
         CancellationToken::new(),
     )?;

@@ -397,13 +397,16 @@ async fn snapshot_store(
                 None,
             )?))
         }
-        StorageProvider::S3(aws) => Ok(Arc::new(crate::bucket::s3::express::snapshots(
-            persistence,
-            Arc::new(crate::bucket::S3Bucket::new(archive, aws.client.clone())?),
-            Arc::new(crate::bucket::s3::S3ExpressLogs::new(aws.client.clone())),
-            stop,
-            None,
-        )?)),
+        StorageProvider::S3(aws) => {
+            crate::bucket::s3::express::validate(persistence, &aws.client).await?;
+            Ok(Arc::new(crate::bucket::s3::express::snapshots(
+                persistence,
+                Arc::new(crate::bucket::S3Bucket::new(archive, aws.client.clone())?),
+                Arc::new(crate::bucket::s3::S3ExpressLogs::new(aws.client.clone())),
+                stop,
+                None,
+            )?))
+        }
     }
 }
 
@@ -691,6 +694,7 @@ fn persistence_config(
                 "DURABLE_ACTORS_ARCHIVE_BUCKET",
                 "DURABLE_ACTORS_ARCHIVE_BATCH_BYTES",
                 "DURABLE_ACTORS_ARCHIVE_BATCH_INTERVAL_MS",
+                "DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS",
             ] {
                 ensure!(
                     get(name).is_none(),
@@ -722,6 +726,10 @@ fn rapid_persistence(
                 .transpose()
                 .context("DURABLE_ACTORS_ARCHIVE_BATCH_INTERVAL_MS must be an integer")?
                 .unwrap_or(10_000),
+            max_lag_ms: get("DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS")
+                .map(|value| value.parse())
+                .transpose()
+                .context("DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS must be an integer")?,
         },
         placement: match get("DURABLE_ACTORS_RAPID_PLACEMENT").as_deref() {
             None | Some("all") => crate::bucket::RapidPlacement::All,

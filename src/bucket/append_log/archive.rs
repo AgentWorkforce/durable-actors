@@ -105,11 +105,19 @@ async fn run(
     let mut closed_published = false;
     let mut retry = false;
     let interval = Duration::from_millis(storage.batch.interval_ms);
+    let mut alarm = LagAlarm::new(storage.batch.max_lag());
     loop {
-        let (end, closed, due, last_version) = {
+        let (end, closed, due, last_version, lag) = {
             let p = pending.lock().unwrap();
-            (p.end, p.closed, p.since.map(|at| at + interval), p.version)
+            (
+                p.end,
+                p.closed,
+                p.since.map(|at| at + interval),
+                p.version,
+                p.since.map(|at| at.elapsed()),
+            )
         };
+        alarm.observe(lag, &manifest);
         if closed && !closed_published {
             storage
                 .close_segment(
@@ -148,6 +156,11 @@ async fn run(
             let cached = take_cache(&pending, through)?;
             match upload(&storage, &manifest, through, end, cached).await {
                 Ok(next) => {
+                    tracing::info!(
+                        event = "rapid_archive_lag",
+                        lag_ms = lag.unwrap_or_default().as_millis() as u64,
+                        pending_bytes = end - through,
+                    );
                     retry = false;
                     through = next;
                     let mut p = pending.lock().unwrap();
@@ -176,6 +189,62 @@ async fn run(
             None => wake.notified().await,
         }
     }
+}
+
+/// Warns once when the oldest unarchived frame is older than the bound, and once when the archive
+/// catches up. With a single log zone this lag is what losing that zone would lose.
+pub(super) struct LagAlarm {
+    max: Duration,
+    peak: Option<Duration>,
+}
+
+impl LagAlarm {
+    pub fn new(max: Duration) -> Self {
+        Self { max, peak: None }
+    }
+
+    pub fn observe(&mut self, lag: Option<Duration>, manifest: &Manifest) {
+        match (self.transition(lag), manifest.key()) {
+            (Some(LagChange::Exceeded(lag)), Ok(segment)) => tracing::warn!(
+                event = "rapid_archive_lag_exceeded",
+                lag_ms = lag.as_millis() as u64,
+                max_lag_ms = self.max.as_millis() as u64,
+                segment,
+                "Standard archive is behind the Express log"
+            ),
+            (Some(LagChange::Recovered(peak)), Ok(segment)) => tracing::info!(
+                event = "rapid_archive_lag_recovered",
+                peak_lag_ms = peak.as_millis() as u64,
+                segment,
+            ),
+            _ => {}
+        }
+    }
+
+    pub fn transition(&mut self, lag: Option<Duration>) -> Option<LagChange> {
+        let lag = lag.unwrap_or_default();
+        match self.peak {
+            None if lag > self.max => {
+                self.peak = Some(lag);
+                Some(LagChange::Exceeded(lag))
+            }
+            Some(peak) if lag <= self.max => {
+                self.peak = None;
+                Some(LagChange::Recovered(peak))
+            }
+            Some(peak) => {
+                self.peak = Some(peak.max(lag));
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LagChange {
+    Exceeded(Duration),
+    Recovered(Duration),
 }
 
 fn take_cache(pending: &StdMutex<Pending>, through: u64) -> Result<Option<Bytes>> {
@@ -419,3 +488,7 @@ impl LogStorage {
         self.cleanup_segment(&manifest).await
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/bucket/append_log/archive.rs"]
+mod tests;

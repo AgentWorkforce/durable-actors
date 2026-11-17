@@ -134,6 +134,7 @@ Use the [self-hosting guide](../self-hosting.md) and [Helm chart](../../charts/d
 | `DURABLE_ACTORS_RAPID_PLACEMENT` | Rapid only: `all` (default) writes every configured zone. `nearest` needs two zones, usually in different regions: at assignment the host opens its log in both, keeps the first to open, and writes only there for the session. The chart uses `storage.rapid.placement`. |
 | `DURABLE_ACTORS_ARCHIVE_BATCH_BYTES` | Rapid archive batch target, default `16777216` bytes. |
 | `DURABLE_ACTORS_ARCHIVE_BATCH_INTERVAL_MS` | Rapid archive batch interval, default `10000` milliseconds. |
+| `DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS` | Rapid only: archive lag that logs `rapid_archive_lag_exceeded`, default three batch intervals; must exceed the interval. Each upload logs `rapid_archive_lag` with `lag_ms`, the age of the oldest frame not yet in the archive bucket. With one log zone (one Express bucket, or `nearest`), this lag is what losing that zone would lose, so alert on it. |
 | `DURABLE_ACTORS_KUBERNETES_NAMESPACE` | Dedicated sandbox namespace; the chart defaults to `<release-namespace>-<release-name>`. |
 | `DURABLE_ACTORS_KUBERNETES_RUNTIME_CLASS` | RuntimeClass for actor pods, default `gvisor`. Its scheduling rules choose the sandbox nodes: GKE's built-in class selects GKE Sandbox nodes, and on EKS the cluster provides one. |
 | `DURABLE_ACTORS_KUBERNETES_ZONE` | Actor placement zone, for example `us-west4-a` or `us-west-2a`; the runtime infers the canonical compute region. The chart sets this from `placement.zone`. |

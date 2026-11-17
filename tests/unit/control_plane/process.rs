@@ -466,6 +466,7 @@ fn archive_batch_triggers_are_configurable_and_positive() -> Result<()> {
     };
     assert_eq!(archive_batch.bytes, 2 * 1024 * 1024);
     assert_eq!(archive_batch.interval_ms, 250);
+    assert_eq!(archive_batch.max_lag_ms, None);
     assert!(configured.same_backend(&defaults));
     assert_eq!(
         serde_json::from_value::<crate::bucket::SnapshotStoreConfig>(serde_json::to_value(
@@ -482,6 +483,28 @@ fn archive_batch_triggers_are_configurable_and_positive() -> Result<()> {
             bad.insert(name, invalid);
             assert!(parse(&bad).is_err(), "accepted {name}={invalid}");
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn archive_max_lag_is_an_optional_bound_above_the_batch_interval() -> Result<()> {
+    let mut values = process_environment();
+    let parse = |values: &HashMap<&str, &str>| {
+        ControlPlaneProcessConfig::from_lookup(|name| values.get(name).map(|value| (*value).into()))
+    };
+    values.insert("DURABLE_ACTORS_ARCHIVE_BATCH_INTERVAL_MS", "1000");
+    values.insert("DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS", "5000");
+    let crate::bucket::SnapshotStoreConfig::Rapid { archive_batch, .. } =
+        parse(&values)?.storage.persistence
+    else {
+        panic!()
+    };
+    assert_eq!(archive_batch.max_lag_ms, Some(5_000));
+    for invalid in ["1000", "500", "soon", "-1"] {
+        let mut bad = values.clone();
+        bad.insert("DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS", invalid);
+        assert!(parse(&bad).is_err(), "accepted max lag {invalid}");
     }
     Ok(())
 }

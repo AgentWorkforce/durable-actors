@@ -75,6 +75,8 @@ storage:
       - {bucket: actor-logs--use2-az2--x-s3, zone: use2-az2}
 ```
 
-The controller role also needs `s3express:CreateSession` on these buckets. Actor hosts never receive Express credentials: they write through short-lived URLs, each signed by the controller for one log object.
+The controller role also needs `s3express:CreateSession` on these buckets. It opens one session on each at startup and fails with the missing permission rather than on the first write. Actor hosts never receive Express credentials: they write through short-lived URLs, each signed by the controller for one log object.
+
+Each Express bucket lives in one Availability Zone. With two or more zones and the default `all` placement, an acknowledged write is in every zone its log segment opened in, so losing one zone loses nothing. A zone that is unavailable when a segment opens is skipped for that segment. With a single bucket, or `nearest` placement, the Standard archive bucket is the only other copy. Losing that zone loses the writes not yet archived. That is at most `rapid_archive_lag` (`lag_ms`), normally under one batch interval. The controller logs `rapid_single_zone` at startup, and hosts log `rapid_archive_lag_exceeded` when the lag passes `DURABLE_ACTORS_ARCHIVE_MAX_LAG_MS`.
 
 Spares (`actors.warm`), image, ingress, Redis and `credentialsSecret` settings match the [GKE chart](../durable-actors/README.md). S3 spares open their storage connections at assignment.
