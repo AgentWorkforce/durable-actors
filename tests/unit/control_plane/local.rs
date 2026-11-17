@@ -64,6 +64,8 @@ async fn relative_state_directories_are_absolute_in_host_configuration() -> Resu
         data_dir: Some(relative.into()),
         entrypoint: Some("actors.ts".into()),
         storage: DevStorage::Local,
+        host_binary: None,
+        host_ready_timeout_ms: 30_000,
         ready_fd: None,
         sdk_host: None,
     };

@@ -25,6 +25,7 @@ use crate::{
         access::{BucketLocation, RuntimeAccess},
     },
     clock::SystemClock,
+    host_leases::{AbandonedLeases, local_host_lease_ms},
     sandbox::{HostSandboxRuntimeConfig, LocalSandboxProvider},
 };
 
@@ -59,6 +60,14 @@ pub struct DevOptions {
         default_value = "local"
     )]
     pub storage: DevStorage,
+    #[arg(long, env = "DURABLE_ACTORS_LOCAL_HOST_BINARY")]
+    pub host_binary: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "DURABLE_ACTORS_LOCAL_HOST_READY_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    pub host_ready_timeout_ms: u64,
     #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(3..))]
     pub ready_fd: Option<i32>,
     #[arg(long, hide = true)]
@@ -122,13 +131,22 @@ pub async fn serve_local(
         .context("bind local runtime; use --port to select another port")?;
     let origin = format!("http://{}", listener.local_addr()?);
     let storage = local_storage(&options, &directory).await?;
+    let abandoned_leases = abandoned_leases(&options, &storage).await?;
+    let host_binary = match &options.host_binary {
+        Some(binary) => binary
+            .canonicalize()
+            .context("find the local host binary")?,
+        None => std::env::current_exe()?,
+    };
     let provider = Arc::new(
         LocalSandboxProvider::new(
-            std::env::current_exe()?,
+            host_binary,
             project.clone(),
             storage.runtime.clone(),
+            abandoned_leases,
             options.sdk_host.clone(),
             directory.join("local-hosts.sqlite3"),
+            Duration::from_millis(options.host_ready_timeout_ms),
         )
         .await?,
     );
@@ -320,6 +338,22 @@ async fn local_storage(options: &DevOptions, directory: &Path) -> Result<LocalSt
         access: bootstrap,
         region: "north-america-east".into(),
     })
+}
+
+/// A long lease outlasts a killed host, so this runtime ends the leases of its hosts: each one's
+/// when its process exits, and with local storage every one it finds as it starts, since the
+/// directory lock leaves no other runtime whose hosts could hold them.
+async fn abandoned_leases(
+    options: &DevOptions,
+    storage: &LocalState,
+) -> Result<Option<Arc<dyn AbandonedLeases>>> {
+    if local_host_lease_ms()?.is_none() {
+        return Ok(None);
+    }
+    if matches!(options.storage, DevStorage::Local) {
+        storage.runtime.release_leases().await?;
+    }
+    Ok(Some(storage.runtime.clone()))
 }
 
 async fn local_routes(

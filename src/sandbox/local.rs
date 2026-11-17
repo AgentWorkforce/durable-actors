@@ -19,6 +19,7 @@ use super::{
 };
 use crate::{
     clock::{Clock, SystemClock},
+    host_leases::{AbandonedLeases, LOCAL_HOST_LEASE_VARIABLE},
     placement::ObjectPlacementStore,
 };
 
@@ -33,8 +34,10 @@ impl LocalSandboxProvider {
         executable: PathBuf,
         project: PathBuf,
         placements: Arc<dyn ObjectPlacementStore>,
+        abandoned_leases: Option<Arc<dyn AbandonedLeases>>,
         sdk_host: Option<PathBuf>,
         database: PathBuf,
+        ready_timeout: Duration,
     ) -> Result<Self> {
         let stop = CancellationToken::new();
         Ok(Self {
@@ -42,6 +45,8 @@ impl LocalSandboxProvider {
                 executable,
                 project,
                 sdk_host,
+                abandoned_leases,
+                ready_timeout,
                 store: LocalHostStore::open(database).await?,
                 tasks: TaskTracker::new(),
                 changes: watch::channel(()).0,
@@ -200,6 +205,8 @@ struct LocalRuntime {
     executable: PathBuf,
     project: PathBuf,
     sdk_host: Option<PathBuf>,
+    abandoned_leases: Option<Arc<dyn AbandonedLeases>>,
+    ready_timeout: Duration,
     store: LocalHostStore,
     tasks: TaskTracker,
     changes: watch::Sender<()>,
@@ -236,6 +243,7 @@ impl LocalRuntime {
 
     async fn run_host(&self, request: EnsureHostRequest, token: String) {
         let result = self.serve_host(&request, &token).await;
+        self.release_lease(&request).await;
         let error = match result {
             Ok(()) => "local actor host stopped".into(),
             Err(error) => format!("{error:#}"),
@@ -250,11 +258,12 @@ impl LocalRuntime {
         let retired = self.retired(token);
         tokio::pin!(retired);
         let mut host = self.spawn_host(request)?;
+        let ready_timeout = self.ready_timeout;
         let result = async {
             tokio::select! {
                 biased;
                 result = &mut retired => { result?; anyhow::bail!("local actor startup was retired"); },
-                result = tokio::time::timeout(Duration::from_secs(30), host.wait_ready()) => result.context("local actor host did not become ready within 30 seconds")??,
+                result = tokio::time::timeout(ready_timeout, host.wait_ready()) => result.with_context(|| format!("local actor host did not become ready within {ready_timeout:?}"))??,
             }
             let lease = host.lease.as_ref().context("local readiness omitted lease")?;
             ensure!(self.store.publish(token, lease, host.owner_epoch).await?, "local actor startup was retired");
@@ -267,6 +276,19 @@ impl LocalRuntime {
         }.await;
         host.stop().await;
         result
+    }
+
+    /// A killed host still holds its lease, which only its own process could renew.
+    async fn release_lease(&self, request: &EnsureHostRequest) {
+        let (Some(leases), Some(actor)) = (&self.abandoned_leases, &request.actor) else {
+            return;
+        };
+        if let Err(error) = leases
+            .release(actor, &request.host_id, &request.session_id)
+            .await
+        {
+            warn!(%error, "failed to release local host lease");
+        }
     }
 
     fn spawn_host(&self, request: &EnsureHostRequest) -> Result<LocalHost> {
@@ -382,8 +404,15 @@ fn handle(lease: crate::host_leases::HostLease, region: &str, owner_epoch: u64) 
 
 fn host_environment(request: &EnsureHostRequest, directory: &TempDir) -> HashMap<String, String> {
     let mut environment = std::env::vars()
-        .filter(|(key, _)| !key.starts_with("DURABLE_ACTORS_") || key == "DURABLE_ACTORS_PYTHON")
+        .filter(|(key, _)| {
+            !key.starts_with("DURABLE_ACTORS_")
+                || key == "DURABLE_ACTORS_PYTHON"
+                || key == LOCAL_HOST_LEASE_VARIABLE
+        })
         .collect::<HashMap<_, _>>();
+    if let Some(lease) = environment.get(LOCAL_HOST_LEASE_VARIABLE).cloned() {
+        environment.insert("DURABLE_ACTORS_LEASE_MS".into(), lease);
+    }
     if let Some(actor) = &request.actor {
         environment.insert(
             "DURABLE_ACTORS_ACTOR".into(),

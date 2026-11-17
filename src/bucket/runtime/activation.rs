@@ -423,6 +423,13 @@ impl RuntimeStorage {
     }
 }
 
+#[async_trait]
+impl crate::host_leases::AbandonedLeases for RuntimeStorage {
+    async fn release(&self, actor: &ActorKey, host: &HostId, session_id: &str) -> Result<()> {
+        self.release_activation(actor, host, session_id).await
+    }
+}
+
 impl RuntimeStorageReader {
     pub(super) async fn replace_activation(
         &self,

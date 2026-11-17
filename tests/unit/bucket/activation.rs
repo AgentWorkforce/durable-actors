@@ -461,6 +461,23 @@ async fn expired_activation_cannot_renew_or_reacquire_with_the_same_session() ->
 }
 
 #[tokio::test]
+async fn releasing_every_lease_lets_another_host_take_over_at_once() -> Result<()> {
+    let f = Fixture::new()?;
+    let first = request("first");
+    f.runtime
+        .register_activation(&f.actor, &first, "us-east", true, None)
+        .await?;
+    f.runtime.release_leases().await?;
+    assert!(f.runtime.renew_activation(&f.actor, &first).await.is_err());
+    let next = f
+        .runtime
+        .register_activation(&f.actor, &request("second"), "us-east", false, None)
+        .await?;
+    assert_eq!(next.placement.owner_epoch, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn ambiguous_claim_and_renewal_responses_reconcile_the_exact_record() -> Result<()> {
     let f = Fixture::new()?;
     f.bucket.lose_reply.store(true, Ordering::SeqCst);

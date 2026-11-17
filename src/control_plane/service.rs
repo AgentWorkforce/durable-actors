@@ -1504,7 +1504,7 @@ fn ready_lease(
     ensure!(
         lease.expires_at_ms > now
             && lease.expires_at_ms
-                <= now.saturating_add(crate::host_leases::MAX_HOST_LEASE_DURATION_MS + 5_000),
+                <= now.saturating_add(crate::host_leases::max_host_lease_duration_ms()? + 5_000),
         "sandbox readiness lease expired or invalid"
     );
     Ok(lease)

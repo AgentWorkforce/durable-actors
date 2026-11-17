@@ -87,4 +87,30 @@ impl RuntimeStorageReader {
         self.replace_activation(&mut record, Some(stored.generation))
             .await
     }
+
+    /// Ends every live lease, which lets a new host take over at once. Only for a store that no
+    /// live host can be using.
+    pub(crate) async fn release_leases(&self) -> Result<()> {
+        for key in self.authority.list(&crate::storage_paths::owners()).await? {
+            self.release_lease(&key).await?;
+        }
+        Ok(())
+    }
+
+    async fn release_lease(&self, key: &str) -> Result<()> {
+        let Some(stored) = self.authority.get(key).await? else {
+            return Ok(());
+        };
+        let mut record: Ownership = serde_json::from_slice(&stored.bytes)?;
+        if record.lease.expires_at_ms <= self.clock.now_ms()? {
+            return Ok(());
+        }
+        record.lease.expires_at_ms = 0;
+        ensure!(
+            self.replace_activation(&mut record, Some(stored.generation))
+                .await?,
+            "actor ownership changed while its lease was released"
+        );
+        Ok(())
+    }
 }
