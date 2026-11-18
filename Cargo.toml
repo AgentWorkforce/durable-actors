@@ -110,8 +110,3 @@ test = false
 name = "durable-actors-native"
 path = "src/bin/durable-actors-native.rs"
 required-features = ["python-cli"]
-
-# Under gVisor each sandbox keeps a private resident copy of the binary, so code size is memory.
-[profile.release]
-lto = "fat"
-codegen-units = 1
