@@ -4,7 +4,7 @@ use super::{
 };
 use crate::host::HostEndpoint;
 use crate::node_cache::NodeCacheClient;
-use crate::payload::JsonText;
+use crate::payload::{JsonText, Payload};
 use crate::{
     actor::{
         ActorExecutionResult, ActorInvocation, ActorInvocationFailure, DatabaseCall,
@@ -13,10 +13,9 @@ use crate::{
     litestream::{Replicator, storage::SqliteCapture},
     request_tracking::RequestStage,
     state_log::{SqliteSnapshot, StateSnapshot},
-    storage::{SnapshotRef, WritePlan},
+    storage::{SnapshotRef, VerifiedSnapshot, WritePlan},
 };
 use anyhow::{Context, Result, ensure};
-use bytes::Bytes;
 use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
@@ -221,11 +220,11 @@ impl DatabaseSession {
                 )
                 .await?
             } else {
-                let bytes = activation
+                let snapshot = activation
                     .state
                     .take()
                     .context("activation has no recovered state")?;
-                self.load_cached(activation.owner_epoch, activation.state_version, &bytes)
+                self.load_cached(activation.owner_epoch, activation.state_version, snapshot)
                     .await?
             };
             self.cached_state = Some(cached);
@@ -346,7 +345,7 @@ impl DatabaseSession {
         }
         let (state_version, loaded) = self.storage.load_actor_state(owner_epoch).await?;
         if state_version == 0 {
-            ensure!(loaded.is_empty(), "uninitialized actor has state");
+            ensure!(loaded.is_none(), "uninitialized actor has state");
             return ResidentDatabase::open(
                 owner_epoch,
                 SqliteCapture::new(self.replication.clone(), self.storage.full_snapshots()).await?,
@@ -354,8 +353,9 @@ impl DatabaseSession {
             .await;
         }
         timings.mark(RequestStage::StateDownloaded);
+        let snapshot = loaded.context("actor state head has no snapshot")?;
         let cached = self
-            .load_cached(owner_epoch, state_version, &loaded)
+            .load_cached(owner_epoch, state_version, snapshot)
             .await?;
         timings.mark(RequestStage::StateDecoded);
         Ok(cached)
@@ -365,32 +365,33 @@ impl DatabaseSession {
         &self,
         owner_epoch: u64,
         state_version: u64,
-        loaded: &bytes::Bytes,
+        loaded: VerifiedSnapshot,
     ) -> Result<ResidentDatabase> {
-        let snapshot = StateSnapshot::decode(loaded)?;
         ensure!(
-            snapshot.state_version == state_version,
+            loaded.snapshot.state_version == state_version,
             "actor snapshot version does not match its state head"
         );
         ensure!(
-            snapshot.owner_epoch <= owner_epoch,
+            loaded.snapshot.owner_epoch <= owner_epoch,
             "actor snapshot belongs to a newer owner epoch"
         );
         let started = std::time::Instant::now();
-        let digest = SnapshotRef::digest_of(loaded);
-        let parent = self.storage.resume_parent(&snapshot, loaded)?;
-        let (capture, source) = self
-            .open_sqlite(&snapshot, loaded, &digest, parent.is_some())
-            .await?;
+        let parent = self.storage.resume_parent(&loaded)?;
+        let (capture, source) = self.open_sqlite(&loaded, parent.is_some()).await?;
         tracing::info!(event = "actor_sqlite_restored", host_id = %self.endpoint.id, state_version,
             source, duration_ms = started.elapsed().as_secs_f64() * 1000.0);
         let mut cached = ResidentDatabase::open(owner_epoch, capture).await?;
         cached.sqlite_head = parent.filter(|_| cached.synced > 0);
         cached.state_version = state_version;
         cached.published = Some(cached.synced);
+        let VerifiedSnapshot {
+            reference,
+            snapshot,
+            bytes,
+        } = loaded;
         cached.snapshot = Some(PublishedSnapshot {
-            digest,
-            bytes: loaded.clone(),
+            digest: reference.digest,
+            bytes,
         });
         cached.set_completion(snapshot.request_id, snapshot.completion);
         Ok(cached)
@@ -398,17 +399,15 @@ impl DatabaseSession {
 
     async fn open_sqlite(
         &self,
-        snapshot: &StateSnapshot,
-        loaded: &Bytes,
-        digest: &str,
+        loaded: &VerifiedSnapshot,
         resume: bool,
     ) -> Result<(SqliteCapture, &'static str)> {
         let full_snapshots = self.storage.full_snapshots();
-        if let Some(database) = self.storage.take_saved_database(digest) {
+        if let Some(database) = self.storage.take_saved_database(&loaded.reference.digest) {
             match SqliteCapture::adopt(
                 self.replication.clone(),
                 database,
-                snapshot.sqlite.txid,
+                loaded.snapshot.sqlite.txid,
                 full_snapshots,
                 resume,
             )
@@ -535,6 +534,7 @@ impl DatabaseSession {
         timings.snapshot_encoded_at_ms = Some(timings.elapsed_ms());
         cached.pending = Some(PendingStateCommit {
             snapshot,
+            bytes,
             txid,
             ticket,
             durable: false,
@@ -543,7 +543,9 @@ impl DatabaseSession {
             .pending
             .as_ref()
             .expect("pending write was installed");
-        self.state.write_snapshot(&pending.ticket, bytes).await?;
+        self.state
+            .write_snapshot(&pending.ticket, pending.bytes.clone())
+            .await?;
         cached
             .pending
             .as_mut()
@@ -628,7 +630,7 @@ impl DatabaseSession {
             );
             pending.ticket = renewed;
             self.state
-                .write_snapshot(&pending.ticket, pending.snapshot.encode()?)
+                .write_snapshot(&pending.ticket, pending.bytes.clone())
                 .await?;
             pending.durable = true;
         }
@@ -641,15 +643,14 @@ impl DatabaseSession {
             .context("state version overflow")?;
         next_write.object_name = stream.object(next_write.state_version);
         let pending = cached.pending.take().expect("pending commit checked above");
-        let bytes = pending.snapshot.encode()?;
         let head = SnapshotRef::new(
             pending.ticket.object_name.clone(),
             &pending.snapshot,
-            &bytes,
-        );
+            &pending.bytes,
+        )?;
         cached.snapshot = Some(PublishedSnapshot {
             digest: head.digest.clone(),
-            bytes,
+            bytes: pending.bytes,
         });
         cached.sqlite_head = Some(head);
         cached.state_version = pending.snapshot.state_version;
@@ -677,11 +678,12 @@ struct ResidentDatabase {
 
 struct PublishedSnapshot {
     digest: String,
-    bytes: bytes::Bytes,
+    bytes: Payload,
 }
 
 struct PendingStateCommit {
     snapshot: StateSnapshot,
+    bytes: Payload,
     txid: u64,
     ticket: WritePlan,
     durable: bool,

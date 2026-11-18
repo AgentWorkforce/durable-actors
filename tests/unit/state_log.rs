@@ -97,8 +97,8 @@ fn reads_json_snapshots_and_writes_binary_ones() -> Result<()> {
     let snapshot = StateSnapshot::new(1, 2, "request".into(), sqlite, json!(3))?;
     let json = serde_json::to_vec(&snapshot)?;
     let binary = snapshot.encode()?;
-    assert!(binary.starts_with(b"DAS2") && binary.len() < json.len());
-    for bytes in [Bytes::from(json), binary] {
+    assert!(binary.starts_with(b"DAS2")? && binary.len() < json.len());
+    for bytes in [Payload::from(json), binary] {
         let decoded = StateSnapshot::decode(&bytes)?;
         assert_eq!(
             serde_json::to_value(&decoded)?,

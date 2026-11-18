@@ -190,7 +190,7 @@ impl Bucket for GcsBucket {
         &self,
         key: &str,
         generation: Option<i64>,
-        bytes: bytes::Bytes,
+        bytes: crate::payload::Payload,
     ) -> Result<bool> {
         let _transfer = self.clients.transfer(bytes.len() as u64).await?;
         let source = crate::payload::Upload::new(bytes);

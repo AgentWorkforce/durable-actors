@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use bytes::Bytes;
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, CredentialsProvider, EntityTag,
 };
@@ -268,23 +267,14 @@ impl ActorStorage for HostStorage {
         }
     }
 
-    // Only Rapid checkpoints bound a history that crosses activations.
     fn resume_parent(
         &self,
-        snapshot: &crate::state_log::StateSnapshot,
-        bytes: &[u8],
+        snapshot: &crate::storage::VerifiedSnapshot,
     ) -> Result<Option<crate::storage::SnapshotRef>> {
         if self.runtime.persistence.rapid_settings().is_none() {
             return Ok(None);
         }
-        let object = crate::storage::snapshot_object_name(
-            &self.actor,
-            snapshot.state_version,
-            &format!("{:032x}", snapshot.owner_epoch),
-        )?;
-        Ok(Some(crate::storage::SnapshotRef::new(
-            object, snapshot, bytes,
-        )))
+        Ok(Some(snapshot.reference.clone()))
     }
 
     fn take_saved_database(&self, digest: &str) -> Option<tempfile::NamedTempFile> {
@@ -326,7 +316,10 @@ impl ActorStorage for HostStorage {
         })
     }
 
-    async fn load_actor_state(&self, epoch: u64) -> Result<(u64, bytes::Bytes)> {
+    async fn load_actor_state(
+        &self,
+        epoch: u64,
+    ) -> Result<(u64, Option<crate::storage::VerifiedSnapshot>)> {
         self.ensure_authority()?;
         let lease = self
             .lease
@@ -339,23 +332,17 @@ impl ActorStorage for HostStorage {
             .load_owned_actor(&self.actor, &lease, epoch)
             .await?;
         self.ensure_authority()?;
-        Ok((
-            loaded.placement.state_version,
-            loaded.state.unwrap_or_default(),
-        ))
+        Ok((loaded.placement.state_version, loaded.state))
     }
 
-    async fn read_sqlite(&self, bytes: &Bytes) -> Result<crate::state_log::SqliteSnapshot> {
+    async fn read_sqlite(
+        &self,
+        snapshot: &crate::storage::VerifiedSnapshot,
+    ) -> Result<crate::state_log::SqliteSnapshot> {
         self.ensure_authority()?;
-        let snapshot = crate::state_log::StateSnapshot::decode(bytes)?;
-        let object = crate::storage::snapshot_object_name(
-            &self.actor,
-            snapshot.state_version,
-            &format!("{:032x}", snapshot.owner_epoch),
-        )?;
         let checkpoint = self.checkpoint.lock().unwrap().take();
         self.runtime
-            .read_sqlite_prefetched(&object, bytes.clone(), checkpoint)
+            .read_sqlite_prefetched(snapshot.clone(), checkpoint)
             .await
     }
 
@@ -459,7 +446,7 @@ impl HostStorage {
         }
     }
 
-    async fn find_snapshot(&self) -> Option<bytes::Bytes> {
+    async fn find_snapshot(&self) -> Option<crate::payload::Payload> {
         let cache = self.node_cache.as_ref()?;
         let digest = &self.owner_hint.as_ref()?.sealed_base()?.digest;
         let started = Instant::now();

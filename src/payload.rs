@@ -7,14 +7,15 @@ use axum::{
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
 use http_body::{Frame, SizeHint};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use std::{
     collections::VecDeque,
     fmt,
     fs::File,
     io::{self, Read, Write},
-    ops::Deref,
+    ops::{Bound, Range, RangeBounds},
+    os::unix::fs::FileExt,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
@@ -27,9 +28,230 @@ pub(crate) const ARRIVING_BYTES: usize = 1024 * 1024;
 pub(crate) const IO_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Bytes kept in memory, or in a temporary file that is read through bounded buffers so its
+/// size never becomes resident memory. Clones and slices share the file.
+#[derive(Clone)]
+pub enum Payload {
+    Memory(Bytes),
+    File(FileRange),
+}
+
+#[derive(Clone)]
+pub struct FileRange {
+    file: Arc<File>,
+    start: u64,
+    len: usize,
+}
+
+impl Payload {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Memory(bytes) => bytes.len(),
+            Self::File(range) => range.len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
+        match self {
+            Self::Memory(bytes) => Self::Memory(bytes.slice(range)),
+            Self::File(file) => {
+                let range = bounds(range, file.len);
+                Self::File(FileRange {
+                    file: file.file.clone(),
+                    start: file.start + range.start as u64,
+                    len: range.len(),
+                })
+            }
+        }
+    }
+
+    /// Reads `range` into memory, for pieces small enough to hold.
+    pub fn read(&self, range: Range<usize>) -> io::Result<Bytes> {
+        match self.slice(range) {
+            Self::Memory(bytes) => Ok(bytes),
+            Self::File(range) => {
+                let mut bytes = vec![0; range.len];
+                range.file.read_exact_at(&mut bytes, range.start)?;
+                Ok(bytes.into())
+            }
+        }
+    }
+
+    /// Reads all of it into memory, for objects small enough to hold.
+    pub fn to_bytes(&self) -> io::Result<Bytes> {
+        self.read(0..self.len())
+    }
+
+    pub fn starts_with(&self, prefix: &[u8]) -> io::Result<bool> {
+        Ok(self.len() >= prefix.len() && self.read(0..prefix.len())? == prefix)
+    }
+
+    /// Passes the contents to `visit` in order, reading a file through one bounded buffer.
+    pub fn for_each_chunk(&self, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+        let Self::File(range) = self else {
+            return visit(&self.read(0..self.len())?);
+        };
+        let mut buffer = vec![0; IO_BUFFER_BYTES.min(range.len)];
+        let mut offset = 0;
+        while offset < range.len {
+            let length = buffer.len().min(range.len - offset);
+            (range.file).read_exact_at(&mut buffer[..length], range.start + offset as u64)?;
+            visit(&buffer[..length])?;
+            offset += length;
+        }
+        Ok(())
+    }
+
+    pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        self.for_each_chunk(|chunk| writer.write_all(chunk))
+    }
+
+    pub fn reader(&self) -> io::BufReader<PayloadReader> {
+        self.reader_with_capacity(BUFFER_BYTES)
+    }
+
+    pub fn reader_with_capacity(&self, capacity: usize) -> io::BufReader<PayloadReader> {
+        io::BufReader::with_capacity(
+            capacity,
+            PayloadReader {
+                payload: self.clone(),
+                position: 0,
+            },
+        )
+    }
+
+    /// Up to `IO_BUFFER_BYTES` from `offset`, with file reads kept off the async runtime.
+    pub async fn chunk(&self, offset: usize) -> io::Result<Bytes> {
+        let end = self.len().min(offset.saturating_add(IO_BUFFER_BYTES));
+        match self {
+            Self::Memory(bytes) => Ok(bytes.slice(offset..end)),
+            Self::File(_) => {
+                let payload = self.clone();
+                tokio::task::spawn_blocking(move || payload.read(offset..end))
+                    .await
+                    .map_err(io::Error::other)?
+            }
+        }
+    }
+
+    pub fn chunks(&self) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
+        futures_util::stream::try_unfold((self.clone(), 0), |(payload, offset)| async move {
+            if offset == payload.len() {
+                return Ok(None);
+            }
+            let chunk = payload.chunk(offset).await?;
+            let next = offset + chunk.len();
+            Ok(Some((chunk, (payload, next))))
+        })
+    }
+
+    fn same_chunks(&self, other: &Self) -> io::Result<bool> {
+        let mut offset = 0;
+        while offset < self.len() {
+            let end = self.len().min(offset + IO_BUFFER_BYTES);
+            if self.read(offset..end)? != other.read(offset..end)? {
+                return Ok(false);
+            }
+            offset = end;
+        }
+        Ok(true)
+    }
+}
+
+fn bounds(range: impl RangeBounds<usize>, len: usize) -> Range<usize> {
+    let start = match range.start_bound() {
+        Bound::Included(start) => *start,
+        Bound::Excluded(start) => start + 1,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(end) => end + 1,
+        Bound::Excluded(end) => *end,
+        Bound::Unbounded => len,
+    };
+    assert!(
+        start <= end && end <= len,
+        "range {start}..{end} out of bounds for {len} bytes"
+    );
+    start..end
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Self::Memory(Bytes::new())
+    }
+}
+impl From<Bytes> for Payload {
+    fn from(bytes: Bytes) -> Self {
+        Self::Memory(bytes)
+    }
+}
+impl From<Vec<u8>> for Payload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Memory(bytes.into())
+    }
+}
+impl From<&'static [u8]> for Payload {
+    fn from(bytes: &'static [u8]) -> Self {
+        Self::Memory(Bytes::from_static(bytes))
+    }
+}
+/// Compares contents, reading files; a failed read counts as a difference.
+impl PartialEq for Payload {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            _ if self.len() != other.len() => false,
+            (Self::Memory(left), Self::Memory(right)) => left == right,
+            (Self::File(left), Self::File(right))
+                if Arc::ptr_eq(&left.file, &right.file) && left.start == right.start =>
+            {
+                true
+            }
+            _ => self.same_chunks(other).unwrap_or(false),
+        }
+    }
+}
+impl fmt::Debug for Payload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory(bytes) => bytes.fmt(formatter),
+            Self::File(range) => formatter
+                .debug_struct("File")
+                .field("len", &range.len)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+pub struct PayloadReader {
+    payload: Payload,
+    position: usize,
+}
+
+impl Read for PayloadReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let length = buffer.len().min(self.payload.len() - self.position);
+        let target = &mut buffer[..length];
+        match &self.payload {
+            Payload::Memory(bytes) => {
+                target.copy_from_slice(&bytes[self.position..self.position + length])
+            }
+            Payload::File(range) => {
+                (range.file).read_exact_at(target, range.start + self.position as u64)?
+            }
+        }
+        self.position += length;
+        Ok(length)
+    }
+}
+
 pub(crate) struct Spool {
     memory: Vec<u8>,
-    file: Option<tempfile::NamedTempFile>,
+    file: Option<File>,
     length: u64,
 }
 
@@ -42,18 +264,15 @@ impl Spool {
         }
     }
 
-    pub fn finish(mut self) -> Result<Bytes> {
-        self.flush()?;
-        match self.file {
-            None => Ok(self.memory.into()),
-            Some(file) => {
-                let path = file.into_temp_path();
-                let file = File::open(&path)?;
-                // This privately owned file is immutable until the last mapping is dropped.
-                let map = unsafe { memmap2::Mmap::map(&file)? };
-                Ok(Bytes::from_owner(Mapped { map, _path: path }))
-            }
-        }
+    pub fn finish(self) -> Result<Payload> {
+        Ok(match self.file {
+            None => Payload::Memory(self.memory.into()),
+            Some(file) => Payload::File(FileRange {
+                file: Arc::new(file),
+                start: 0,
+                len: usize::try_from(self.length)?,
+            }),
+        })
     }
 }
 
@@ -65,7 +284,7 @@ impl Write for Spool {
             .filter(|length| *length <= MAX_FILE_BYTES)
             .ok_or_else(|| io::Error::other("temporary storage object exceeds 2 GiB"))?;
         if self.file.is_none() && length > BUFFER_BYTES as u64 {
-            let mut file = tempfile::NamedTempFile::new()?;
+            let mut file = tempfile::tempfile()?;
             file.write_all(&self.memory)?;
             self.memory = Vec::new();
             self.file = Some(file);
@@ -78,76 +297,20 @@ impl Write for Spool {
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        match self.file.as_mut() {
-            Some(file) => file.flush(),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
-struct Mapped {
-    map: memmap2::Mmap,
-    _path: tempfile::TempPath,
-}
-impl AsRef<[u8]> for Mapped {
-    fn as_ref(&self) -> &[u8] {
-        &self.map
-    }
-}
-
-pub(crate) fn encode(value: &impl Serialize) -> Result<Bytes> {
+pub(crate) fn encode(value: &impl Serialize) -> Result<Payload> {
     let mut spool = Spool::new();
     serde_json::to_writer(&mut spool, value)?;
     spool.finish()
 }
 
-pub(crate) fn copy(mut reader: impl Read) -> Result<Bytes> {
+pub(crate) fn copy(mut reader: impl Read) -> Result<Payload> {
     let mut spool = Spool::new();
     io::copy(&mut reader, &mut spool)?;
     spool.finish()
-}
-
-#[derive(Clone, Debug)]
-pub struct Text(Bytes);
-
-impl Deref for Text {
-    type Target = str;
-    fn deref(&self) -> &str {
-        std::str::from_utf8(&self.0).expect("validated text")
-    }
-}
-impl AsRef<[u8]> for Text {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-impl From<String> for Text {
-    fn from(value: String) -> Self {
-        Self(value.into())
-    }
-}
-impl Serialize for Text {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self)
-    }
-}
-impl<'de> Deserialize<'de> for Text {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl de::Visitor<'_> for Visitor {
-            type Value = Text;
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("base64 text")
-            }
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Text, E> {
-                copy(value.as_bytes()).map(Text).map_err(E::custom)
-            }
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Text, E> {
-                self.visit_str(&value)
-            }
-        }
-        deserializer.deserialize_str(Visitor)
-    }
 }
 
 /// A JSON document kept as its text, which passes through without being parsed. Clones share the
@@ -462,34 +625,35 @@ impl From<JsonBody> for reqwest::Body {
 }
 
 pub(crate) struct Upload {
-    bytes: Bytes,
+    payload: Payload,
     offset: usize,
 }
 impl Upload {
-    pub fn new(bytes: Bytes) -> Self {
-        Self { bytes, offset: 0 }
+    pub fn new(payload: Payload) -> Self {
+        Self { payload, offset: 0 }
     }
 }
 impl google_cloud_storage::streaming_source::StreamingSource for Upload {
     type Error = io::Error;
     async fn next(&mut self) -> Option<io::Result<Bytes>> {
-        if self.offset == self.bytes.len() {
+        if self.offset == self.payload.len() {
             return None;
         }
-        let end = self.bytes.len().min(self.offset + IO_BUFFER_BYTES);
-        let bytes = self.bytes.slice(self.offset..end);
-        self.offset = end;
-        Some(Ok(bytes))
+        let chunk = self.payload.chunk(self.offset).await;
+        if let Ok(chunk) = &chunk {
+            self.offset += chunk.len();
+        }
+        Some(chunk)
     }
     async fn size_hint(&self) -> io::Result<google_cloud_storage::streaming_source::SizeHint> {
-        Ok(google_cloud_storage::streaming_source::SizeHint::with_exact(self.bytes.len() as u64))
+        Ok(google_cloud_storage::streaming_source::SizeHint::with_exact(self.payload.len() as u64))
     }
 }
 impl google_cloud_storage::streaming_source::Seek for Upload {
     type Error = io::Error;
     async fn seek(&mut self, offset: u64) -> io::Result<()> {
         self.offset = usize::try_from(offset).map_err(io::Error::other)?;
-        if self.offset > self.bytes.len() {
+        if self.offset > self.payload.len() {
             return Err(io::Error::other("upload seek exceeds object"));
         }
         Ok(())
@@ -528,7 +692,7 @@ impl Download {
         Ok(self)
     }
 
-    pub async fn finish(mut self) -> Result<Bytes> {
+    pub async fn finish(mut self) -> Result<Payload> {
         tokio::task::spawn_blocking(move || {
             self.flush()?;
             self.spool.finish()

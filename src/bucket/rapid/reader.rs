@@ -1,9 +1,8 @@
 use super::*;
 use futures_util::{StreamExt, TryStreamExt, stream};
-use std::io::Write;
 
 impl LogStorage {
-    pub async fn latest(&self, prefix: &str, fence: bool) -> Result<Option<(String, Bytes)>> {
+    pub async fn latest(&self, prefix: &str, fence: bool) -> Result<Option<(String, Payload)>> {
         let (checkpoint, records) =
             tokio::try_join!(self.snapshots.latest(prefix), self.records(prefix, fence))?;
         let mut records = records;
@@ -15,7 +14,7 @@ impl LogStorage {
             .max_by_key(|(key, _)| super::super::snapshots::version(key)))
     }
 
-    pub async fn records(&self, prefix: &str, fence: bool) -> Result<BTreeMap<String, Bytes>> {
+    pub async fn records(&self, prefix: &str, fence: bool) -> Result<BTreeMap<String, Payload>> {
         let started = std::time::Instant::now();
         let physical = super::super::rapid::object_name(prefix)?;
         let keys: Vec<_> = self
@@ -57,12 +56,12 @@ impl LogStorage {
         prefix: &str,
         fence: bool,
     ) -> Result<(Manifest, Vec<Record>)> {
-        let bytes = self
+        let stored = self
             .archive
             .get(key)
             .await?
             .context("log manifest disappeared")?;
-        let manifest: Manifest = serde_json::from_slice(&bytes.bytes)?;
+        let manifest: Manifest = serde_json::from_reader(stored.bytes.reader())?;
         manifest.validate(key, prefix, &self.zones)?;
         let records = self.read_segment(&manifest, fence).await?;
         Ok((manifest, records))
@@ -72,7 +71,7 @@ impl LogStorage {
         let marker = self.archive.get(&manifest.marker("replicated")?).await?;
         let (end, archived) = self.archived(manifest).await?;
         if let Some(marker) = marker {
-            let closed: archive::ClosedSegment = serde_json::from_slice(&marker.bytes)?;
+            let closed: archive::ClosedSegment = serde_json::from_reader(marker.bytes.reader())?;
             closed.validate(manifest, end, &archived)?;
             return Ok(archived);
         }
@@ -80,7 +79,8 @@ impl LogStorage {
             Ok(records) => records,
             Err(error) => {
                 if let Some(marker) = self.archive.get(&manifest.marker("replicated")?).await? {
-                    let closed: archive::ClosedSegment = serde_json::from_slice(&marker.bytes)?;
+                    let closed: archive::ClosedSegment =
+                        serde_json::from_reader(marker.bytes.reader())?;
                     let (end, records) = self.archived(manifest).await?;
                     closed.validate(manifest, end, &records)?;
                     return Ok(records);
@@ -117,13 +117,12 @@ impl LogStorage {
                 .context("invalid archive batch range")?;
             let (mut offset, end) = (start.parse::<u64>()?, end.parse::<u64>()?);
             ensure!(end > offset, "invalid archive batch boundary");
-            let bytes: Bytes = self
+            let bytes = self
                 .archive
                 .get(&key)
                 .await?
                 .context("archive batch missing")?
-                .bytes
-                .into();
+                .bytes;
             batches += 1;
             downloaded_bytes += bytes.len();
             ensure!(
@@ -187,20 +186,20 @@ impl LogStorage {
             end_offset,
         };
         if let Some(marker) = self.archive.get(&manifest.marker("closed")?).await? {
-            closed = serde_json::from_slice(&marker.bytes)?;
+            closed = serde_json::from_reader(marker.bytes.reader())?;
             closed.validate(manifest, end_offset, &records)?;
         }
         let mut offset = 0;
         let mut batch = crate::payload::Spool::new();
         let mut length = 0;
         for record in records {
-            let frame = record.encode()?;
-            offset += frame.len() as u64;
+            let size = frame::HEADER + record.state.len();
+            offset += size as u64;
             if offset <= through {
                 continue;
             }
-            batch.write_all(&frame)?;
-            length += frame.len();
+            record.write_to(&mut batch)?;
+            length += size;
             if length >= self.batch.bytes {
                 let bytes = std::mem::replace(&mut batch, crate::payload::Spool::new()).finish()?;
                 self.put_batch(manifest, through, bytes).await?;
@@ -249,7 +248,7 @@ impl LogStorage {
     }
 }
 
-fn insert(records: &mut BTreeMap<String, Bytes>, key: String, bytes: Bytes) -> Result<()> {
+fn insert(records: &mut BTreeMap<String, Payload>, key: String, bytes: Payload) -> Result<()> {
     ensure!(
         records.get(&key).is_none_or(|prior| prior == &bytes),
         "conflicting state records"

@@ -61,7 +61,7 @@ fn legacy_records_still_require_valid_metadata_and_sqlite() -> Result<()> {
 
 #[test]
 fn legacy_snapshot_references_use_the_original_bytes() -> Result<()> {
-    let bytes = bytes::Bytes::from(serde_json::to_vec(&legacy_record(json!(3))?)?);
+    let bytes = crate::payload::Payload::from(serde_json::to_vec(&legacy_record(json!(3))?)?);
     let snapshot = StateSnapshot::decode(&bytes)?;
     let stream = crate::storage::StateStream {
         session: "session".into(),

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::actor::ActorKey;
 
 mod stream;
-pub use stream::{SnapshotRef, StateStream};
+pub use stream::{SnapshotRef, StateStream, VerifiedSnapshot};
+
+pub(crate) use stream::snapshot_position;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,7 +19,7 @@ pub struct WritePlan {
 
 #[async_trait]
 pub trait SnapshotReader: Send + Sync {
-    async fn read_snapshot(&self, region: &str, object: &str) -> Result<bytes::Bytes>;
+    async fn read_snapshot(&self, region: &str, object: &str) -> Result<crate::payload::Payload>;
 }
 
 pub fn snapshot_object_name(actor: &ActorKey, state_version: u64, nonce: &str) -> Result<String> {

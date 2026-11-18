@@ -119,9 +119,9 @@ impl RuntimeStorageReader {
         let Some(bytes) = self.read_persisted(key).await? else {
             return Ok(None);
         };
-        decode_snapshot(key.into(), bytes.clone())?;
-        let snapshot = StateSnapshot::decode(&bytes)?;
-        let sqlite = self.read_sqlite(key, bytes).await?;
+        let snapshot = VerifiedSnapshot::named(key.into(), bytes)?;
+        let record = record(snapshot.snapshot.clone());
+        let sqlite = self.read_sqlite(snapshot).await?;
         let fields = crate::litestream::storage::restored_fields(
             self.restore.as_ref(),
             &sqlite.files,
@@ -129,7 +129,7 @@ impl RuntimeStorageReader {
         )
         .await?;
         Ok(Some(InspectedState {
-            record: record(snapshot),
+            record,
             state: serde_json::value::to_raw_value(&fields)?,
         }))
     }
@@ -137,17 +137,14 @@ impl RuntimeStorageReader {
     async fn read_commit(&self, key: &str) -> Result<Option<StateSnapshot>> {
         self.read_persisted(key)
             .await?
-            .map(|bytes| {
-                decode_snapshot(key.to_owned(), bytes)
-                    .and_then(|loaded| StateSnapshot::decode(&loaded.bytes))
-            })
+            .map(|bytes| VerifiedSnapshot::named(key.into(), bytes).map(|loaded| loaded.snapshot))
             .transpose()
     }
 
     async fn history_record(&self, snapshot_key: &str) -> Result<Option<StateRecord>> {
         let key = format!("{snapshot_key}.metadata");
         if let Some(cached) = self.authority.get(&key).await? {
-            return Ok(Some(serde_json::from_slice(&cached.bytes)?));
+            return Ok(Some(serde_json::from_reader(cached.bytes.reader())?));
         }
         let Some(snapshot) = self.read_commit(snapshot_key).await? else {
             return Ok(None);

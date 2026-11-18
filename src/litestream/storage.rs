@@ -1,6 +1,6 @@
 use super::{DatabaseRestore, Replicator};
+use crate::payload::Payload;
 use anyhow::{Context, Result, ensure};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -15,22 +15,34 @@ pub struct LtxFile {
     pub last: u64,
     /// Raw LTX bytes; JSON state, written before binary snapshots, carries them as base64.
     #[serde(with = "base64_data")]
-    pub data: Bytes,
+    pub data: Payload,
 }
 
 mod base64_data {
+    use crate::payload::Payload;
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use bytes::Bytes;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+    use serde::{Deserializer, Serializer, de, ser::Error};
+    use std::fmt;
 
-    pub fn serialize<S: Serializer>(data: &Bytes, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&STANDARD.encode(data))
+    pub fn serialize<S: Serializer>(data: &Payload, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(data.to_bytes().map_err(S::Error::custom)?))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Bytes, D::Error> {
-        let text = crate::payload::Text::deserialize(deserializer)?;
-        crate::payload::copy(base64::read::DecoderReader::new(text.as_ref(), &STANDARD))
-            .map_err(D::Error::custom)
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Payload, D::Error> {
+        deserializer.deserialize_str(Base64)
+    }
+
+    struct Base64;
+
+    impl de::Visitor<'_> for Base64 {
+        type Value = Payload;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("base64 text")
+        }
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Payload, E> {
+            crate::payload::copy(base64::read::DecoderReader::new(text.as_bytes(), &STANDARD))
+                .map_err(E::custom)
+        }
     }
 }
 
@@ -44,7 +56,7 @@ impl LtxFile {
         ensure!(self.level != 9 || self.first == 1, "invalid LTX snapshot");
         // Only the header magic is checked: snapshots are validated on every encode and decode,
         // and a full LTX decode here made each of those another pass over the database.
-        ensure!(self.data.starts_with(b"LTX1"), "malformed LTX file");
+        ensure!(self.data.starts_with(b"LTX1")?, "malformed LTX file");
         Ok(())
     }
 

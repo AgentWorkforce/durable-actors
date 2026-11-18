@@ -175,8 +175,8 @@ impl DatabaseRestore for EmbeddedRestore {
     }
 }
 
-/// Restores read the LTX files from memory instead of writing them to disk first.
-struct MemoryReplica(Vec<(Segment, bytes::Bytes)>);
+/// Restores read the LTX files where they already are instead of writing them to disk first.
+struct MemoryReplica(Vec<(Segment, crate::payload::Payload)>);
 
 impl MemoryReplica {
     fn decode(files: &[LtxFile]) -> Result<Self> {
@@ -203,12 +203,12 @@ impl ReplicaStore for MemoryReplica {
     }
 
     fn open(&self, segment: &Segment) -> Result<Box<dyn std::io::Read + Send>> {
-        let (_, bytes) = self
+        let (_, data) = self
             .0
             .iter()
             .find(|(candidate, _)| candidate == segment)
             .context("LTX file missing from restore")?;
-        Ok(Box::new(std::io::Cursor::new(bytes.clone())))
+        Ok(Box::new(data.reader()))
     }
 
     fn create(&self, _: &Segment) -> Result<Box<dyn SegmentWriter>> {

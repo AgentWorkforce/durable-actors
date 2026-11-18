@@ -5,12 +5,13 @@ use std::sync::{
 };
 
 #[tokio::test]
-async fn rapid_uploads_hand_whole_records_to_the_sdk_and_only_succeed_after_flush() -> Result<()> {
-    let bytes = Bytes::from(
-        (0..5 * 1024 * 1024 + 17)
-            .map(|n| (n % 251) as u8)
-            .collect::<Vec<_>>(),
-    );
+async fn rapid_uploads_stream_records_to_the_sdk_and_only_succeed_after_flush() -> Result<()> {
+    let header = Bytes::from_static(b"header");
+    let state = (0..5 * 1024 * 1024 + 17)
+        .map(|n| (n % 251) as u8)
+        .collect::<Vec<_>>();
+    let bytes = [header.as_ref(), &state].concat();
+    let state = crate::payload::copy(state.as_slice())?;
     for (fail_append, fail_flush) in [(false, false), (true, false), (false, true)] {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let flushes = Arc::new(AtomicU64::new(0));
@@ -21,7 +22,7 @@ async fn rapid_uploads_hand_whole_records_to_the_sdk_and_only_succeed_after_flus
             fail_flush,
             persisted: 0,
         }));
-        let result = writer.append_and_flush(bytes.clone()).await;
+        let result = writer.append_and_flush(header.clone(), state.clone()).await;
         if fail_append || fail_flush {
             assert!(result.is_err());
         } else {
@@ -29,8 +30,20 @@ async fn rapid_uploads_hand_whole_records_to_the_sdk_and_only_succeed_after_flus
         }
         assert_eq!(flushes.load(Ordering::SeqCst), u64::from(!fail_append));
         let chunks = chunks.lock().unwrap();
-        assert_eq!(chunks.len(), usize::from(!fail_append));
-        assert!(chunks.iter().all(|chunk| *chunk == bytes));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= crate::payload::IO_BUFFER_BYTES)
+        );
+        let sent = chunks.concat();
+        assert_eq!(
+            sent,
+            if fail_append {
+                Vec::new()
+            } else {
+                bytes.clone()
+            }
+        );
     }
     Ok(())
 }

@@ -14,7 +14,7 @@ pub(super) struct Session {
     archive: Option<Archiver>,
     retired: Option<Archiver>,
     retirement_error: Option<String>,
-    latest: Option<(String, Bytes)>,
+    latest: Option<(String, Payload)>,
     version: u64,
     /// The version the current segment opened after; equal to `version` while it holds no frames.
     installed_at: u64,
@@ -51,7 +51,7 @@ impl Session {
         })
     }
 
-    pub fn cached(&self, object: &str) -> Option<Bytes> {
+    pub fn cached(&self, object: &str) -> Option<Payload> {
         self.latest
             .as_ref()
             .filter(|(key, _)| key == object)
@@ -62,7 +62,7 @@ impl Session {
         &mut self,
         storage: Arc<LogStorage>,
         object: &str,
-        bytes: Bytes,
+        bytes: Payload,
     ) -> Result<()> {
         let started = Instant::now();
         ensure!(self.healthy, "uncertain write requires activation recovery");
@@ -129,19 +129,18 @@ impl Session {
     pub async fn restored(
         &mut self,
         storage: Arc<LogStorage>,
-        object: &str,
-        bytes: Bytes,
+        snapshot: &crate::storage::VerifiedSnapshot,
         restored: &crate::bucket::recovery::ResolvedSqlite,
     ) -> Result<()> {
-        let snapshot = crate::state_log::StateSnapshot::decode(&bytes)?;
+        let object = &snapshot.reference.object;
         if self.latest.is_some()
-            || snapshot.state_version != self.stream.base_version
+            || snapshot.reference.state_version != self.stream.base_version
             || crate::storage_paths::actor_from_snapshot(object)?
                 != crate::storage_paths::actor_from_snapshot(&self.stream.object(self.version))?
         {
             return Ok(());
         }
-        self.latest = Some((object.into(), bytes));
+        self.latest = Some((object.clone(), snapshot.bytes.clone()));
         self.checkpoint.restored(restored, self.version);
         self.checkpoint
             .schedule(storage, self.latest.as_ref(), self.version)

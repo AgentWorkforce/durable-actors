@@ -1,7 +1,7 @@
 use super::*;
 use crate::bucket::recovery::{Checkpoint, ResolvedSqlite, SnapshotHistory, resolve};
-use crate::state_log::{SqliteSnapshot, StateSnapshot};
-use crate::storage::SnapshotRef;
+use crate::state_log::SqliteSnapshot;
+use crate::storage::VerifiedSnapshot;
 
 // Below this a checkpoint saves less than its own upload costs.
 const MIN_LOG_BYTES: u64 = 1024 * 1024; // 1 MB
@@ -13,11 +13,11 @@ const MAX_LOG_VERSIONS: u64 = if cfg!(test) { 32 } else { 256 };
 impl LogStorage {
     pub async fn restore(
         &self,
-        object: &str,
-        bytes: Bytes,
+        snapshot: VerifiedSnapshot,
         checkpoint: Option<crate::bucket::recovery::PrefetchedCheckpoint>,
     ) -> Result<ResolvedSqlite> {
         let started = std::time::Instant::now();
+        let object = snapshot.reference.object.clone();
         tracing::info!(event = "sqlite_history_started", object);
         let mut history = LogHistory {
             storage: self,
@@ -25,7 +25,7 @@ impl LogStorage {
             reads: 0,
             probes: 0,
         };
-        let resolved = resolve(&mut history, object, bytes, checkpoint).await?;
+        let resolved = resolve(&mut history, snapshot, checkpoint).await?;
         tracing::info!(
             event = "sqlite_history_restored",
             object,
@@ -52,34 +52,35 @@ impl LogStorage {
     }
 
     /// Returns the LTX bytes of the full copy that now ends the history at `object`, if any.
-    pub async fn checkpoint(&self, object: &str, bytes: Bytes) -> Result<Option<u64>> {
+    pub async fn checkpoint(&self, object: &str, bytes: Payload) -> Result<Option<u64>> {
         let started = std::time::Instant::now();
-        let snapshot = StateSnapshot::decode(&bytes)?;
-        if snapshot.sqlite.parent.is_none() {
+        let snapshot = VerifiedSnapshot::named(object.into(), bytes)?;
+        let state_version = snapshot.reference.state_version;
+        if snapshot.snapshot.sqlite.parent.is_none() {
             tracing::info!(
                 event = "sqlite_checkpoint",
                 object,
-                state_version = snapshot.state_version,
+                state_version,
                 outcome = "full_snapshot",
                 duration_ms = started.elapsed().as_secs_f64() * 1000.0
             );
-            return Ok(Some(sqlite_bytes(&snapshot.sqlite.files)));
+            return Ok(Some(sqlite_bytes(&snapshot.snapshot.sqlite.files)));
         }
-        let source = SnapshotRef::new(object.into(), &snapshot, &bytes);
+        let source = snapshot.reference.clone();
         let key = format!("{object}.checkpoint");
         if let Some(stored) = self.snapshots.get(&key).await? {
-            let sqlite = Checkpoint::decode(&stored, &source, snapshot.sqlite.txid)?;
+            let sqlite = Checkpoint::decode(&stored, &source, snapshot.snapshot.sqlite.txid)?;
             tracing::info!(
                 event = "sqlite_checkpoint",
                 object,
-                state_version = snapshot.state_version,
+                state_version,
                 outcome = "existing",
                 duration_ms = started.elapsed().as_secs_f64() * 1000.0
             );
             return Ok(Some(sqlite_bytes(&sqlite.files)));
         }
         let sqlite = self
-            .restore(object, bytes, None)
+            .restore(snapshot, None)
             .await
             .context("resolve checkpoint inputs")?
             .sqlite;
@@ -118,7 +119,7 @@ impl LogStorage {
             history_ms,
             compaction_ms,
             upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0,
-            state_version = snapshot.state_version,
+            state_version,
             input_files,
             bytes = size,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0
@@ -139,15 +140,15 @@ struct LogHistory<'a> {
 }
 
 struct EpochHistory {
-    records: Option<BTreeMap<String, Bytes>>,
+    records: Option<BTreeMap<String, Payload>>,
     indexes: Vec<String>,
-    indexed: BTreeMap<String, Bytes>,
+    indexed: BTreeMap<String, Payload>,
     checkpoints: std::collections::BTreeSet<String>,
 }
 
 #[async_trait]
 impl SnapshotHistory for LogHistory<'_> {
-    async fn read(&mut self, object: &str) -> Result<Bytes> {
+    async fn read(&mut self, object: &str) -> Result<Payload> {
         let (prefix, _) = object.rsplit_once('/').context("invalid snapshot name")?;
         if !self.epochs.contains_key(prefix) {
             let prefix_key = format!("{prefix}/");
@@ -223,7 +224,7 @@ impl SnapshotHistory for LogHistory<'_> {
             .context("SQLite dependency missing")
     }
 
-    async fn checkpoint(&mut self, object: &str) -> Result<Option<Bytes>> {
+    async fn checkpoint(&mut self, object: &str) -> Result<Option<Payload>> {
         let key = format!("{object}.checkpoint");
         let (prefix, _) = object.rsplit_once('/').context("invalid snapshot name")?;
         if self
@@ -265,7 +266,7 @@ impl Progress {
     pub async fn schedule(
         &mut self,
         storage: Arc<LogStorage>,
-        latest: Option<&(String, Bytes)>,
+        latest: Option<&(String, Payload)>,
         version: u64,
     ) {
         self.collect().await;
@@ -319,7 +320,7 @@ impl Progress {
         &mut self,
         storage: Arc<LogStorage>,
         object: &str,
-        bytes: Bytes,
+        bytes: Payload,
         version: u64,
         deadline: tokio::time::Instant,
     ) {
@@ -358,7 +359,7 @@ impl Progress {
         &mut self,
         storage: Arc<LogStorage>,
         object: String,
-        bytes: Bytes,
+        bytes: Payload,
         version: u64,
         trigger: &'static str,
     ) {

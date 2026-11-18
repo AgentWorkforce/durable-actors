@@ -47,6 +47,20 @@ async fn saved_databases_are_only_visible_to_hosts_of_the_same_actor() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn saved_snapshots_are_received_whole() -> Result<()> {
+    let issuer = issuer()?;
+    let cache = NodeCache::start(&issuer).await?;
+    let bytes = (0..600 * 1024).map(|i| i as u8).collect::<Vec<_>>();
+    let digest = sha256(&bytes);
+    let payload = crate::payload::copy(bytes.as_slice())?;
+    let host = cache.client(&host_token(&issuer, "one")?)?;
+    assert!(host.snapshot(&digest).await?.is_none());
+    host.store_snapshot(&digest, payload.clone()).await?;
+    assert_eq!(host.snapshot(&digest).await?, Some(payload));
+    Ok(())
+}
+
 struct NodeCache {
     url: String,
     _directory: tempfile::TempDir,

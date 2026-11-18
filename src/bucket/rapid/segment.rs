@@ -88,12 +88,12 @@ impl Segment {
         }))
     }
 
-    pub async fn append(&mut self, version: u64, state: Bytes) -> Result<Bytes> {
+    pub async fn append(&mut self, version: u64, state: Payload) -> Result<Frame> {
         ensure!(
             self.healthy,
             "uncertain log append requires activation recovery"
         );
-        let frame = Record { version, state }.encode()?;
+        let frame = Record { version, state }.frame()?;
         let expected = self
             .offset
             .checked_add(frame.len() as u64)
@@ -102,9 +102,9 @@ impl Segment {
         self.healthy = false;
         let flushed = bounded(async {
             Ok(futures_util::future::join_all(
-                self.writers
-                    .iter_mut()
-                    .map(|writer| writer.append_and_flush(frame.clone())),
+                self.writers.iter_mut().map(|writer| {
+                    writer.append_and_flush(frame.header.clone(), frame.state.clone())
+                }),
             )
             .await)
         })

@@ -1,7 +1,6 @@
 //! DAS2: a JSON header naming the LTX files, then their raw bytes, so state skips base64.
-use crate::litestream::storage::LtxFile;
+use crate::{litestream::storage::LtxFile, payload::Payload};
 use anyhow::{Context, Result, ensure};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::Write;
 
@@ -24,12 +23,12 @@ struct FileHeader {
     bytes: u64,
 }
 
-pub(crate) fn is_binary(bytes: &[u8]) -> bool {
-    bytes.starts_with(MAGIC)
+pub(crate) fn is_binary(bytes: &Payload) -> Result<bool> {
+    Ok(bytes.starts_with(MAGIC)?)
 }
 
 /// `value` carries everything but the bytes of `files`.
-pub(crate) fn encode<T: Serialize>(value: &T, files: &[LtxFile]) -> Result<Bytes> {
+pub(crate) fn encode<T: Serialize>(value: &T, files: &[LtxFile]) -> Result<Payload> {
     let header = serde_json::to_vec(&Envelope {
         value,
         files: files.iter().map(FileHeader::new).collect(),
@@ -40,22 +39,22 @@ pub(crate) fn encode<T: Serialize>(value: &T, files: &[LtxFile]) -> Result<Bytes
     spool.write_all(&length.to_le_bytes())?;
     spool.write_all(&header)?;
     for file in files {
-        spool.write_all(&file.data)?;
+        file.data.write_to(&mut spool)?;
     }
     spool.finish()
 }
 
-pub(crate) fn decode<T: DeserializeOwned>(bytes: &Bytes) -> Result<(T, Vec<LtxFile>)> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &Payload) -> Result<(T, Vec<LtxFile>)> {
     ensure!(
-        is_binary(bytes) && bytes.len() >= PREFIX,
+        bytes.len() >= PREFIX && is_binary(bytes)?,
         "not a binary state object"
     );
-    let length = u32::from_le_bytes(bytes[MAGIC.len()..PREFIX].try_into()?) as usize;
+    let length = u32::from_le_bytes(bytes.read(MAGIC.len()..PREFIX)?.as_ref().try_into()?) as usize;
     let start = PREFIX
         .checked_add(length)
         .filter(|start| *start <= bytes.len())
         .context("truncated state header")?;
-    let envelope: Envelope<T> = serde_json::from_slice(&bytes[PREFIX..start])?;
+    let envelope: Envelope<T> = serde_json::from_slice(&bytes.read(PREFIX..start)?)?;
     let payload = bytes.slice(start..);
     let mut offset = 0usize;
     let mut files = Vec::with_capacity(envelope.files.len());

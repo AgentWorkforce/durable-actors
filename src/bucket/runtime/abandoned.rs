@@ -62,7 +62,7 @@ impl RuntimeStorageReader {
         let Some(stored) = self.authority.get(key).await? else {
             return Ok(false);
         };
-        let mut record: Ownership = serde_json::from_slice(&stored.bytes)?;
+        let mut record: Ownership = serde_json::from_reader(stored.bytes.reader())?;
         let abandoned_at = record
             .lease
             .expires_at_ms
@@ -77,7 +77,7 @@ impl RuntimeStorageReader {
             .snapshots
             .recover(&record.stream()?.prefix)
             .await?
-            .map(|(object, bytes)| decode_snapshot(object, bytes))
+            .map(|(object, bytes)| VerifiedSnapshot::named(object, bytes))
             .transpose()?;
         advance(
             &mut record.base,
@@ -101,7 +101,7 @@ impl RuntimeStorageReader {
         let Some(stored) = self.authority.get(key).await? else {
             return Ok(());
         };
-        let mut record: Ownership = serde_json::from_slice(&stored.bytes)?;
+        let mut record: Ownership = serde_json::from_reader(stored.bytes.reader())?;
         if record.lease.expires_at_ms <= self.clock.now_ms()? {
             return Ok(());
         }

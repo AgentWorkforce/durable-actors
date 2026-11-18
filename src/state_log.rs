@@ -1,6 +1,9 @@
-use crate::{litestream::storage::LtxFile, payload::JsonText, storage::SnapshotRef};
+use crate::{
+    litestream::storage::LtxFile,
+    payload::{JsonText, Payload},
+    storage::SnapshotRef,
+};
 use anyhow::{Context, Result, ensure};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod binary;
@@ -99,21 +102,21 @@ impl StateSnapshot {
     }
 
     /// Reads binary snapshots and the JSON ones written before them.
-    pub fn decode(bytes: &Bytes) -> Result<Self> {
-        let snapshot = if binary::is_binary(bytes) {
+    pub fn decode(bytes: &Payload) -> Result<Self> {
+        let snapshot = if binary::is_binary(bytes)? {
             let (mut snapshot, files): (Self, _) = binary::decode(bytes)?;
             ensure!(snapshot.sqlite.files.is_empty(), "duplicate LTX files");
             snapshot.sqlite.files = files;
             snapshot
         } else {
-            serde_json::from_slice(bytes).or_else(|_| legacy::decode(bytes))?
+            serde_json::from_reader(bytes.reader()).or_else(|_| legacy::decode(bytes.reader()))?
         };
         snapshot.validate().context("decode actor SQLite commit")?;
         Ok(snapshot)
     }
 
     // Object names keep their .json suffix, which every reader parses, for binary content too.
-    pub fn encode(&self) -> Result<bytes::Bytes> {
+    pub fn encode(&self) -> Result<Payload> {
         self.validate()?;
         let mut header = self.clone();
         let files = std::mem::take(&mut header.sqlite.files);

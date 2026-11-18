@@ -157,7 +157,7 @@ async fn commits_fields_and_sql_and_recovers_them_at_one_version() -> Result<()>
     assert_eq!(snapshots.len(), 4, "reads preserve the durable version");
     let decoded = snapshots
         .iter()
-        .map(|bytes| StateSnapshot::decode(bytes))
+        .map(StateSnapshot::decode)
         .collect::<Result<Vec<_>>>()?;
     let history = decoded
         .iter()
@@ -174,7 +174,7 @@ async fn commits_fields_and_sql_and_recovers_them_at_one_version() -> Result<()>
         endpoint,
         executor.clone(),
         Arc::new(FakeAuthority {
-            initial_state: Some((4, snapshots[3].clone().into())),
+            initial_state: Some((4, snapshots[3].clone())),
             history,
             ..Default::default()
         }),
@@ -1605,12 +1605,12 @@ async fn unreadable_cached_database_falls_back_to_history() -> Result<()> {
 #[derive(Default)]
 struct FakeAuthority {
     persisted: Option<Arc<FakeStateTransport>>,
-    history: std::collections::HashMap<String, bytes::Bytes>,
+    history: std::collections::HashMap<String, crate::payload::Payload>,
     fenced: std::sync::atomic::AtomicBool,
     loads: AtomicUsize,
     sqlite_reads: AtomicUsize,
-    initial_state: Option<(u64, bytes::Bytes)>,
-    activation_state: Option<bytes::Bytes>,
+    initial_state: Option<(u64, crate::payload::Payload)>,
+    activation_state: Option<crate::payload::Payload>,
     preparations: Mutex<Vec<u64>>,
     saved_database: Mutex<Option<tempfile::NamedTempFile>>,
 }
@@ -1626,15 +1626,13 @@ impl ActorStorage for FakeAuthority {
     }
 
     async fn acquire_actor(&self) -> Result<ActorActivation> {
+        let state = self.activation_state.clone().map(verified).transpose()?;
         Ok(ActorActivation {
             owner_epoch: 7,
-            state_version: self
-                .activation_state
+            state_version: state
                 .as_ref()
-                .map(|bytes| StateSnapshot::decode(bytes).map(|s| s.state_version))
-                .transpose()?
-                .unwrap_or(0),
-            state: self.activation_state.clone().map(Into::into),
+                .map_or(0, |snapshot| snapshot.reference.state_version),
+            state,
         })
     }
 
@@ -1642,32 +1640,35 @@ impl ActorStorage for FakeAuthority {
         anyhow::ensure!(!self.fenced.load(Ordering::SeqCst), "host lease expired");
         Ok(())
     }
-    async fn load_actor_state(&self, _: u64) -> Result<(u64, bytes::Bytes)> {
+    async fn load_actor_state(
+        &self,
+        _: u64,
+    ) -> Result<(u64, Option<crate::storage::VerifiedSnapshot>)> {
         self.loads.fetch_add(1, Ordering::SeqCst);
         if let Some(bytes) = self
             .persisted
             .as_ref()
             .and_then(|state| state.writes.lock().unwrap().last().cloned())
         {
-            return Ok((StateSnapshot::decode(&bytes)?.state_version, bytes.into()));
+            let snapshot = verified(bytes)?;
+            return Ok((snapshot.reference.state_version, Some(snapshot)));
         }
-        Ok(self.initial_state.clone().unwrap_or_default())
+        match self.initial_state.clone() {
+            Some((version, bytes)) => Ok((version, Some(verified(bytes)?))),
+            None => Ok((0, None)),
+        }
     }
     fn take_saved_database(&self, _digest: &str) -> Option<tempfile::NamedTempFile> {
         self.saved_database.lock().unwrap().take()
     }
-    async fn read_sqlite(&self, bytes: &bytes::Bytes) -> Result<crate::state_log::SqliteSnapshot> {
+    async fn read_sqlite(
+        &self,
+        snapshot: &crate::storage::VerifiedSnapshot,
+    ) -> Result<crate::state_log::SqliteSnapshot> {
         self.sqlite_reads.fetch_add(1, Ordering::SeqCst);
-        let snapshot = StateSnapshot::decode(bytes)?;
-        let object = crate::storage::snapshot_object_name(
-            &counter(),
-            snapshot.state_version,
-            &format!("{:032x}", snapshot.owner_epoch),
-        )?;
         Ok(crate::bucket::recovery::resolve(
             &mut FakeHistory(&self.history),
-            &object,
-            bytes.clone(),
+            snapshot.clone(),
             None,
         )
         .await?
@@ -1695,18 +1696,27 @@ impl ActorStorage for FakeAuthority {
     }
 }
 
-struct FakeHistory<'a>(&'a std::collections::HashMap<String, bytes::Bytes>);
+fn verified(bytes: crate::payload::Payload) -> Result<crate::storage::VerifiedSnapshot> {
+    let snapshot = StateSnapshot::decode(&bytes)?;
+    let object = crate::storage::snapshot_object_name(
+        &counter(),
+        snapshot.state_version,
+        &format!("{:032x}", snapshot.owner_epoch),
+    )?;
+    crate::storage::VerifiedSnapshot::named(object, bytes)
+}
+
+struct FakeHistory<'a>(&'a std::collections::HashMap<String, crate::payload::Payload>);
 
 #[async_trait]
 impl crate::bucket::recovery::SnapshotHistory for FakeHistory<'_> {
-    async fn read(&mut self, object: &str) -> Result<bytes::Bytes> {
+    async fn read(&mut self, object: &str) -> Result<crate::payload::Payload> {
         self.0
             .get(object)
             .cloned()
-            .map(Into::into)
             .ok_or_else(|| anyhow::anyhow!("missing snapshot dependency"))
     }
-    async fn checkpoint(&mut self, _: &str) -> Result<Option<bytes::Bytes>> {
+    async fn checkpoint(&mut self, _: &str) -> Result<Option<crate::payload::Payload>> {
         Ok(None)
     }
 }
@@ -1714,13 +1724,17 @@ impl crate::bucket::recovery::SnapshotHistory for FakeHistory<'_> {
 #[derive(Default)]
 struct FakeStateTransport {
     failures: AtomicUsize,
-    writes: Mutex<Vec<bytes::Bytes>>,
+    writes: Mutex<Vec<crate::payload::Payload>>,
     paused_commit: Option<(mpsc::UnboundedSender<()>, Arc<tokio::sync::Semaphore>)>,
 }
 
 #[async_trait]
 impl crate::state_transport::SnapshotWriter for FakeStateTransport {
-    async fn write_snapshot(&self, _ticket: &WritePlan, bytes: bytes::Bytes) -> Result<StateWrite> {
+    async fn write_snapshot(
+        &self,
+        _ticket: &WritePlan,
+        bytes: crate::payload::Payload,
+    ) -> Result<StateWrite> {
         if StateSnapshot::decode(&bytes)?.request_id == "first"
             && let Some((started, release)) = &self.paused_commit
         {
@@ -1754,7 +1768,7 @@ async fn cold_actors_load_the_current_head_instead_of_a_cached_route_snapshot() 
     )?
     .encode()?;
     let authority = Arc::new(FakeAuthority {
-        initial_state: Some((8, snapshot.into())),
+        initial_state: Some((8, snapshot)),
         ..Default::default()
     });
     let state = Arc::new(FakeStateTransport::default());
@@ -1806,7 +1820,7 @@ async fn read_only_results_are_withheld_if_the_lease_expires_during_execution() 
     )?
     .encode()?;
     let authority = Arc::new(FakeAuthority {
-        initial_state: Some((8, snapshot.into())),
+        initial_state: Some((8, snapshot)),
         ..Default::default()
     });
     let state = Arc::new(FakeStateTransport::default());
@@ -1961,7 +1975,7 @@ async fn resident_actor_uses_immutable_snapshots_and_replays_the_last_request() 
         .lock()
         .unwrap()
         .iter()
-        .map(|bytes| StateSnapshot::decode(bytes))
+        .map(StateSnapshot::decode)
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(snapshots[0].state_version, 1);
     assert_eq!(snapshots[1].state_version, 2);
@@ -2298,7 +2312,7 @@ async fn immediate_writes_wait_for_durability_and_share_atomic_versions() -> Res
         .lock()
         .unwrap()
         .iter()
-        .map(|bytes| StateSnapshot::decode(bytes))
+        .map(StateSnapshot::decode)
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(
         snapshots
@@ -2387,7 +2401,7 @@ async fn sql_transactions_publish_once_on_commit_and_never_on_rollback() -> Resu
         .lock()
         .unwrap()
         .iter()
-        .map(|bytes| StateSnapshot::decode(bytes))
+        .map(StateSnapshot::decode)
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|snapshot| snapshot.completion.is_none())
@@ -2503,7 +2517,7 @@ async fn delayed_interleaved_completion_cannot_rewind_an_immediate_write() -> Re
         .lock()
         .unwrap()
         .iter()
-        .map(|bytes| StateSnapshot::decode(bytes))
+        .map(StateSnapshot::decode)
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(snapshots.len(), 2);
     assert_eq!(snapshots[0].request_id, "newer");
@@ -2585,7 +2599,7 @@ async fn background_database_writes_outlive_invocations() -> Result<()> {
         .lock()
         .unwrap()
         .iter()
-        .map(|bytes| StateSnapshot::decode(bytes))
+        .map(StateSnapshot::decode)
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|snapshot| snapshot.request_id == "background")

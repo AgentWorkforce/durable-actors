@@ -23,10 +23,19 @@ async fn bulk_transfers_do_not_block_ownership_reads_and_updates() -> Result<()>
         .bind("test-bucket", TestCredentials::new("owner").into())?;
     let _bulk = bucket.clients.transfers.acquire_many(2).await?;
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        assert_eq!(bucket.get("owner").await?.unwrap().bytes.as_ref(), b"lease");
+        assert_eq!(
+            bucket
+                .get("owner")
+                .await?
+                .unwrap()
+                .bytes
+                .to_bytes()?
+                .as_ref(),
+            b"lease"
+        );
         assert!(
             bucket
-                .compare_and_swap("owner", None, bytes::Bytes::from_static(b"lease"))
+                .compare_and_swap("owner", None, bytes::Bytes::from_static(b"lease").into())
                 .await?
         );
         anyhow::Ok(())
@@ -42,7 +51,16 @@ async fn warmed_connections_keep_credentials_isolated_and_refreshable() -> Resul
     warm.preconnect().await;
     let token = TestCredentials::new("first");
     let first = warm.bind("test-bucket", token.clone().into())?;
-    assert_eq!(first.get("owner").await?.unwrap().bytes.as_ref(), b"lease");
+    assert_eq!(
+        first
+            .get("owner")
+            .await?
+            .unwrap()
+            .bytes
+            .to_bytes()?
+            .as_ref(),
+        b"lease"
+    );
 
     let warm = server.client().await?;
     warm.preconnect().await;
@@ -51,7 +69,7 @@ async fn warmed_connections_keep_credentials_isolated_and_refreshable() -> Resul
     *token.0.lock().unwrap() = "refreshed".into();
     assert!(
         first
-            .compare_and_swap("owner", None, bytes::Bytes::from_static(b"lease"))
+            .compare_and_swap("owner", None, bytes::Bytes::from_static(b"lease").into())
             .await?
     );
 
@@ -141,7 +159,7 @@ async fn stalled_warmup_is_bounded_and_can_be_cancelled_for_assignment() -> Resu
     let bucket = warm.bind("test-bucket", TestCredentials::new("assigned").into())?;
     let result =
         tokio::time::timeout(std::time::Duration::from_secs(2), bucket.get("owner")).await??;
-    assert_eq!(result.unwrap().bytes.as_ref(), b"lease");
+    assert_eq!(result.unwrap().bytes.to_bytes()?.as_ref(), b"lease");
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests[0].1, None);
     assert_eq!(requests[1].1, None);
@@ -288,12 +306,12 @@ async fn gcs_adapter_preserves_generation_conditions_and_pagination() -> Result<
     let key = "runtime/lease.json";
     let object = bucket.get(key).await.context("read object")?.unwrap();
     assert_eq!(object.generation, 42);
-    assert_eq!(object.bytes.as_ref(), b"lease");
+    assert_eq!(object.bytes.to_bytes()?.as_ref(), b"lease");
     assert!(bucket.get("missing").await?.is_none());
     assert!(bucket.get("forbidden").await.is_err());
     assert!(
         bucket
-            .compare_and_swap(key, None, bytes::Bytes::from_static(b"lease"))
+            .compare_and_swap(key, None, bytes::Bytes::from_static(b"lease").into())
             .await
             .context("create object")?
     );
@@ -302,19 +320,19 @@ async fn gcs_adapter_preserves_generation_conditions_and_pagination() -> Result<
             .compare_and_swap(
                 key,
                 Some(object.generation),
-                bytes::Bytes::from_static(b"lease")
+                bytes::Bytes::from_static(b"lease").into()
             )
             .await
             .context("replace object")?
     );
     assert!(
         !bucket
-            .compare_and_swap(key, Some(41), bytes::Bytes::from_static(b"lease"))
+            .compare_and_swap(key, Some(41), bytes::Bytes::from_static(b"lease").into())
             .await?
     );
     assert!(
         bucket
-            .compare_and_swap(key, Some(43), bytes::Bytes::from_static(b"lease"))
+            .compare_and_swap(key, Some(43), bytes::Bytes::from_static(b"lease").into())
             .await
             .is_err()
     );
@@ -345,7 +363,7 @@ async fn object_writes_declare_crc32c_so_gcs_rejects_corruption() -> Result<()> 
     assert!(
         test_bucket(&endpoint)
             .await?
-            .compare_and_swap("runtime/lease.json", None, payload.clone())
+            .compare_and_swap("runtime/lease.json", None, payload.clone().into())
             .await?
     );
     let declared = format!(

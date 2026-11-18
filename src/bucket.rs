@@ -12,6 +12,7 @@ mod runtime;
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub use crate::payload::Payload;
 pub use file::FileBucket;
 pub use gcs::GcsBucket;
 pub(crate) use gcs::WarmStorage;
@@ -21,7 +22,7 @@ pub use runtime::{LoadedActor, OwnershipHint, RuntimeStorage, RuntimeStorageRead
 #[derive(Clone, Debug)]
 pub struct BucketObject {
     pub generation: i64,
-    pub bytes: bytes::Bytes,
+    pub bytes: Payload,
 }
 
 #[async_trait]
@@ -32,7 +33,7 @@ pub trait Bucket: Send + Sync {
         &self,
         key: &str,
         generation: Option<i64>,
-        bytes: bytes::Bytes,
+        bytes: Payload,
     ) -> Result<bool>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -41,7 +42,7 @@ pub(crate) async fn replace(
     bucket: &dyn Bucket,
     key: &str,
     generation: Option<i64>,
-    bytes: bytes::Bytes,
+    bytes: Payload,
 ) -> Result<bool> {
     match bucket
         .compare_and_swap(key, generation, bytes.clone())

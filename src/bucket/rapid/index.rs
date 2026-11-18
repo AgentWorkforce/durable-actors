@@ -39,7 +39,7 @@ impl LogStorage {
         &self,
         object: &str,
         first: u64,
-    ) -> Result<Option<BTreeMap<String, Bytes>>> {
+    ) -> Result<Option<BTreeMap<String, Payload>>> {
         let Some(record) = self.live_range(object, first) else {
             return Ok(None);
         };
@@ -96,7 +96,7 @@ impl LogStorage {
         object: &str,
         first: u64,
         keys: &[String],
-    ) -> Option<BTreeMap<String, Bytes>> {
+    ) -> Option<BTreeMap<String, Payload>> {
         match self.read_indexed(object, first, keys).await {
             Ok(records) => records,
             Err(error) => {
@@ -111,7 +111,7 @@ impl LogStorage {
         object: &str,
         first: u64,
         keys: &[String],
-    ) -> Result<Option<BTreeMap<String, Bytes>>> {
+    ) -> Result<Option<BTreeMap<String, Payload>>> {
         let version =
             super::super::snapshots::version(object).context("invalid snapshot version")?;
         let (prefix, _) = object.rsplit_once('/').context("invalid snapshot object")?;
@@ -125,7 +125,7 @@ impl LogStorage {
                 .get(key)
                 .await?
                 .context("archive index missing")?;
-            let index: Index = serde_json::from_slice(&stored.bytes)?;
+            let index: Index = serde_json::from_reader(stored.bytes.reader())?;
             index.validate(&format!("{physical}log~{segment}~"))?;
             let (start, length) = index.range(first, version, self.batch.bytes as u64)?;
             let bytes = self
@@ -151,7 +151,7 @@ impl LogStorage {
         &self,
         manifest: &Manifest,
         batch: String,
-        bytes: &Bytes,
+        bytes: &Payload,
     ) -> Result<()> {
         let mut start = 0;
         let mut entries = Vec::new();
@@ -273,7 +273,7 @@ impl Index {
     }
 }
 
-fn decode_records(prefix: &str, bytes: Bytes) -> Result<BTreeMap<String, Bytes>> {
+fn decode_records(prefix: &str, bytes: Payload) -> Result<BTreeMap<String, Payload>> {
     let mut length = 0;
     let mut records = BTreeMap::new();
     for record in frame::decode(&bytes)? {

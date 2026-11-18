@@ -1,5 +1,6 @@
 use super::*;
 use crate::bucket::{ArchiveBatchConfig, BucketObject};
+use crate::storage::VerifiedSnapshot;
 
 struct ArchiveBucket {
     inner: Arc<FileBucket>,
@@ -54,7 +55,7 @@ impl Bucket for ArchiveBucket {
         &self,
         key: &str,
         generation: Option<i64>,
-        bytes: bytes::Bytes,
+        bytes: Payload,
     ) -> Result<bool> {
         if key.ends_with(".checkpoint") {
             self.checkpoint_attempts.fetch_add(1, Ordering::SeqCst);
@@ -138,7 +139,10 @@ async fn live_checkpoint_inputs_are_read_as_one_bounded_range() -> Result<()> {
     let (writer, _) = controlled(&f, 16 * 1024 * 1024, 60_000)?;
     let (replication, history) = write_history(&f, &writer, 31).await?;
     let sqlite = writer
-        .restore_prefetched(&f.stream.object(31), history[30].clone(), None)
+        .restore_prefetched(
+            VerifiedSnapshot::named(f.stream.object(31), history[30].clone())?,
+            None,
+        )
         .await?;
     assert_eq!(
         crate::litestream::storage::restored_fields(
@@ -187,14 +191,20 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
 
     let (reader, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
     let sqlite = reader
-        .restore_prefetched(&f.stream.object(35), history[34].clone(), None)
+        .restore_prefetched(
+            VerifiedSnapshot::named(f.stream.object(35), history[34].clone())?,
+            None,
+        )
         .await?;
     assert_eq!(archive.read_requests.load(Ordering::SeqCst), 1);
     let source = f.stream.snapshot(&history[34])?;
     let prefetched = reader.prefetch_checkpoint(&source).await?;
     let requests = archive.read_requests.load(Ordering::SeqCst);
     let prepared = reader
-        .restore_prefetched(&source.object, history[34].clone(), prefetched)
+        .restore_prefetched(
+            VerifiedSnapshot::matching(source.clone(), history[34].clone())?,
+            prefetched,
+        )
         .await?;
     assert_eq!(archive.read_requests.load(Ordering::SeqCst), requests);
     assert_eq!(prepared.txid, sqlite.txid);
@@ -212,7 +222,10 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     corrupt.bytes = Some(checkpoint.encode()?);
     assert!(
         reader
-            .restore_prefetched(&source.object, history[34].clone(), Some(corrupt))
+            .restore_prefetched(
+                VerifiedSnapshot::matching(source.clone(), history[34].clone())?,
+                Some(corrupt),
+            )
             .await
             .is_err()
     );
@@ -247,7 +260,10 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     archive.read_batches.store(0, Ordering::SeqCst);
     archive.range_bytes.store(0, Ordering::SeqCst);
     let tail = reader
-        .restore_prefetched(&f.stream.object(34), history[33].clone(), None)
+        .restore_prefetched(
+            VerifiedSnapshot::named(f.stream.object(34), history[33].clone())?,
+            None,
+        )
         .await?;
     assert_eq!(tail.files.len(), 3);
     assert_eq!(archive.read_batches.load(Ordering::SeqCst), 1);
@@ -261,7 +277,10 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     );
     archive.read_batches.store(0, Ordering::SeqCst);
     let older = reader
-        .restore_prefetched(&f.stream.object(31), history[30].clone(), None)
+        .restore_prefetched(
+            VerifiedSnapshot::named(f.stream.object(31), history[30].clone())?,
+            None,
+        )
         .await?;
     assert_eq!(
         restored_fields(replication.as_ref(), &older.files, older.txid).await?,
@@ -301,7 +320,10 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     );
     assert!(
         reader
-            .restore_prefetched(&f.stream.object(35), history[34].clone(), None)
+            .restore_prefetched(
+                VerifiedSnapshot::named(f.stream.object(35), history[34].clone())?,
+                None
+            )
             .await
             .is_err()
     );
@@ -329,7 +351,10 @@ async fn failed_checkpoint_publication_keeps_committed_state_recoverable() -> Re
             Some(history[1].clone())
         );
         let sqlite = reader
-            .restore_prefetched(&f.stream.object(2), history[1].clone(), None)
+            .restore_prefetched(
+                VerifiedSnapshot::named(f.stream.object(2), history[1].clone())?,
+                None,
+            )
             .await?;
         assert_eq!(
             crate::litestream::storage::restored_fields(
@@ -373,7 +398,10 @@ async fn resumed_checkpoint_retries_without_new_writes() -> Result<()> {
     };
     resumed.start(&stream).await?;
     resumed
-        .restore_prefetched(&f.stream.object(33), history[32].clone(), None)
+        .restore_prefetched(
+            VerifiedSnapshot::named(f.stream.object(33), history[32].clone())?,
+            None,
+        )
         .await?;
     tokio::time::timeout(Duration::from_secs(2), async {
         while archive.checkpoint_attempts.load(Ordering::SeqCst) == 0 {
@@ -404,7 +432,7 @@ async fn write_history(
     f: &Fixture,
     writer: &RapidSnapshots,
     count: u64,
-) -> Result<(Arc<crate::litestream::Litestream>, Vec<Bytes>)> {
+) -> Result<(Arc<crate::litestream::Litestream>, Vec<Payload>)> {
     use crate::litestream::{Litestream, Replicator, storage::SqliteCapture};
     writer.start(&f.stream).await?;
     let replication = Arc::new(Litestream::default());
@@ -431,7 +459,7 @@ async fn write_history(
             },
             serde_json::json!(version),
         )?;
-        let bytes: Bytes = snapshot.encode()?.into();
+        let bytes = snapshot.encode()?;
         writer.put(&f.stream.object(version), bytes.clone()).await?;
         parent = Some(f.stream.snapshot(&bytes)?);
         history.push(bytes);
@@ -453,7 +481,7 @@ async fn byte_threshold_combines_commits_without_rotating_rapid_streams() -> Res
     assert_eq!(archive.batches.load(Ordering::SeqCst), 0);
     store.put(&f.stream.object(2), state(2, 1)?).await?;
     let keys = batches(&f, 1).await?;
-    let bytes = f.archive.get(&keys[0]).await?.unwrap().bytes.into();
+    let bytes = f.archive.get(&keys[0]).await?.unwrap().bytes;
     assert_eq!(frame::decode(&bytes)?.len(), 2);
     assert_eq!(archive.batches.load(Ordering::SeqCst), 1);
     assert!(f.zones.iter().all(|z| z.opens.load(Ordering::SeqCst) == 1));
@@ -483,7 +511,7 @@ async fn failed_partial_batch_retries_without_another_write() -> Result<()> {
     store.start(&f.stream).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     let keys = batches(&f, 1).await?;
-    let bytes = f.archive.get(&keys[0]).await?.unwrap().bytes.into();
+    let bytes = f.archive.get(&keys[0]).await?.unwrap().bytes;
     let records = frame::decode(&bytes)?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].state, state(1, 1)?);
@@ -616,7 +644,7 @@ async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> 
         },
         serde_json::json!(1),
     )?;
-    let first_bytes: Bytes = first.encode()?.into();
+    let first_bytes = first.encode()?;
     db.execute_batch("UPDATE __terse_fields SET value='2'; INSERT INTO entries VALUES (2);")?;
     let txid = replication.sync(&capture.path()).await?;
     let second = StateSnapshot::new(
@@ -625,13 +653,13 @@ async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> 
         "second".into(),
         SqliteSnapshot {
             txid,
-            parent: Some(SnapshotRef::new(f.stream.object(1), &first, &first_bytes)),
+            parent: Some(SnapshotRef::new(f.stream.object(1), &first, &first_bytes)?),
             files: capture.capture(txid).await?,
         },
         serde_json::json!(2),
     )?;
     assert!(second.sqlite.files[0].first > 1);
-    let second_bytes: Bytes = second.encode()?.into();
+    let second_bytes = second.encode()?;
     let (store, archive) = controlled(&f, first_bytes.len() + frame::HEADER, 60_000)?;
     store.start(&f.stream).await?;
     store.put(&f.stream.object(1), first_bytes).await?;
@@ -753,15 +781,17 @@ async fn conflicting_batches_never_allow_recovery_to_delete_rapid_data() -> Resu
         .into_iter()
         .find(|k| k.ends_with(".manifest"))
         .unwrap();
-    let manifest: Manifest = serde_json::from_slice(&f.archive.get(&key).await?.unwrap().bytes)?;
+    let manifest: Manifest =
+        serde_json::from_slice(&f.archive.get(&key).await?.unwrap().bytes.to_bytes()?)?;
     let mut snapshot = StateSnapshot::decode(&original)?;
     snapshot.completion.as_mut().unwrap().result = serde_json::json!(9).into();
-    let frame = Record {
+    let mut frame = Vec::new();
+    Record {
         version: 1,
-        state: snapshot.encode()?.into(),
+        state: snapshot.encode()?,
     }
-    .encode()?;
-    store.storage.put_batch(&manifest, 0, frame).await?;
+    .write_to(&mut frame)?;
+    store.storage.put_batch(&manifest, 0, frame.into()).await?;
     assert!(f.store()?.recover(&f.stream.prefix).await.is_err());
     assert!(
         f.zones
@@ -901,10 +931,10 @@ async fn unavailable_or_invalid_indexes_preserve_archive_recovery() -> Result<()
         .find(|key| key.ends_with(".idx"))
         .unwrap();
     let original = f.archive.get(&key).await?.unwrap();
-    let mut wrong: serde_json::Value = serde_json::from_slice(&original.bytes)?;
+    let mut wrong: serde_json::Value = serde_json::from_slice(&original.bytes.to_bytes()?)?;
     wrong["records"][1]["start"] = 1.into();
     for bytes in [
-        Bytes::from_static(b"invalid json"),
+        Payload::from(&b"invalid json"[..]),
         serde_json::to_vec(&wrong)?.into(),
     ] {
         let stored = f.archive.get(&key).await?.unwrap();

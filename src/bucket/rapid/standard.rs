@@ -11,19 +11,19 @@ impl GcsSnapshots {
 
 #[async_trait]
 impl SnapshotStore for GcsSnapshots {
-    async fn put(&self, object: &str, bytes: Bytes) -> Result<()> {
+    async fn put(&self, object: &str, bytes: Payload) -> Result<()> {
         ensure!(
             replace(&self.0, &object_name(object)?, None, bytes).await?,
             "conflicting immutable checkpoint"
         );
         Ok(())
     }
-    async fn get(&self, object: &str) -> Result<Option<Bytes>> {
+    async fn get(&self, object: &str) -> Result<Option<Payload>> {
         Ok(self
             .0
             .get(&object_name(object)?)
             .await?
-            .map(|copy| copy.bytes.into()))
+            .map(|copy| copy.bytes))
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let physical = object_name(prefix)?;
@@ -39,7 +39,7 @@ impl SnapshotStore for GcsSnapshots {
             })
             .collect()
     }
-    async fn latest(&self, prefix: &str) -> Result<Option<(String, Bytes)>> {
+    async fn latest(&self, prefix: &str) -> Result<Option<(String, Payload)>> {
         let key = self
             .list(prefix)
             .await?

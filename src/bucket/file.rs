@@ -59,7 +59,7 @@ impl Bucket for FileBucket {
         &self,
         key: &str,
         expected: Option<i64>,
-        bytes: bytes::Bytes,
+        bytes: crate::payload::Payload,
     ) -> Result<bool> {
         let key = key.to_owned();
         self.run(move |directory| {
@@ -77,7 +77,7 @@ impl Bucket for FileBucket {
                 .context("bucket generation overflow")?;
             let mut replacement = AtomicWriteFile::open(&path)?;
             replacement.write_all(&next.to_be_bytes())?;
-            replacement.write_all(&bytes)?;
+            bytes.write_to(&mut replacement)?;
             replacement.commit()?;
             Ok(true)
         })

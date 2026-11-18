@@ -7,6 +7,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+// Compaction reads every input at once, so their buffers share one budget.
+const READ_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const MIN_READ_BYTES: usize = 8 * 1024;
+
 #[async_trait]
 pub(crate) trait LtxCompactor: Send + Sync {
     async fn compact(&self, files: &[LtxFile]) -> Result<LtxFile>;
@@ -27,11 +31,13 @@ impl LtxCompactor for RustCompactor {
 fn compact(files: Vec<LtxFile>, cancel: CancellationToken) -> Result<LtxFile> {
     let last = files.last().context("empty checkpoint")?.last;
     let deadline = Instant::now() + Duration::from_secs(120);
+    let capacity =
+        (READ_BUDGET_BYTES / files.len()).clamp(MIN_READ_BYTES, crate::payload::BUFFER_BYTES);
     let readers = files
         .into_iter()
         .map(|file| {
             Ok(CompactionInput {
-                reader: std::io::Cursor::new(file.data),
+                reader: file.data.reader_with_capacity(capacity),
                 cancel: cancel.clone(),
                 deadline,
             })
@@ -52,7 +58,7 @@ fn compact(files: Vec<LtxFile>, cancel: CancellationToken) -> Result<LtxFile> {
 }
 
 struct CompactionInput {
-    reader: std::io::Cursor<bytes::Bytes>,
+    reader: io::BufReader<crate::payload::PayloadReader>,
     cancel: CancellationToken,
     deadline: Instant,
 }

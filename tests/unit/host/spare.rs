@@ -175,7 +175,7 @@ async fn run_activation(
             "failed activation reported ready"
         );
         let record: serde_json::Value =
-            serde_json::from_slice(&bucket.get(&owner).await?.unwrap().bytes)?;
+            serde_json::from_slice(&bucket.get(&owner).await?.unwrap().bytes.to_bytes()?)?;
         assert_eq!(
             record["lease"]["expires_at_ms"], 0,
             "failed startup must release its lease"

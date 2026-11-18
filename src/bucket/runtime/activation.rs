@@ -5,7 +5,7 @@ use crate::host_leases::HostLeaseRequest;
 
 #[derive(Default)]
 struct ActivationRecovery {
-    snapshot: Option<LoadedSnapshot>,
+    snapshot: Option<VerifiedSnapshot>,
     checkpoint: Option<super::super::recovery::PrefetchedCheckpoint>,
     checkpoint_ms: Option<f64>,
     session_ms: Option<f64>,
@@ -17,7 +17,7 @@ pub(crate) struct CachedBase {
     /// The base's SQLite database: its checkpoint is left for SQLite recovery to fetch.
     pub database: bool,
     /// The base snapshot, used only when it matches the digest the ownership record names.
-    pub snapshot: Option<Bytes>,
+    pub snapshot: Option<Payload>,
 }
 
 impl RuntimeStorage {
@@ -318,7 +318,7 @@ impl RuntimeStorage {
             .snapshots
             .recover(&record.stream()?.prefix)
             .await?
-            .map(|(key, bytes)| decode_snapshot(key, bytes))
+            .map(|(key, bytes)| VerifiedSnapshot::named(key, bytes))
             .transpose()?;
         let snapshot = self.load_latest(record, recovered).await?;
         Ok(ActivationRecovery {
@@ -331,7 +331,7 @@ impl RuntimeStorage {
     async fn recover_sealed_activation(
         &self,
         record: &Ownership,
-        cached: Option<&Bytes>,
+        cached: Option<&Payload>,
     ) -> Result<ActivationRecovery> {
         let snapshot = self.load_activation_snapshot(record, cached);
         let checkpoint = self.prefetch_activation_checkpoint(record);
@@ -339,10 +339,10 @@ impl RuntimeStorage {
         let (mut recovery, (checkpoint, checkpoint_ms)) = tokio::select! {
             result = &mut snapshot => {
                 let recovery = result?;
-                let needs_checkpoint = match &recovery.snapshot {
-                    Some(snapshot) => crate::state_log::StateSnapshot::decode(&snapshot.bytes)?.sqlite.parent.is_some(),
-                    None => false,
-                };
+                let needs_checkpoint = recovery
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.snapshot.sqlite.parent.is_some());
                 if !needs_checkpoint {
                     return Ok(recovery);
                 }
@@ -358,17 +358,12 @@ impl RuntimeStorage {
     async fn load_activation_snapshot(
         &self,
         record: &Ownership,
-        cached: Option<&Bytes>,
+        cached: Option<&Payload>,
     ) -> Result<ActivationRecovery> {
         let started = Instant::now();
-        let cached = record
-            .base
-            .as_ref()
-            .zip(cached)
-            .filter(|(base, bytes)| base.verify(bytes).is_ok())
-            .map(|(base, bytes)| LoadedSnapshot {
-                reference: base.clone(),
-                bytes: bytes.clone(),
+        let cached =
+            record.base.as_ref().zip(cached).and_then(|(base, bytes)| {
+                VerifiedSnapshot::matching(base.clone(), bytes.clone()).ok()
             });
         let snapshot = self.load_latest(record, cached).await?;
         Ok(ActivationRecovery {

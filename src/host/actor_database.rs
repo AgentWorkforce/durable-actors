@@ -7,11 +7,10 @@ use crate::{
     litestream::Replicator,
     request_tracking::{RequestStage, RequestTracker},
     state_log::SqliteSnapshot,
-    storage::WritePlan,
+    storage::{VerifiedSnapshot, WritePlan},
 };
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use bytes::Bytes;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -29,8 +28,8 @@ use session::DatabaseSession;
 #[async_trait]
 pub(crate) trait ActorStorage: Send + Sync {
     async fn acquire_actor(&self) -> Result<ActorActivation>;
-    async fn load_actor_state(&self, epoch: u64) -> Result<(u64, bytes::Bytes)>;
-    async fn read_sqlite(&self, bytes: &Bytes) -> Result<SqliteSnapshot>;
+    async fn load_actor_state(&self, epoch: u64) -> Result<(u64, Option<VerifiedSnapshot>)>;
+    async fn read_sqlite(&self, snapshot: &VerifiedSnapshot) -> Result<SqliteSnapshot>;
     async fn get_alarm(&self) -> Result<Option<i64>>;
     async fn update_alarm(&self, timestamp_ms: Option<i64>) -> Result<()>;
     fn ensure_authority(&self) -> Result<()>;
@@ -47,8 +46,7 @@ pub(crate) trait ActorStorage: Send + Sync {
     /// across activations; `None` starts a new history with a full copy.
     fn resume_parent(
         &self,
-        _snapshot: &crate::state_log::StateSnapshot,
-        _bytes: &[u8],
+        _snapshot: &VerifiedSnapshot,
     ) -> Result<Option<crate::storage::SnapshotRef>> {
         Ok(None)
     }
@@ -61,7 +59,7 @@ pub(crate) trait ActorStorage: Send + Sync {
 pub(crate) struct ActorActivation {
     pub owner_epoch: u64,
     pub state_version: u64,
-    pub state: Option<bytes::Bytes>,
+    pub state: Option<VerifiedSnapshot>,
 }
 
 #[derive(Clone, Default)]

@@ -27,7 +27,7 @@ struct Pending {
     version: u64,
     since: Option<Instant>,
     cache_start: u64,
-    cache: Vec<Bytes>,
+    cache: Vec<Frame>,
     cache_bytes: usize,
     closed: bool,
 }
@@ -66,7 +66,7 @@ impl Archiver {
         }
     }
 
-    pub fn append(&self, frame: Bytes, version: u64) {
+    pub fn append(&self, frame: Frame, version: u64) {
         let mut pending = self.pending.lock().unwrap();
         if pending.cache_start + pending.cache_bytes as u64 == pending.end
             && pending.cache_bytes < self.batch_bytes
@@ -167,7 +167,7 @@ async fn run(
     }
 }
 
-fn take_cache(pending: &StdMutex<Pending>, through: u64) -> Result<Option<Bytes>> {
+fn take_cache(pending: &StdMutex<Pending>, through: u64) -> Result<Option<Payload>> {
     let frames = {
         let mut p = pending.lock().unwrap();
         if p.cache_start != through || p.cache_bytes == 0 {
@@ -180,10 +180,9 @@ fn take_cache(pending: &StdMutex<Pending>, through: u64) -> Result<Option<Bytes>
         }
         std::mem::take(&mut p.cache)
     };
-    use std::io::Write;
     let mut spool = crate::payload::Spool::new();
     for frame in frames {
-        spool.write_all(&frame)?;
+        frame.write_to(&mut spool)?;
     }
     Ok(Some(spool.finish()?))
 }
@@ -193,7 +192,7 @@ async fn upload(
     manifest: &Manifest,
     start: u64,
     end: u64,
-    cached: Option<Bytes>,
+    cached: Option<Payload>,
 ) -> Result<u64> {
     let bytes = match cached {
         Some(bytes) => bytes,
@@ -237,10 +236,10 @@ async fn read_batch(
     manifest: &Manifest,
     start: u64,
     end: u64,
-) -> Result<Bytes> {
+) -> Result<Payload> {
     let requested = (end - start).min(storage.batch.bytes.max(frame::HEADER) as u64);
     let bytes = storage.read_range(manifest, start, requested).await?;
-    let length = frame::length(&bytes)? as u64;
+    let length = frame::length(&bytes.read(0..frame::HEADER.min(bytes.len()))?)? as u64;
     if length <= requested {
         return Ok(bytes);
     }
@@ -250,13 +249,13 @@ async fn read_batch(
         .await?;
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
-        crate::payload::copy(bytes.as_ref().chain(tail.as_ref()))
+        crate::payload::copy(bytes.reader().chain(tail.reader()))
     })
     .await?
 }
 
 impl LogStorage {
-    pub async fn put_batch(&self, manifest: &Manifest, start: u64, bytes: Bytes) -> Result<()> {
+    pub async fn put_batch(&self, manifest: &Manifest, start: u64, bytes: Payload) -> Result<()> {
         let end = start
             .checked_add(bytes.len() as u64)
             .context("batch offset overflow")?;
@@ -280,7 +279,12 @@ impl LogStorage {
         Ok(())
     }
 
-    pub async fn read_range(&self, manifest: &Manifest, start: u64, length: u64) -> Result<Bytes> {
+    pub async fn read_range(
+        &self,
+        manifest: &Manifest,
+        start: u64,
+        length: u64,
+    ) -> Result<Payload> {
         for replica in &manifest.replicas {
             match bounded(self.zone(replica)?.read_range(replica, start, length)).await {
                 Ok(bytes) => return Ok(bytes),

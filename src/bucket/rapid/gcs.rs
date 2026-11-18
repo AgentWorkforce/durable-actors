@@ -1,5 +1,6 @@
 use super::*;
 use crate::bucket::{GcsBucket, SnapshotStoreConfig, gcs::GcsClients};
+use futures_util::TryStreamExt;
 use google_cloud_storage::{
     appendable_object_writer::AppendableObjectWriter, model_ext::ReadRange,
 };
@@ -113,7 +114,7 @@ impl LogZone for GcsZone {
         Ok((replica, Box::new(GcsWriter(writer))))
     }
 
-    async fn read(&self, replica: &Replica, fence: bool) -> Result<Bytes> {
+    async fn read(&self, replica: &Replica, fence: bool) -> Result<Payload> {
         let _transfer = self.clients.transfers.acquire().await?;
         let mut writer = if fence {
             Some(
@@ -132,7 +133,7 @@ impl LogZone for GcsZone {
             None
         };
         if persisted == Some(0) {
-            return Ok(Bytes::new());
+            return Ok(Payload::default());
         }
         let descriptor = self
             .clients
@@ -144,7 +145,7 @@ impl LogZone for GcsZone {
         let size = descriptor.object().size;
         ensure!(size >= 0, "invalid log segment size");
         if size == 0 {
-            return Ok(Bytes::new());
+            return Ok(Payload::default());
         }
         let mut reader = descriptor
             .read_range(ReadRange::segment(0, size as u64))
@@ -165,7 +166,7 @@ impl LogZone for GcsZone {
         download.finish().await
     }
 
-    async fn read_range(&self, replica: &Replica, start: u64, length: u64) -> Result<Bytes> {
+    async fn read_range(&self, replica: &Replica, start: u64, length: u64) -> Result<Payload> {
         let _transfer = self.clients.transfers.acquire().await?;
         let descriptor = self
             .clients
@@ -214,8 +215,12 @@ impl LogZone for GcsZone {
 
 #[async_trait]
 impl LogWriter for GcsWriter {
-    async fn append_and_flush(&mut self, bytes: Bytes) -> Result<u64> {
-        self.0.append(bytes).await?;
+    async fn append_and_flush(&mut self, header: Bytes, state: Payload) -> Result<u64> {
+        self.0.append(header).await?;
+        let mut chunks = std::pin::pin!(state.chunks());
+        while let Some(chunk) = chunks.try_next().await? {
+            self.0.append(chunk).await?;
+        }
         Ok(self.0.flush().await?.try_into()?)
     }
 }

@@ -1,8 +1,8 @@
 use super::recovery;
 use super::{Bucket, replace};
+use crate::payload::Payload;
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -146,7 +146,7 @@ impl SnapshotStoreConfig {
 
 #[async_trait]
 pub(crate) trait SnapshotStore: Send + Sync {
-    async fn get(&self, object: &str) -> Result<Option<Bytes>>;
+    async fn get(&self, object: &str) -> Result<Option<Payload>>;
     async fn prefetch_checkpoint(
         &self,
         _source: &crate::storage::SnapshotRef,
@@ -155,26 +155,22 @@ pub(crate) trait SnapshotStore: Send + Sync {
     }
     async fn restore_prefetched(
         &self,
-        object: &str,
-        bytes: Bytes,
+        snapshot: crate::storage::VerifiedSnapshot,
         checkpoint: Option<recovery::PrefetchedCheckpoint>,
     ) -> Result<crate::state_log::SqliteSnapshot> {
-        Ok(recovery::resolve(
-            &mut recovery::StoredHistory(self),
-            object,
-            bytes,
-            checkpoint,
+        Ok(
+            recovery::resolve(&mut recovery::StoredHistory(self), snapshot, checkpoint)
+                .await?
+                .sqlite,
         )
-        .await?
-        .sqlite)
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
-    async fn latest(&self, prefix: &str) -> Result<Option<(String, Bytes)>>;
-    async fn put(&self, object: &str, bytes: Bytes) -> Result<()>;
+    async fn latest(&self, prefix: &str) -> Result<Option<(String, Payload)>>;
+    async fn put(&self, object: &str, bytes: Payload) -> Result<()>;
     async fn start(&self, _stream: &crate::storage::StateStream) -> Result<()> {
         Ok(())
     }
-    async fn recover(&self, prefix: &str) -> Result<Option<(String, Bytes)>> {
+    async fn recover(&self, prefix: &str) -> Result<Option<(String, Payload)>> {
         let latest = self.latest(prefix).await?;
         if let Some((object, bytes)) = &latest {
             self.put(object, bytes.clone()).await?;
@@ -194,19 +190,15 @@ pub(crate) struct BucketSnapshots(pub Arc<dyn Bucket>);
 
 #[async_trait]
 impl SnapshotStore for BucketSnapshots {
-    async fn get(&self, object: &str) -> Result<Option<Bytes>> {
-        Ok(self
-            .0
-            .get(object)
-            .await?
-            .map(|object| Bytes::from(object.bytes)))
+    async fn get(&self, object: &str) -> Result<Option<Payload>> {
+        Ok(self.0.get(object).await?.map(|object| object.bytes))
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.0.list(prefix).await
     }
 
-    async fn latest(&self, prefix: &str) -> Result<Option<(String, Bytes)>> {
+    async fn latest(&self, prefix: &str) -> Result<Option<(String, Payload)>> {
         let newest = self
             .list(prefix)
             .await?
@@ -220,7 +212,7 @@ impl SnapshotStore for BucketSnapshots {
         }
     }
 
-    async fn put(&self, object: &str, bytes: Bytes) -> Result<()> {
+    async fn put(&self, object: &str, bytes: Payload) -> Result<()> {
         ensure!(
             replace(self.0.as_ref(), object, None, bytes).await?,
             "conflicting immutable snapshot"
