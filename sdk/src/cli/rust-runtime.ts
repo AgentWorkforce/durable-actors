@@ -52,11 +52,15 @@ function startRustRuntime(
 }
 
 async function runtimeConnection(readiness: Readable, exited: Promise<number>): Promise<unknown> {
+    const connection = readJson(readiness)
     return Promise.race([
-        readJson(readiness),
-        exited.then(code => {
-            throw new Error(`Local actors exited before readiness (${code}).`)
-        })
+        connection,
+        // The exit event can arrive before the readiness pipe drains, so readiness written before exit still counts.
+        exited.then(code =>
+            connection.catch(() => {
+                throw new Error(`Local actors exited before readiness (${code}).`)
+            })
+        )
     ])
 }
 

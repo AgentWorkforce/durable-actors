@@ -560,12 +560,12 @@ test("regeneration replaces managed runtime files and preserves application file
     const { generateClient } = await import("../../../src/compiler/generators/client-generator.js")
     await generateClient({ version: 1, actors: [], typescript: declarations({}) }, directory)
     const runtime = path.join(directory, "runtime")
-    const files = await readdir(runtime)
+    const files = (await readdir(runtime)).sort()
     await writeFile(path.join(runtime, "stale.js"), "throw new Error('stale runtime')")
     await writeFile(path.join(runtime, "client.js"), "throw new Error('edited runtime')")
     await writeFile(path.join(directory, "backend.ts"), "export const application = true")
     await generateClient({ version: 1, actors: [], typescript: declarations({}) }, directory)
-    assert.deepEqual(await readdir(runtime), files)
+    assert.deepEqual((await readdir(runtime)).sort(), files)
     const consumer = path.join(directory, "consumer.ts")
     await writeFile(
         consumer,

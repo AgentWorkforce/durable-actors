@@ -204,7 +204,7 @@ test("a separate consumer generates identical clients from the deployed contract
         env: { ...env, DURABLE_ACTORS_CONTROL_PLANE_URL: "http://unreachable.invalid" }
     })
     const local = path.join(author, "generated")
-    const entries = await readdir(local, { recursive: true })
+    const entries = (await readdir(local, { recursive: true })).sort()
     const files = entries.filter(file => file !== "runtime")
     for (const file of ["index.js", "index.d.ts", "runtime/index.js", "runtime/index.d.ts"])
         assert.ok(files.includes(file), `missing ${file}`)
@@ -253,7 +253,7 @@ test("a separate consumer generates identical clients from the deployed contract
     assert.deepEqual(requests, ["/v1/projects/default/deployment/contract"])
     for (const [file, content] of expected)
         assert.equal(await readFile(path.join(directory, "generated", file), "utf8"), content)
-    assert.deepEqual(await readdir(path.join(directory, "generated"), { recursive: true }), entries)
+    assert.deepEqual((await readdir(path.join(directory, "generated"), { recursive: true })).sort(), entries)
     assert.match(result.stdout, /Generated 1 actor contract/)
     assert.match(result.stdout, /Type dependencies: private-data@1.0.0/)
 
