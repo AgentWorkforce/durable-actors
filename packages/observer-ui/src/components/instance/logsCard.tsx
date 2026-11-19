@@ -76,17 +76,23 @@ export function LogsCard({ actorName, actorId, requests, requestId, onRequestCha
             className="pb-3.5"
         >
             {requestId && <RequestChip requestId={requestId} call={calls.get(requestId)} onRemove={() => onRequestChange(null)} onClearFilters={clearFilters} />}
-            <LogChart histogram={logs.histogram} level={minimum} live={timeWindow.live} onZoom={span => setRange({ mode: "static", ...span })} />
-            <LogList
-                lines={logs.lines}
-                failed={logs.isError}
-                search={search}
-                filtered={Boolean(requestId || search || minimum)}
-                onFilterRequest={onRequestChange}
-                onClearFilters={clearFilters}
-                onReachEnd={logs.hasOlder && !logs.loadingOlder ? logs.loadOlder : undefined}
-                columns={columns}
-            />
+            {logs.isError ? (
+                <p className="py-4 text-[13px] text-muted-foreground">Couldn't reach the observer API.</p>
+            ) : (
+                <>
+                    <LogChart histogram={logs.histogram} level={minimum} live={timeWindow.live} onZoom={span => setRange({ mode: "static", ...span })} />
+                    <LogList
+                        lines={logs.lines}
+                        search={search}
+                        filtered={Boolean(requestId || search || minimum)}
+                        onFilterRequest={onRequestChange}
+                        onClearFilters={clearFilters}
+                        onReachEnd={logs.hasOlder && !logs.loadingOlder ? logs.loadOlder : undefined}
+                        loadingOlder={logs.loadingOlder}
+                        columns={columns}
+                    />
+                </>
+            )}
         </SectionCard>
     )
 }

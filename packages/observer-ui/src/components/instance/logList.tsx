@@ -31,19 +31,18 @@ const jsonToken = /("(?:\\.|[^"\\])*")(?=\s*:)\s*:|("(?:\\.|[^"\\])*")|-?\d+(?:\
 
 export type LogListProps = {
     lines: ActorLog[] | null
-    failed: boolean
     search: string
     filtered: boolean
     onFilterRequest: (requestId: string) => void
     onClearFilters: () => void
     onReachEnd: (() => void) | undefined
+    loadingOlder: boolean
     columns: LogColumns
 }
 
-export function LogList({ lines, failed, search, filtered, onFilterRequest, onClearFilters, onReachEnd, columns }: LogListProps) {
+export function LogList({ lines, search, filtered, onFilterRequest, onClearFilters, onReachEnd, loadingOlder, columns }: LogListProps) {
     const layout = layoutFor(columns)
     const [expansion, setExpansion] = useState<Expansion>({ all: false, toggled: new Set() })
-    if (failed) return <p className="py-6 text-[13px] text-muted-foreground">Couldn't reach the observer API.</p>
     if (!lines) return <ListSkeleton layout={layout} />
     if (!lines.length) return <EmptyList filtered={filtered} onClearFilters={onClearFilters} />
     const isExpanded = (logId: string) => expansion.all !== expansion.toggled.has(logId)
@@ -62,27 +61,26 @@ export function LogList({ lines, failed, search, filtered, onFilterRequest, onCl
                 if (onReachEnd && box.scrollHeight - box.scrollTop - box.clientHeight < loadAheadPx) onReachEnd()
             }}
         >
-            <div className={`${rowGrid} sticky top-0 z-[1] h-7.5 border-b bg-card px-2 text-xs text-muted-foreground`} style={{ gridTemplateColumns: layout.gridTemplateColumns }}>
-                <span>Time</span>
-                {columns.level && <span>Level</span>}
-                {columns.request && <span>Request</span>}
-                <span className="col-span-2 flex items-center justify-between">
-                    Message
-                    <button
-                        type="button"
-                        onClick={() => setExpansion({ all: !anyExpanded, toggled: new Set() })}
-                        className="flex items-center gap-1 rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                        {anyExpanded ? <ChevronsDownUp className="size-3.5" /> : <ChevronsUpDown className="size-3.5" />}
-                        {anyExpanded ? "Collapse all" : "Expand all"}
-                    </button>
-                </span>
-            </div>
+            <ListHeader layout={layout}>
+                <button
+                    type="button"
+                    onClick={() => setExpansion({ all: !anyExpanded, toggled: new Set() })}
+                    className="flex items-center gap-1 rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                    {anyExpanded ? <ChevronsDownUp className="size-3.5" /> : <ChevronsUpDown className="size-3.5" />}
+                    {anyExpanded ? "Collapse all" : "Expand all"}
+                </button>
+            </ListHeader>
             <ol>
                 {lines.map(line => (
                     <LogRow key={line.logId} line={line} layout={layout} expanded={isExpanded(line.logId)} onToggle={() => toggle(line.logId)} search={search} onFilterRequest={onFilterRequest} />
                 ))}
             </ol>
+            {loadingOlder && (
+                <div aria-hidden className="border-t border-border/55">
+                    <RowSkeletons layout={layout} rows={3} />
+                </div>
+            )}
         </div>
     )
 }
@@ -96,19 +94,38 @@ function layoutFor(columns: LogColumns): Layout {
     }
 }
 
-function ListSkeleton({ layout }: { layout: Layout }) {
+function ListHeader({ layout, children }: { layout: Layout; children?: ReactNode }) {
     return (
-        <div className="py-2">
-            {Array.from({ length: 6 }, (_, index) => (
-                <div key={index} className={`${rowGrid} h-8.5 px-2`} style={{ gridTemplateColumns: layout.gridTemplateColumns }}>
-                    <Skeleton className="h-3.5 w-20" />
-                    {layout.columns.level && <Skeleton className="h-4 w-11" />}
-                    {layout.columns.request && <Skeleton className="h-4 w-16" />}
-                    <Skeleton className="h-3.5" style={{ width: `${35 + ((index * 23) % 50)}%` }} />
-                </div>
-            ))}
+        <div className={`${rowGrid} sticky top-0 z-[1] h-7.5 border-b bg-card px-2 text-xs text-muted-foreground`} style={{ gridTemplateColumns: layout.gridTemplateColumns }}>
+            <span>Time</span>
+            {layout.columns.level && <span>Level</span>}
+            {layout.columns.request && <span>Request</span>}
+            <span className="col-span-2 flex items-center justify-between">
+                Message
+                {children}
+            </span>
         </div>
     )
+}
+
+function ListSkeleton({ layout }: { layout: Layout }) {
+    return (
+        <div aria-hidden>
+            <ListHeader layout={layout} />
+            <RowSkeletons layout={layout} rows={6} />
+        </div>
+    )
+}
+
+function RowSkeletons({ layout, rows }: { layout: Layout; rows: number }) {
+    return Array.from({ length: rows }, (_, index) => (
+        <div key={index} className={`${rowGrid} h-8.5 border-b border-border/55 px-2 last:border-b-0`} style={{ gridTemplateColumns: layout.gridTemplateColumns }}>
+            <Skeleton className="h-3.5 w-20" />
+            {layout.columns.level && <Skeleton className="h-4 w-11" />}
+            {layout.columns.request && <Skeleton className="h-4 w-16" />}
+            <Skeleton className="h-3.5" style={{ width: `${35 + ((index * 23) % 50)}%` }} />
+        </div>
+    ))
 }
 
 function EmptyList({ filtered, onClearFilters }: { filtered: boolean; onClearFilters: () => void }) {

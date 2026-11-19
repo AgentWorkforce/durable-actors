@@ -16,6 +16,7 @@ export const levelFill: Record<LogLevel, string> = {
 
 const scaleSteps = [2, 4, 6, 10]
 const tickCount = 6
+const skeletonBars = 48
 
 type Drag = { from: number; to: number }
 
@@ -29,7 +30,7 @@ export type LogChartProps = {
 export function LogChart({ histogram, level, live, onZoom }: LogChartProps) {
     const [hovered, setHovered] = useState<number | null>(null)
     const [drag, setDrag] = useState<Drag | null>(null)
-    if (!histogram) return <Skeleton className="mt-4 mb-3.5 h-[122px] w-full rounded-sm" />
+    if (!histogram) return <ChartSkeleton />
     const { buckets, fromMs, bucketMs } = histogram
     // The pointer can outlast a histogram with fewer buckets, as right after a zoom.
     const hoveredIndex = hovered !== null && hovered < buckets.length ? hovered : null
@@ -77,6 +78,26 @@ export function LogChart({ histogram, level, live, onZoom }: LogChartProps) {
     )
 }
 
+function ChartSkeleton() {
+    return (
+        <div aria-hidden className="mt-4 border-b pb-3.5">
+            <div className="relative pt-4">
+                <Gridlines />
+                <div className="relative ml-[42px] flex h-24 items-end gap-0.5">
+                    {Array.from({ length: skeletonBars }, (_, index) => (
+                        <Skeleton key={index} className="flex-1 rounded-[1px]" style={{ height: `${12 + ((index * 37) % 53)}%` }} />
+                    ))}
+                </div>
+            </div>
+            <div className="mt-1.5 ml-[42px] flex h-[16.5px] items-center justify-between">
+                {Array.from({ length: tickCount + 1 }, (_, index) => (
+                    <Skeleton key={index} className="h-3 w-9" />
+                ))}
+            </div>
+        </div>
+    )
+}
+
 function niceScale(peak: number): number {
     for (let magnitude = 1; ; magnitude *= 10) {
         const step = scaleSteps.find(candidate => candidate * magnitude >= peak)
@@ -85,12 +106,16 @@ function niceScale(peak: number): number {
 }
 
 // Lines span the card's full width; each value sits just above its line, left of the bars.
-function Gridlines({ scale }: { scale: number }) {
+function Gridlines({ scale }: { scale?: number }) {
     return (
         <div aria-hidden className="pointer-events-none absolute inset-x-0 top-4 h-24">
-            {[scale, scale / 2, 0].map((value, index) => (
+            {[1, 0.5, 0].map((fraction, index) => (
                 <div key={index} className="absolute inset-x-0 border-t border-dashed border-border/80" style={{ top: `${index * 50}%` }}>
-                    <span className="absolute bottom-0.5 left-0 text-[11px] leading-none text-muted-foreground tabular-nums">{formatCount(value)}</span>
+                    {scale === undefined ? (
+                        <Skeleton className="absolute bottom-0.5 left-0 h-2.5 w-5 rounded-sm" />
+                    ) : (
+                        <span className="absolute bottom-0.5 left-0 text-[11px] leading-none text-muted-foreground tabular-nums">{formatCount(scale * fraction)}</span>
+                    )}
                 </div>
             ))}
         </div>
