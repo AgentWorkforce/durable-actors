@@ -1,0 +1,48 @@
+# Rust tests run against the database services like CI does:
+#   DURABLE_ACTORS_TEST_POSTGRES_URL='postgresql://postgres:postgres@127.0.0.1:5432/durable_actors_test?sslmode=disable'
+#   DURABLE_ACTORS_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123
+#   DURABLE_ACTORS_TEST_REDIS_URL=redis://127.0.0.1:6379
+services:
+  - name: observer
+    command: .niteshift/durable-actors/files/observer-dev
+    port: 5173
+    environment:
+      - name: DURABLE_ACTORS_CONTROL_PLANE_URL
+        value: http://127.0.0.1:7100
+      - name: DURABLE_ACTORS_PROJECT_ID
+        value: local
+      # Vite's undocumented escape hatch for allowedHosts, so the tracked vite.config.ts stays as is.
+      - name: __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS
+        value: .preview.niteshift.dev
+  # Local runtime serving the chat example's actors from the debug build in target/.
+  - name: actors
+    command: DURABLE_ACTORS_BINARY="$PWD/../../target/debug/durable-actors" exec bun run dev:actors
+    cwd: examples/chat
+    port: 7100
+    environment:
+      - name: DURABLE_ACTORS_PORT
+        value: "7100"
+  # Its WebSocket URLs point at 127.0.0.1:7100, so use it from the sandbox browser, not the preview.
+  - name: chat
+    command: exec bun run dev
+    cwd: examples/chat
+    port: 3000
+    autostart: false
+    environment:
+      - name: DURABLE_ACTORS_CONTROL_PLANE_URL
+        value: http://127.0.0.1:7100
+  - name: postgres
+    command: |
+      docker rm -f durable-actors-postgres >/dev/null 2>&1 || true
+      exec docker run --rm --name durable-actors-postgres -p 127.0.0.1:5432:5432 \
+        -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=durable_actors_test postgres:16
+  - name: redis
+    command: |
+      docker rm -f durable-actors-redis >/dev/null 2>&1 || true
+      exec docker run --rm --name durable-actors-redis -p 127.0.0.1:6379:6379 redis:7.2-alpine
+  - name: clickhouse
+    command: |
+      docker rm -f durable-actors-clickhouse >/dev/null 2>&1 || true
+      exec docker run --rm --name durable-actors-clickhouse -p 127.0.0.1:8123:8123 \
+        -e CLICKHOUSE_DB=trace_test -e CLICKHOUSE_USER=trace_test -e CLICKHOUSE_PASSWORD=local-test-only \
+        -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 clickhouse/clickhouse-server:26.6

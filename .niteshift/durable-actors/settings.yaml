@@ -1,0 +1,6 @@
+version: 1
+additionalRepositories: []
+scripts:
+  setup: setup
+serviceDefinitions:
+  - services.yaml

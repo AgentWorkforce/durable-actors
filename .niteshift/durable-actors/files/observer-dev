@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Serves the observer UI from source with Vite HMR. `durable-actors observe` provides the
+# /api/observe proxy but always binds a random port, so read it from its output first.
+set -euo pipefail
+
+until curl -s -o /dev/null "$DURABLE_ACTORS_CONTROL_PLANE_URL"; do sleep 1; done
+
+coproc OBSERVE { exec bun sdk/dist/cli.js observe --no-open 2>&1; }
+trap 'kill "$OBSERVE_PID" 2>/dev/null || true' EXIT
+# Coproc descriptors are closed in subshells, so keep a copy for the background log forwarder.
+exec {observe_output}<&"${OBSERVE[0]}"
+api_url=""
+while IFS= read -r line <&"$observe_output"; do
+    echo "[observe] $line"
+    if [[ $line =~ ^Observe:\ (http://[^[:space:]]+) ]]; then
+        api_url="${BASH_REMATCH[1]}"
+        break
+    fi
+done
+[ -n "$api_url" ] || { echo "durable-actors observe exited before printing its URL" >&2; exit 1; }
+sed -u 's/^/[observe] /' <&"$observe_output" &
+
+cd packages/observer-ui
+OBSERVER_API_URL="$api_url" bun run --bun dev -- --port "$PORT" --strictPort &
+wait -n

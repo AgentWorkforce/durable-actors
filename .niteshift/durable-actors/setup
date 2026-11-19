@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUN_VERSION=1.4.2
+RUST_VERSION=1.91.0
+LIT_VERSION=0.1.2
+LITESTREAM_VERSION=0.5.17
+LITESTREAM_SHA256=cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d
+DOCKER_IMAGES=(postgres:16 redis:7.2-alpine clickhouse/clickhouse-server:26.6)
+
+REPO="${NITESHIFT_CHECKOUT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+[ -f "$REPO/Cargo.toml" ] || REPO="$REPO/durable-actors"
+cd "$REPO"
+
+log() { echo "==> $*"; }
+
+install_bun() {
+    if [ "$(/opt/bun/bin/bun --version 2>/dev/null)" != "$BUN_VERSION" ]; then
+        log "Installing Bun $BUN_VERSION"
+        curl -fsSL https://bun.sh/install | BUN_INSTALL=/opt/bun bash -s "bun-v$BUN_VERSION" >/dev/null
+    fi
+    ln -sf /opt/bun/bin/bun /usr/local/bin/bun
+    ln -sf /opt/bun/bin/bun /usr/local/bin/bunx
+}
+
+install_rust() {
+    export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+    if [ ! -x /opt/cargo/bin/rustup ]; then
+        log "Installing rustup"
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+    fi
+    /opt/cargo/bin/rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt
+    /opt/cargo/bin/rustup default "$RUST_VERSION"
+    # rustup proxies need these homes, so expose wrappers instead of bare symlinks.
+    for tool in cargo rustc rustup rustfmt cargo-fmt; do
+        printf '#!/bin/sh\nexport RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo\nexec /opt/cargo/bin/%s "$@"\n' "$tool" >"/usr/local/bin/$tool"
+        chmod +x "/usr/local/bin/$tool"
+    done
+}
+
+install_system_packages() {
+    local missing=()
+    command -v cc >/dev/null || missing+=(build-essential)
+    command -v cmake >/dev/null || missing+=(cmake)
+    command -v pkg-config >/dev/null || missing+=(pkg-config)
+    dpkg -s libssl-dev >/dev/null 2>&1 || missing+=(libssl-dev)
+    command -v psql >/dev/null || missing+=(postgresql-client)
+    command -v redis-cli >/dev/null || missing+=(redis-tools)
+    if [ ${#missing[@]} -gt 0 ]; then
+        log "Installing ${missing[*]}"
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null
+    fi
+}
+
+# Rust SQLite test fixtures shell out to the upstream Litestream CLI (see CONTRIBUTING.md).
+install_litestream() {
+    if ! litestream version 2>/dev/null | grep -q "$LITESTREAM_VERSION"; then
+        log "Installing Litestream $LITESTREAM_VERSION"
+        local tmp archive="litestream-$LITESTREAM_VERSION-linux-x86_64.tar.gz"
+        tmp="$(mktemp -d)"
+        curl -fsSL -o "$tmp/$archive" "https://github.com/benbjohnson/litestream/releases/download/v$LITESTREAM_VERSION/$archive"
+        echo "$LITESTREAM_SHA256  $tmp/$archive" | sha256sum --check --quiet
+        tar -xzf "$tmp/$archive" -C "$tmp" litestream
+        install "$tmp/litestream" /usr/local/bin/litestream
+        rm -rf "$tmp"
+    fi
+}
+
+# Linear ticket CLI (CONTRIBUTING.md); the repository's .lit.json selects the DUR team.
+install_lit() {
+    if ! npm ls -g --depth=0 "linear-lit-cli@$LIT_VERSION" >/dev/null 2>&1; then
+        log "Installing lit $LIT_VERSION"
+        npm install -g --silent "linear-lit-cli@$LIT_VERSION"
+    fi
+    # Agent shells don't receive repository secrets, so store the key in lit's own config.
+    if ns secrets exec --env LINEAR_API_KEY=LINEAR_API_KEY -- \
+        sh -c 'lit config set linear-api-key "$LINEAR_API_KEY"' >/dev/null 2>&1; then
+        log "Configured lit with LINEAR_API_KEY"
+    else
+        log "LINEAR_API_KEY is not set; lit needs it to reach Linear"
+    fi
+}
+
+pull_test_images() {
+    for image in "${DOCKER_IMAGES[@]}"; do
+        docker image inspect "$image" >/dev/null 2>&1 || docker pull -q "$image" >/dev/null || log "Could not pull $image"
+    done
+}
+
+install_workspace() {
+    log "Installing Bun workspace"
+    bun install --frozen-lockfile
+    log "Building SDK and observer UI"
+    bun run --bun --cwd sdk build
+    log "Building Rust runtime"
+    cargo build --locked
+}
+
+install_python_sdk() {
+    log "Syncing Python SDK"
+    (cd sdk-python && uv sync --locked --all-extras --no-install-package durable-actors-runtime)
+}
+
+install_system_packages
+install_bun
+install_rust
+install_litestream
+install_lit
+pull_test_images
+install_workspace
+install_python_sdk
+log "Setup complete"
