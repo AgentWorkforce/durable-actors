@@ -2411,6 +2411,56 @@ async fn sql_transactions_publish_once_on_commit_and_never_on_rollback() -> Resu
     Ok(())
 }
 
+struct ReadThenWriteTransactions;
+#[async_trait]
+impl ActorExecutor for ReadThenWriteTransactions {
+    fn supports(&self, _: &str) -> bool {
+        true
+    }
+    async fn invoke(
+        &self,
+        _: ActorMethodInvocation,
+        database: Arc<dyn ActorDatabase>,
+    ) -> Result<ActorMethodOutcome> {
+        exec(&*database, "CREATE TABLE entries(value TEXT)").await?;
+        exec(&*database, "INSERT INTO entries VALUES ('first')").await?;
+        // Read-then-write transactions keep running while the insert's pages wait in the WAL.
+        let (until, mut transactions) = (Instant::now() + Duration::from_millis(2500), 0);
+        while Instant::now() < until {
+            exec(&*database, "BEGIN").await?;
+            exec(&*database, "SELECT count(*) FROM entries").await?;
+            exec(&*database, "DELETE FROM entries").await?;
+            exec(&*database, "ROLLBACK").await?;
+            transactions += 1;
+        }
+        Ok(ActorMethodOutcome::Completed {
+            result: json!(transactions).into(),
+            effects: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn transactions_that_read_then_write_never_meet_a_checkpoint() -> Result<()> {
+    let host = create_host(
+        HostEndpoint {
+            id: super::super::HostId::new("host-1"),
+            route: "http://host.invalid/".into(),
+        },
+        Arc::new(ReadThenWriteTransactions),
+        Arc::new(FakeAuthority::default()),
+        Arc::new(FakeStateTransport::default()),
+        Arc::new(EmptySocketPublisher),
+        replication().await,
+    );
+    let result = invoke(&host, "transactions").await?;
+    assert!(
+        matches!(result, ActorExecutionResult::Completed { .. }),
+        "{result:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn failed_immediate_write_stops_the_actor_without_acknowledging_the_write() -> Result<()> {
     let (written, mut writes_seen) = mpsc::unbounded_channel();
