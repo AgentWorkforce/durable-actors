@@ -1,0 +1,97 @@
+{{- if .Values.telemetry.nodeCollector.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "actors.nodeCollectorName" . }}
+data:
+  collector.yaml: |
+    {{- .Files.Get "files/node-collector.yaml" | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "actors.nodeCollectorName" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "actors.nodeCollectorClusterName" . }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes/stats]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "actors.nodeCollectorClusterName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "actors.nodeCollectorName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "actors.nodeCollectorClusterName" . }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "actors.nodeCollectorName" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "actors.nodeCollectorName" . }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "actors.nodeCollectorName" . }}
+      annotations:
+        checksum/config: {{ .Files.Get "files/node-collector.yaml" | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "actors.nodeCollectorName" . }}
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - {key: sandbox.gke.io/runtime, operator: Equal, value: gvisor, effect: NoSchedule}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: collector
+          image: {{ include "actors.image" .Values.images.collector | quote }}
+          args: ["--config=/etc/otelcol/collector.yaml"]
+          ports:
+            - {name: health, containerPort: 13133}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            {{- toYaml .Values.telemetry.nodeCollector.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 10
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            - {name: SANDBOX_NAMESPACE, value: {{ include "actors.sandboxNamespace" . | quote }}}
+            - name: PLATFORM_COLLECTOR_ENDPOINT
+              value: {{ printf "http://%s.%s.svc.cluster.local:4320" (include "actors.collectorName" .) .Release.Namespace | quote }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol, readOnly: true}
+            - {name: platform-telemetry, mountPath: /var/run/secrets/durable-actors/platform-telemetry, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "actors.nodeCollectorName" . }}}
+        - name: platform-telemetry
+          projected:
+            sources:
+              - serviceAccountToken: {audience: durable-actors-platform-telemetry, expirationSeconds: 3600, path: token}
+{{- end }}

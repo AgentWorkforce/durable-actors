@@ -242,6 +242,16 @@ impl HostDatabase {
     }
 }
 
+// Asked through the service queue like an actor call, so it never touches the database mid-call.
+#[async_trait]
+impl super::lifecycle::DatabaseSize for HostDatabase {
+    async fn database_bytes(&self) -> Option<u64> {
+        let (reply, size) = oneshot::channel();
+        self.send(Command::DatabaseSize { reply }).await.ok()?;
+        size.await.ok().flatten()
+    }
+}
+
 pub(super) struct DatabaseInvocation {
     database: Arc<HostDatabase>,
     scope: Arc<InvocationScope>,
@@ -391,6 +401,9 @@ enum Command {
     SaveToNodeCache {
         reply: oneshot::Sender<Result<Option<u64>>>,
     },
+    DatabaseSize {
+        reply: oneshot::Sender<Option<u64>>,
+    },
 }
 
 struct PendingCompletion {
@@ -462,6 +475,9 @@ impl DatabaseService {
             }
             Command::SaveToNodeCache { reply } => {
                 let _ = reply.send(self.session.save_to_node_cache().await);
+            }
+            Command::DatabaseSize { reply } => {
+                let _ = reply.send(self.session.database_bytes().await);
             }
         }
         true

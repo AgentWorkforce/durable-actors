@@ -46,6 +46,7 @@ async fn lifecycle_inventory_is_shared_and_tracks_activation_handoffs() -> Resul
             resources: Default::default(),
             resident: Some(true),
             last_active_at_ms: None,
+            database_bytes: None,
             waiting: Vec::new(),
         },
     };
@@ -687,5 +688,142 @@ async fn stored_platform_events_read_back_by_name_once_each() -> Result<()> {
         assert_eq!(latest.string(attribute).as_deref(), Some(value));
     }
     assert!(store.platform_events("other", &kills).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resources_count_only_samples_from_the_actors_claimed_sandboxes() -> Result<()> {
+    use crate::{
+        actor_lifecycle::{LifecycleKind, testing::report},
+        platform_events::{PlatformEvent, sandboxes::SandboxClaim},
+        request_traces::resources::{DatabaseBucket, ResourceQuery, SandboxResources, UsageBucket},
+        sandbox::ResourceLimits,
+    };
+    let Ok(url) = std::env::var("DURABLE_ACTORS_TEST_CLICKHOUSE_URL") else {
+        return Ok(());
+    };
+    let stop = CancellationToken::new();
+    let _guard = stop.clone().drop_guard();
+    let store = ClickHouseTracePersistence::start(config(url), Duration::from_secs(86400), stop)?;
+    schema::initialize(&store.client, 86400).await?;
+    let project = format!("resources-{}", uuid::Uuid::new_v4());
+    let actor = |actor_id: &str| crate::actor::ActorKey {
+        project_id: project.clone(),
+        actor_name: "Room".into(),
+        actor_id: actor_id.into(),
+    };
+    let resources = ResourceLimits {
+        cpu_millis: 500,
+        memory_mib: 512,
+        memory_limit_mib: Some(512),
+        ..Default::default()
+    };
+    let (pod, other_pod) = (format!("{project}-a"), format!("{project}-b"));
+    for (actor_id, sandbox_id) in [("room-0", &pod), ("room-1", &other_pod)] {
+        let record = SandboxClaim {
+            actor: actor(actor_id),
+            sandbox_id: sandbox_id.clone(),
+            resources: resources.clone(),
+            at_ms: 10_000,
+        }
+        .to_record();
+        store
+            .client
+            .query(
+                "INSERT INTO platform_events (Timestamp, EventName, LogAttributes, Body) VALUES \
+                 (fromUnixTimestamp64Milli(?), ?, map('durable_actors.project_id', ?, \
+                 'durable_actors.actor_name', 'Room', 'durable_actors.actor_id', ?, \
+                 'durable_actors.sandbox_id', ?), ?)",
+            )
+            .bind(record.at_ms)
+            .bind(record.name)
+            .bind(&project)
+            .bind(actor_id)
+            .bind(sandbox_id)
+            .bind(record.body.unwrap_or_default())
+            .execute()
+            .await?;
+    }
+    // A spare's sample before its claim, two of the actor's, and another actor's.
+    let samples = [
+        (&pod, 5, "container.cpu.usage", 0.9),
+        (&pod, 12, "container.cpu.usage", 0.25),
+        (&pod, 13, "container.cpu.usage", 0.5),
+        (
+            &pod,
+            13,
+            "container.memory.working_set",
+            200.0 * 1024.0 * 1024.0,
+        ),
+        (&other_pod, 13, "container.cpu.usage", 2.0),
+    ];
+    for (pod_name, at_seconds, metric, value) in samples {
+        store
+            .client
+            .query(
+                "INSERT INTO sandbox_usage (ResourceAttributes, MetricName, TimeUnix, Value) \
+                 VALUES (map('k8s.pod.name', ?), ?, toDateTime(?), ?)",
+            )
+            .bind(pod_name)
+            .bind(metric)
+            .bind(at_seconds)
+            .bind(value)
+            .execute()
+            .await?;
+    }
+    let sized = |sequence: u64, occurred_at_ms: u64, database_bytes: u64| {
+        let kind = LifecycleKind::Heartbeat;
+        let mut event = report(&project, 0, 1, sequence, occurred_at_ms, kind, Some(true));
+        event.report.database_bytes = Some(database_bytes);
+        event
+    };
+    collect_all(&store, &[sized(1, 11_000, 4096), sized(2, 14_000, 8192)]).await?;
+    let usage = store
+        .read_resources(
+            &project,
+            &ResourceQuery {
+                actor_name: "Room".into(),
+                actor_id: "room-0".into(),
+                from_ms: 0,
+                to_ms: 20_000,
+                bucket_ms: 10_000,
+            },
+        )
+        .await?;
+    let claimed = SandboxResources {
+        claimed_at_ms: 10_000,
+        resources: resources.clone(),
+    };
+    assert_eq!(usage.sandboxes, [claimed]);
+    assert_eq!(
+        usage.usage,
+        [UsageBucket {
+            at_ms: 10_000,
+            cpu_cores: Some(0.5),
+            memory_bytes: Some(200 * 1024 * 1024),
+        }]
+    );
+    assert_eq!(
+        usage.database,
+        [DatabaseBucket {
+            at_ms: 10_000,
+            bytes: 8192,
+        }]
+    );
+    assert_eq!(usage.database_bytes, Some(8192));
+    // The sandbox claimed before the range is the one in force when it starts.
+    let later = store
+        .read_resources(
+            &project,
+            &ResourceQuery {
+                actor_name: "Room".into(),
+                actor_id: "room-0".into(),
+                from_ms: 12_000,
+                to_ms: 20_000,
+                bucket_ms: 8_000,
+            },
+        )
+        .await?;
+    assert_eq!(later.sandboxes.len(), 1);
     Ok(())
 }

@@ -120,6 +120,7 @@ fn event(kind: LifecycleKind, sequence: u64, time: u64) -> LifecycleEvent {
             resources: Default::default(),
             resident: Some(kind != LifecycleKind::Stopped),
             last_active_at_ms: None,
+            database_bytes: None,
             waiting: Vec::new(),
         },
     }

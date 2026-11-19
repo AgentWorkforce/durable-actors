@@ -240,6 +240,7 @@ fn event(activation: &Activation, kind: LifecycleKind) -> LifecycleEvent {
             resources: Default::default(),
             resident: Some(true),
             last_active_at_ms: None,
+            database_bytes: None,
             waiting: vec![],
         },
     }

@@ -17,30 +17,18 @@ ingress:
   annotations: {}
 replicaCount: 1
 actors:
-  # Ready spares of the default actor size per image and region. Leave at 0 when tiers are set.
   warm: 0
-  # Spare sizes, replacing `warm`: each tier keeps `warm` ready spares per image and region for
-  # actors whose requests and limits equal it. Every field is required; a null cpuLimitMillis
-  # leaves CPU uncapped. For example:
-  #   - {cpuMillis: 250, cpuLimitMillis: null, memoryMiB: 256, memoryLimitMiB: 256, warm: 2}
-  #   - {cpuMillis: 250, cpuLimitMillis: null, memoryMiB: 512, memoryLimitMiB: 512, warm: 1}
   tiers: []
-  # Spares starting at once across controllers, and how often each controller refills pools.
   maxStarting: 32
   refillIntervalMs: 1000
-  # How fast each controller deletes retired spares and finished pods, and forgets stopped sandboxes.
   retireConcurrency: 64
   podReapIntervalMs: 1000
   reapConcurrency: 64
   registryReapIntervalMs: 2000
-  # The default actor size: what an actor gets for each resource its @Compute leaves unset.
   cpuMillis: 250
-  # Unset leaves actor CPU uncapped.
   cpuLimitMillis: null
   memoryMiB: 256
-  # Unset matches memoryMiB.
   memoryLimitMiB: null
-  # Range a deployment's @Compute may request; unset uses the runtime defaults.
   bounds:
     minCpuMillis: null
     maxCpuMillis: null
@@ -49,7 +37,6 @@ actors:
 alarms:
   pollIntervalMs: 100
 analytics:
-  # none or clickhouse; actor spans and logs need clickhouse and telemetry.collector.
   backend: none
   clickhouse:
     url: ""
@@ -78,21 +65,17 @@ telemetry:
       requests: {cpu: 250m, memory: 512Mi}
       limits: {memory: 1Gi}
     platform:
-      # The cluster's service-account token issuer (on GKE:
-      # https://container.googleapis.com/v1/projects/<project>/locations/<location>/clusters/<cluster>).
-      # Setting it makes the control plane report WebSocket connections and deployments through
-      # the collector.
       issuer: ""
-# Caches actor code and state on each sandbox node's disk so cold starts skip GCS.
+  nodeCollector:
+    enabled: false
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 256Mi}
 nodeCache:
   enabled: false
   capacityGiB: 20
-  # Each entry holds about 350 bytes of the cache's memory, whatever its size on disk.
   maxEntries: 500000
-  # A node directory keeps the cache through restarts and upgrades of the cache itself; empty
-  # keeps it in a volume that lives and dies with each cache pod.
   hostPath: ""
-  # Node labels the cache also requires, such as local SSD when hostPath must land on it.
   nodeSelector: {}
   resources:
     requests: {cpu: 100m, memory: 128Mi}
@@ -101,7 +84,6 @@ resources:
   requests: {cpu: 250m, memory: 512Mi}
   limits: {memory: 1Gi}
 images:
-  # Release packaging supplies immutable digests for all four images.
   controlPlane:
     repository: us-central1-docker.pkg.dev/fluid-analogy-473415-c2/public/durable-actors
     digest: ""

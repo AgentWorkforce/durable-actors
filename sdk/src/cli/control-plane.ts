@@ -85,6 +85,10 @@ class ControlPlaneClient {
         )
     }
 
+    getResources(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
+        return this.requestJson("GET", `${this.projectPath()}/observe/resources?${query}`, undefined, 30_000, signal)
+    }
+
     listQueueWaits(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
         return this.requestJson(
             "GET",

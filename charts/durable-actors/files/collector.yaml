@@ -1,16 +1,10 @@
-# Hosts are untrusted: every export needs a host JWT for the telemetry audience, and tenant
-# identity comes only from its verified claims. The collector fetches the verifying keys from
-# the control plane at startup and again whenever a signature fails, so it restarts until the
-# control plane is reachable. Everything else stays at component defaults.
 extensions:
   health_check:
-    # The default binds localhost, which Kubernetes probes can't reach.
     endpoint: 0.0.0.0:13133
   oidc:
     providers:
       - issuer_url: ${env:CONTROL_PLANE_URL}
         audience: durable-actors-telemetry
-        # Tokens keep the control plane's own issuer so running hosts stay valid across upgrades.
         ignore_issuer: true
 
 receivers:
@@ -18,7 +12,6 @@ receivers:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
-        # The OTLP spec's recommended default; the receiver still uses gRPC's 4 MiB.
         max_recv_msg_size_mib: 64
         auth:
           authenticator: oidc
@@ -43,7 +36,6 @@ exporters:
     database: ${env:CLICKHOUSE_DATABASE}
     username: ${env:CLICKHOUSE_USER}
     password: ${env:CLICKHOUSE_PASSWORD}
-    # The control plane owns the schema (src/request_traces/persistence/clickhouse/schema.sql).
     create_schema: false
     sending_queue:
       batch: {}

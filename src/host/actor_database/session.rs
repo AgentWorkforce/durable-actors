@@ -56,6 +56,11 @@ impl DatabaseSession {
             .filter(|version| *version > 0)
     }
 
+    pub(super) async fn database_bytes(&self) -> Option<u64> {
+        let resident = self.cached_state.as_ref()?;
+        resident.database.size().await.ok().flatten()
+    }
+
     pub(super) async fn prepare_invocation(
         &mut self,
         invocation: &ActorInvocation,

@@ -3,6 +3,7 @@ import type { EventHistory, RecordedEvent } from "../types/Events.js"
 import type { ActorLogPage, LogFilter, LogHistogram } from "../types/Logs.js"
 import type { RequestHistoryQuery, RequestTrace, RequestTracePage } from "../types/Requests.js"
 import type { ResidencyHistory } from "../types/Residency.js"
+import type { ResourceUsage } from "../types/Resources.js"
 import type { SocketSession } from "../types/Sockets.js"
 import type { TimeBounds } from "../types/TimeRange.js"
 
@@ -19,6 +20,7 @@ export interface ObserverClient {
     listActorTypes(): Promise<ActorInventory>
     listRequests(query: RequestHistoryQuery): Promise<RequestTracePage>
     listResidency(actorName: string, bounds: TimeBounds, actorId?: string): Promise<ResidencyHistory>
+    getResources(actorName: string, actorId: string, bounds: TimeBounds, bucketMs: number): Promise<ResourceUsage>
     listEventHistory(types: RecordedEvent["type"][], bounds: TimeBounds, actorName?: string, actorId?: string): Promise<EventHistory>
     listWebSockets(): Promise<SocketSession[]>
     listLogs(filter: LogFilter, bounds: TimeBounds, cursor: string | null): Promise<ActorLogPage>
@@ -46,6 +48,11 @@ export class HttpObserverClient implements ObserverClient {
         const query = new URLSearchParams({ actorName, fromMs: String(fromMs), toMs: String(toMs) })
         if (actorId) query.set("actorId", actorId)
         return await this.get<ResidencyHistory>(`residency?${query}`)
+    }
+
+    async getResources(actorName: string, actorId: string, { fromMs, toMs }: TimeBounds, bucketMs: number): Promise<ResourceUsage> {
+        const query = new URLSearchParams({ actorName, actorId, fromMs: String(fromMs), toMs: String(toMs), bucketMs: String(bucketMs) })
+        return await this.get<ResourceUsage>(`resources?${query}`)
     }
 
     async listEventHistory(types: RecordedEvent["type"][], { fromMs, toMs }: TimeBounds, actorName?: string, actorId?: string): Promise<EventHistory> {

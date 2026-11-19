@@ -41,6 +41,7 @@ async fn usage_publishes_activation_boundaries_for_each_project() -> Result<()> 
                         },
                         resident: Some(kind != LifecycleKind::Stopped),
                         last_active_at_ms: None,
+                        database_bytes: None,
                         waiting: Vec::new(),
                     },
                 })
@@ -139,6 +140,7 @@ async fn inventory_distinguishes_resident_idle_stopped_and_stale_actors() -> Res
                     resources: Default::default(),
                     resident,
                     last_active_at_ms: None,
+                    database_bytes: None,
                     waiting: vec![WaitingOperation {
                         id: "request".into(),
                         operation: "increment".into(),
@@ -196,6 +198,7 @@ async fn latest_report_follows_activation_shutdown_and_reactivation_per_project(
             resources: Default::default(),
             resident: Some(true),
             last_active_at_ms: None,
+            database_bytes: None,
             waiting: Vec::new(),
         },
     };
@@ -274,6 +277,7 @@ async fn residency_tracks_eviction_reactivation_gaps_and_range_boundaries() -> R
                     resources: Default::default(),
                     resident: Some(resident),
                     last_active_at_ms: Some(500),
+                    database_bytes: None,
                     waiting: vec![],
                 },
             };

@@ -1,0 +1,46 @@
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  bearertokenauth:
+    filename: /var/run/secrets/durable-actors/platform-telemetry/token
+
+receivers:
+  kubeletstats:
+    collection_interval: 5s
+    auth_type: serviceAccount
+    endpoint: https://${env:K8S_NODE_NAME}:10250
+    metric_groups: [container]
+    metrics:
+      container.cpu.time: {enabled: false}
+      container.filesystem.available: {enabled: false}
+      container.filesystem.capacity: {enabled: false}
+      container.filesystem.usage: {enabled: false}
+      container.memory.available: {enabled: false}
+      container.memory.major_page_faults: {enabled: false}
+      container.memory.page_faults: {enabled: false}
+      container.memory.rss: {enabled: false}
+      container.memory.usage: {enabled: false}
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+  filter/sandboxes:
+    error_mode: ignore
+    metric_conditions:
+      - resource.attributes["k8s.namespace.name"] != "${env:SANDBOX_NAMESPACE}"
+      - resource.attributes["k8s.container.name"] != "runtime"
+
+exporters:
+  otlp_http:
+    endpoint: ${env:PLATFORM_COLLECTOR_ENDPOINT}
+    auth:
+      authenticator: bearertokenauth
+
+service:
+  extensions: [health_check, bearertokenauth]
+  pipelines:
+    metrics:
+      receivers: [kubeletstats]
+      processors: [memory_limiter, filter/sandboxes]
+      exporters: [otlp_http]

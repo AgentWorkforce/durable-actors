@@ -160,6 +160,7 @@ test("request history uses bounded filters with server-side credentials", async 
 for (const [method, path] of [
     ["getMetrics", "metrics"],
     ["listQueueWaits", "queue-waits"],
+    ["getResources", "resources"],
     ["listWebSockets", "websockets"],
     ["listEventHistory", "events/history"],
     ["getState", "state"],

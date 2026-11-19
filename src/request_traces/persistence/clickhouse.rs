@@ -14,10 +14,12 @@ use crate::request_traces::{
     logs::{LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
     otlp::PlatformLog,
+    resources::{ResourceQuery, ResourceUsage},
 };
 
 mod lifecycle;
 mod queries;
+mod resources;
 mod schema;
 
 #[derive(Clone)]
@@ -122,6 +124,10 @@ impl TraceQueries for ClickHouseTracePersistence {
 
     async fn deployed_contract(&self, project_id: &str) -> Result<Option<serde_json::Value>> {
         self.read_deployed_contract(project_id).await
+    }
+
+    async fn resources(&self, project: &str, query: &ResourceQuery) -> Result<ResourceUsage> {
+        self.read_resources(project, query).await
     }
 }
 

@@ -424,8 +424,9 @@ paths:
                 - log (signal logs): ActorLog records matching the log filters, deduplicated by logId.
                 - instance (signal platform): an instance as its latest lifecycle report leaves it,
                   with actorName, actorId, status, occurredAtMs, reportedAtMs, staleAtMs (when the
-                  status turns unknown without another report; null once stopped), lastActiveAtMs
-                  and waiting.
+                  status turns unknown without another report; null once stopped), lastActiveAtMs,
+                  waiting and databaseBytes (the SQLite database size, sampled at most every 10
+                  seconds; null when not yet read).
                 - connectionOpened, connectionClosed (signal platform): connectionId, actorName,
                   actorId, gatewayId, openedAtMs, plus metadata when opened, or closedAtMs,
                   closeCode, closeReason, messagesIn and messagesOut when closed.
@@ -436,6 +437,9 @@ paths:
                   methods; empty once the deployment is removed.
                 - kill (signal platform): a SandboxKill, sent once per sandbox. A pool manager that
                   restarts sends the kills it still sees again, each unchanged.
+                - usage (signal platform): actorName, actorId, atMs, cpuCores and memoryBytes of the
+                  instance's runtime container, measured from outside its sandbox about every 5
+                  seconds.
             parameters:
                 - name: signals
                   in: query
@@ -645,6 +649,47 @@ paths:
                                 type: array
                                 maxItems: 500
                                 items: { $ref: "#/components/schemas/QueueWaitRow" }
+                "400": { $ref: "#/components/responses/InvalidRequest" }
+                "401": { $ref: "#/components/responses/Unauthenticated" }
+                "500": { $ref: "#/components/responses/Internal" }
+    /v1/projects/{project_id}/observe/resources:
+        parameters:
+            - { $ref: "#/components/parameters/ProjectId" }
+        get:
+            operationId: getActorResources
+            tags: [Observability]
+            summary: Get an actor instance's resource usage
+            description: CPU and memory of the runtime container in each sandbox the instance ran in, measured from outside the sandbox and excluding gVisor's own usage, and its SQLite database size. Each bucket holds the highest sample within it and is named by when it starts.
+            parameters:
+                - name: actorName
+                  in: query
+                  required: true
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,48}$" }
+                - name: actorId
+                  in: query
+                  required: true
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
+                - name: fromMs
+                  in: query
+                  required: true
+                  schema: { type: integer, minimum: 0 }
+                - name: toMs
+                  in: query
+                  required: true
+                  schema: { type: integer, minimum: 0 }
+                - name: bucketMs
+                  in: query
+                  required: true
+                  description: Splits the range into 1 to 1000 buckets.
+                  schema: { type: integer, minimum: 1 }
+            responses:
+                "200":
+                    description: Retained usage for the selected range.
+                    headers:
+                        Cache-Control: { $ref: "#/components/headers/NoStore" }
+                    content:
+                        application/json:
+                            schema: { $ref: "#/components/schemas/ResourceUsage" }
                 "400": { $ref: "#/components/responses/InvalidRequest" }
                 "401": { $ref: "#/components/responses/Unauthenticated" }
                 "500": { $ref: "#/components/responses/Internal" }
@@ -1010,6 +1055,40 @@ components:
                 admitted: { type: integer, minimum: 1 }
                 averageMs: { type: number, minimum: 0 }
                 maxMs: { type: number, minimum: 0 }
+        ResourceUsage:
+            type: object
+            required: [sandboxes, usage, database, databaseBytes]
+            properties:
+                sandboxes:
+                    description: The requests and limits in force over the range, from the sandbox running when it starts, then each one claimed during it. A sandbox keeps its resources for its whole life. An absent limit leaves that resource uncapped.
+                    type: array
+                    items:
+                        type: object
+                        required: [claimedAtMs, cpuMillis, memoryMib]
+                        properties:
+                            claimedAtMs: { type: integer, minimum: 0 }
+                            cpuMillis: { type: integer, minimum: 0 }
+                            cpuLimitMillis: { type: integer, minimum: 0 }
+                            memoryMib: { type: integer, minimum: 0 }
+                            memoryLimitMib: { type: integer, minimum: 0 }
+                usage:
+                    type: array
+                    items:
+                        type: object
+                        required: [atMs, cpuCores, memoryBytes]
+                        properties:
+                            atMs: { type: integer, minimum: 0 }
+                            cpuCores: { type: [number, "null"], minimum: 0 }
+                            memoryBytes: { type: [integer, "null"], minimum: 0 }
+                database:
+                    type: array
+                    items:
+                        type: object
+                        required: [atMs, bytes]
+                        properties:
+                            atMs: { type: integer, minimum: 0 }
+                            bytes: { type: integer, minimum: 0 }
+                databaseBytes: { type: [integer, "null"], minimum: 0, description: The latest reported SQLite database size, however long ago it was reported. }
         SocketSession:
             type: object
             required: [connectionId, actorName, actorId, gatewayId, status, openedAtMs, closedAtMs]

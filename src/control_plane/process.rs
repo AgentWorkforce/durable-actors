@@ -280,6 +280,11 @@ async fn control_plane_routes(
     )?;
     let public_origin = config.sandbox_provider.public_origin.clone();
     let gateway = super::gateway::Gateway::new(&issuer, public_origin.clone(), socket_gateway)?;
+    let claims: Arc<dyn PlatformEvents<crate::platform_events::sandboxes::SandboxClaim>> =
+        match &platform_events {
+            Some(events) => events.clone(),
+            None => Arc::new(NoPlatformEvents),
+        };
     let mut provisioner = sandbox_provisioner(
         config.sandbox_provider,
         &issuer,
@@ -287,6 +292,7 @@ async fn control_plane_routes(
         database.clone(),
         stop.clone(),
         connections,
+        claims,
     )
     .await?;
     if let Some(admission) = admission {
@@ -397,6 +403,7 @@ async fn sandbox_provisioner(
     database: PostgresDatabase,
     stop: tokio_util::sync::CancellationToken,
     connections: crate::sandbox::connections::HostConnections,
+    claims: Arc<dyn PlatformEvents<crate::platform_events::sandboxes::SandboxClaim>>,
 ) -> Result<super::service::SandboxHostProvisioner> {
     // Every replica watches the same pods, so only the pool manager reports their kills.
     let provider = sandbox_provider(&config, connections, None).await?;
@@ -405,6 +412,7 @@ async fn sandbox_provisioner(
         provider.clone(),
         config.pool,
         Some(config.runtime_images.clone()),
+        claims,
     );
     pool.start(stop);
     Ok(super::service::SandboxHostProvisioner::new(
@@ -465,11 +473,13 @@ pub async fn serve_pool_manager(
         kills,
     )
     .await?;
+    // Serving replicas claim sandboxes; the pool manager only fills and trims the pool.
     let pool = crate::sandbox::pool::SparePool::with_runtime_images(
         database,
         provider,
         config.sandbox_provider.pool,
         Some(config.sandbox_provider.runtime_images),
+        Arc::new(NoPlatformEvents),
     );
     let stale_after = (pool.config.refill_interval * 3).max(Duration::from_secs(60));
     let health = pool.clone();

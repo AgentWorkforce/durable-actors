@@ -65,6 +65,18 @@ impl SqliteDatabase {
         })
         .await?
     }
+
+    /// The committed database's size, or `None` while an actor transaction is open.
+    pub(crate) async fn size(&self) -> Result<Option<u64>> {
+        let engine = self.engine.clone();
+        tokio::task::spawn_blocking(move || {
+            engine
+                .lock()
+                .map_err(|_| anyhow!("actor database is poisoned"))?
+                .size()
+        })
+        .await?
+    }
 }
 
 struct Engine {
@@ -110,6 +122,19 @@ impl Engine {
         let committed =
             self.committed.swap(false, Ordering::Relaxed) && self.connection.is_autocommit();
         Ok(Executed { result, committed })
+    }
+
+    fn size(&self) -> Result<Option<u64>> {
+        if !self.connection.is_autocommit() {
+            return Ok(None);
+        }
+        let pages: i64 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(Some(u64::try_from(pages * page_size)?))
     }
 
     fn write(&self, call: DatabaseCall, rows: &mut dyn RowSink) -> Result<DatabaseResult> {

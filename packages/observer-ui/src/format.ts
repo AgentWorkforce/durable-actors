@@ -23,6 +23,8 @@ export const formatDecimal = (value: number) => decimal.format(value)
 export const formatPercent = (ratio: number) => percent.format(ratio)
 export const formatMs = (ms: number) => formatMsParts(ms).join("\u00a0")
 export const formatMegabytes = (bytes: number) => decimal.format(bytes / 1_000_000)
+export const formatCpu = (cores: number) => fine.format(cores)
+export const formatMebibytes = (bytes: number) => decimal.format(bytes / 1_048_576)
 export const formatPlural = (value: number, noun: string) => `${count.format(value)} ${value === 1 ? noun : `${noun}s`}`
 
 // The cutoffs sit just below 1 ms and 1 s so rounding never prints "1,000 µs" or "1,000 ms".
@@ -51,3 +53,18 @@ export function formatAgo(ms: number, now: number): string {
 function formatMagnitude(value: number): string {
     return value < 10 ? fine.format(value) : count.format(Math.round(value))
 }
+
+const byteUnits = ["B", "KB", "MB", "GB", "TB"]
+
+/** Bytes in the largest unit that keeps the shown value under 1,000. */
+export function scaleBytes(bytes: number): { value: string; unit: string } {
+    let value = bytes
+    let unit = 0
+    while (value >= 999.5 && unit < byteUnits.length - 1) {
+        value /= 1000
+        unit++
+    }
+    return { value: unit ? decimal.format(value) : count.format(value), unit: byteUnits[unit]! }
+}
+
+export const formatBytes = (bytes: number) => Object.values(scaleBytes(bytes)).join("\u00a0")

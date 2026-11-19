@@ -18,10 +18,17 @@ use crate::{
 use super::actor_host::ActorStatus;
 
 const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+const SIZE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub(super) trait LifecycleTransport: Send + Sync {
     async fn report(&self, report: LifecycleReport) -> Result<()>;
+}
+
+#[async_trait]
+pub(super) trait DatabaseSize: Send + Sync {
+    /// `None` when the size can't be read now, such as while a transaction is open.
+    async fn database_bytes(&self) -> Option<u64>;
 }
 
 #[async_trait]
@@ -42,12 +49,15 @@ impl HostLifecycle {
         owner_epoch: u64,
         resources: ResourceLimits,
         executor: Arc<dyn ActorExecutor>,
+        database: Arc<dyn DatabaseSize>,
         status: watch::Receiver<ActorStatus>,
     ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel(2);
         let reporter = Reporter {
             transport,
             executor,
+            database,
+            sampled_at: None,
             status,
             report: LifecycleReport {
                 kind: LifecycleKind::Started,
@@ -59,6 +69,7 @@ impl HostLifecycle {
                 resident: None,
                 last_active_at_ms: None,
                 waiting: Vec::new(),
+                database_bytes: None,
             },
         };
         let task = tokio::spawn(reporter.run(receiver));
@@ -84,6 +95,8 @@ impl Drop for HostLifecycle {
 struct Reporter {
     transport: Arc<dyn LifecycleTransport>,
     executor: Arc<dyn ActorExecutor>,
+    database: Arc<dyn DatabaseSize>,
+    sampled_at: Option<tokio::time::Instant>,
     status: watch::Receiver<ActorStatus>,
     report: LifecycleReport,
 }
@@ -136,6 +149,7 @@ impl Reporter {
             self.report.resident = Some(false);
             self.report.waiting.clear();
         }
+        self.sample_database(kind).await;
         if let Err(error) =
             tokio::time::timeout(REPORT_TIMEOUT, self.transport.report(self.report.clone()))
                 .await
@@ -143,6 +157,24 @@ impl Reporter {
                 .and_then(|result| result)
         {
             tracing::warn!(?kind, %error, "host lifecycle report failed");
+        }
+    }
+
+    /// Status changes also send reports, so the size is read at most once per heartbeat interval,
+    /// and once more on stopping. A size that can't be read now keeps the last one.
+    async fn sample_database(&mut self, kind: LifecycleKind) {
+        let due = kind == LifecycleKind::Stopped
+            || self
+                .sampled_at
+                .is_none_or(|at| at.elapsed() >= HEARTBEAT_INTERVAL);
+        if !due {
+            return;
+        }
+        self.sampled_at = Some(tokio::time::Instant::now());
+        if let Ok(Some(bytes)) =
+            tokio::time::timeout(SIZE_TIMEOUT, self.database.database_bytes()).await
+        {
+            self.report.database_bytes = Some(bytes);
         }
     }
 }

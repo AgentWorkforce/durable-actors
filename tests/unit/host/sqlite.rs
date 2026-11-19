@@ -501,3 +501,26 @@ async fn a_field_nested_deeper_than_stored_state_is_read_is_refused() -> Result<
     assert_eq!(stored.rows.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn size_counts_committed_pages_and_waits_out_open_transactions() -> Result<()> {
+    let (_directory, database) = database().await?;
+    let empty = database.size().await?.unwrap();
+    exec(&database, "CREATE TABLE blobs (data BLOB)", vec![], false).await?;
+    exec(
+        &database,
+        "INSERT INTO blobs VALUES (zeroblob(65536))",
+        vec![],
+        false,
+    )
+    .await?;
+    let written = database.size().await?.unwrap();
+    assert!(written >= empty + 65536, "{written} after {empty}");
+    exec(&database, "BEGIN", vec![], false).await?;
+    assert_eq!(database.size().await?, None);
+    database
+        .call(DatabaseCall::Rollback, rows::ignored())
+        .await?;
+    assert_eq!(database.size().await?, Some(written));
+    Ok(())
+}

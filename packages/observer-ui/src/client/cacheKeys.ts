@@ -8,6 +8,8 @@ export const requestsKey = (baseUrl: string) => ["requests", baseUrl] as const
 
 export const residencyKey = (baseUrl: string, actorName: string, actorId?: string) => ["residency", baseUrl, actorName, actorId] as const
 
+export const resourcesKey = (baseUrl: string, actorName: string, actorId: string) => ["resources", baseUrl, actorName, actorId] as const
+
 export const eventHistoryKey = (baseUrl: string, types: string[], actorName?: string, actorId?: string) => ["events/history", baseUrl, types.join(), actorName, actorId] as const
 
 export const webSocketsKey = (baseUrl: string) => ["websockets", baseUrl] as const

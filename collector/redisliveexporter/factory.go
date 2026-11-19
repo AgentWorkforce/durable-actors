@@ -18,6 +18,7 @@ func NewFactory() exporter.Factory {
 		func() component.Config { return &Config{} },
 		exporter.WithTraces(createTraces, component.StabilityLevelDevelopment),
 		exporter.WithLogs(createLogs, component.StabilityLevelDevelopment),
+		exporter.WithMetrics(createMetrics, component.StabilityLevelDevelopment),
 	)
 }
 
@@ -30,5 +31,11 @@ func createTraces(ctx context.Context, set exporter.Settings, cfg component.Conf
 func createLogs(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
 	live := &liveExporter{config: cfg.(*Config)}
 	return exporterhelper.NewLogs(ctx, set, cfg, live.pushLogs,
+		exporterhelper.WithStart(live.start), exporterhelper.WithShutdown(live.shutdown))
+}
+
+func createMetrics(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
+	live := &liveExporter{config: cfg.(*Config)}
+	return exporterhelper.NewMetrics(ctx, set, cfg, live.pushMetrics,
 		exporterhelper.WithStart(live.start), exporterhelper.WithShutdown(live.shutdown))
 }

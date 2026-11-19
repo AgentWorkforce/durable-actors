@@ -15,6 +15,7 @@ pub(crate) mod logs;
 pub(crate) mod metrics;
 pub(crate) mod otlp;
 pub(crate) mod persistence;
+pub(crate) mod resources;
 pub(crate) mod sockets;
 use live::{InProcessFeed, LiveFeed, LiveStream};
 use persistence::{TraceQueries, sqlite::SqliteTracePersistence};
@@ -179,6 +180,16 @@ impl TraceStore {
         validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
         query.validate().context(InvalidTraceQuery)?;
         self.queries.queue_waits(project_id, query).await
+    }
+
+    pub(crate) async fn resources(
+        &self,
+        project_id: &str,
+        query: &resources::ResourceQuery,
+    ) -> Result<resources::ResourceUsage> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.resources(project_id, query).await
     }
 
     pub(crate) async fn websockets(

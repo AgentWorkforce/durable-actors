@@ -531,6 +531,54 @@ pub(super) struct Log {
     message: String,
 }
 
+/// An actor instance's resource usage. Each sample is the highest in its period.
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Resources {
+    /// The requests and limits in force over the window, from when each sandbox was claimed. An
+    /// absent limit leaves that resource uncapped.
+    sandboxes: Vec<SandboxResources>,
+    /// The latest SQLite database size, however long ago it was reported.
+    database_bytes: Option<u64>,
+    usage: Vec<UsageSample>,
+    database: Vec<DatabaseSample>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SandboxResources {
+    #[schemars(with = "String")]
+    #[serde(rename(deserialize = "claimedAtMs"), serialize_with = "timestamp")]
+    since: u64,
+    cpu_millis: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_limit_millis: Option<u32>,
+    memory_mib: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_limit_mib: Option<u32>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct UsageSample {
+    #[schemars(with = "String")]
+    #[serde(rename(deserialize = "atMs"), serialize_with = "timestamp")]
+    at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_cores: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_bytes: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseSample {
+    #[schemars(with = "String")]
+    #[serde(rename(deserialize = "atMs"), serialize_with = "timestamp")]
+    at: u64,
+    bytes: u64,
+}
+
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Session {

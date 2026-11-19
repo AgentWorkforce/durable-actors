@@ -10,6 +10,7 @@ use super::{
     logs::{LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
     otlp::PlatformLog,
+    resources::{ResourceQuery, ResourceUsage},
     sockets::SocketRecord,
 };
 
@@ -53,6 +54,10 @@ pub(crate) trait TraceQueries: Send + Sync {
     ) -> Result<Vec<PlatformLog>>;
     /// The public actor contract of the project's latest deployment.
     async fn deployed_contract(&self, project_id: &str) -> Result<Option<serde_json::Value>>;
+    /// Only the analytics store holds sandbox usage.
+    async fn resources(&self, _project_id: &str, _query: &ResourceQuery) -> Result<ResourceUsage> {
+        Ok(ResourceUsage::default())
+    }
 }
 
 /// Answers every telemetry query with nothing, for deployments without an analytics backend.

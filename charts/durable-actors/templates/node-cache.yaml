@@ -13,7 +13,6 @@ spec:
         app.kubernetes.io/name: {{ include "actors.nodeCacheName" . }}
     spec:
       automountServiceAccountToken: false
-      # Runs beside the sandboxes but outside gVisor, so customer code never shares its pod.
       nodeSelector:
         sandbox.gke.io/runtime: gvisor
         {{- with .Values.nodeCache.nodeSelector }}
@@ -28,7 +27,6 @@ spec:
         fsGroup: 10000
       {{- if .Values.nodeCache.hostPath }}
       initContainers:
-        # The kubelet creates a missing node directory as root, and fsGroup does not apply to it.
         - name: cache-owner
           image: {{ include "actors.image" .Values.images.controlPlane | quote }}
           command: [chown, "10000:10000", /cache]
@@ -79,7 +77,6 @@ kind: Service
 metadata:
   name: {{ include "actors.nodeCacheName" . }}
 spec:
-  # Each sandbox reaches the cache on its own node.
   internalTrafficPolicy: Local
   selector:
     app.kubernetes.io/name: {{ include "actors.nodeCacheName" . }}

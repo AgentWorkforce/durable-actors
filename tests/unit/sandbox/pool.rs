@@ -15,6 +15,15 @@ impl SparePool {
     }
 }
 
+#[derive(Default)]
+struct RecordedClaims(std::sync::Mutex<Vec<SandboxClaim>>);
+
+impl PlatformEvents<SandboxClaim> for RecordedClaims {
+    fn record(&self, claim: SandboxClaim) {
+        self.0.lock().unwrap().push(claim);
+    }
+}
+
 fn pool(database: PostgresDatabase) -> Arc<SparePool> {
     SparePool::new(
         database,
@@ -38,6 +47,7 @@ async fn platform_spares_follow_current_images_while_custom_spares_remain_pinned
                 typescript: "im-b".into(),
                 python: "im-python".into(),
             }),
+            Arc::new(crate::platform_events::NoPlatformEvents),
         );
         let registry = LocalAdminRegistry::default();
         let platform: HostLaunchSpec = serde_json::from_value(serde_json::json!({
@@ -160,7 +170,7 @@ async fn expired_claims_and_outdated_runtime_spares_cannot_be_reused() -> Result
            pool.store.0.execute("UPDATE durable_actors_spares SET expires_at = clock_timestamp() - interval '1 second'", &[]).await?;
            let spare = SpareHandle { node: String::new(),
 control_route: String::new(),
-control_token: String::new(), name: "do-actor-expired".into(), resource_id: "sb-expired".into(), route: "https://spare.test".into(), canonical_region: "region".into() };
+control_token: String::new(), name: "do-actor-expired".into(), resource_id: "sb-expired".into(), route: "https://spare.test".into(), canonical_region: "region".into()};
            assert!(pool.remember("host", "revision", &spare).await.is_err());
            let old = reserve(&pool.store, "old-runtime", 1).await?.unwrap();
            pool.store.publish("old-runtime", &SpareHandle { name: old.clone(), ..spare.clone() }, 600).await?;
@@ -205,7 +215,7 @@ async fn concurrent_pool_claims_are_exclusive_and_never_return_assigned_sandboxe
                             name: name.clone(),
                             resource_id: format!("sb-{name}"),
                             route: "https://spare.test".into(),
-                            canonical_region: "region-a".into()
+                            canonical_region: "region-a".into(),
                         },
                         600
                     )
@@ -282,7 +292,14 @@ async fn claims_record_the_actor_each_sandbox_was_claimed_for() -> Result<()> {
     use claims::{ClaimedActors, PoolClaims};
     with_postgres(async |fixture| {
         let database = PostgresDatabase::connect(&fixture.url).await?;
-        let pool = pool(database.clone());
+        let recorded = Arc::new(RecordedClaims::default());
+        let pool = SparePool::with_runtime_images(
+            database.clone(),
+            Arc::new(crate::sandbox::testing::UnusedSandboxProvider),
+            config(1),
+            None,
+            recorded.clone(),
+        );
         let claims = PoolClaims(database);
         let actor = ActorKey {
             project_id: "project".into(),
@@ -318,9 +335,15 @@ async fn claims_record_the_actor_each_sandbox_was_claimed_for() -> Result<()> {
         // A failed assignment's kill is looked up while its sandbox waits to be retired.
         pool.failed("host-warm").await?;
         assert_eq!(claims.actor_of(&warm.name).await?, Some(actor.clone()));
-        assert_eq!(claims.actor_of("do-actor-cold").await?, Some(actor));
+        assert_eq!(claims.actor_of("do-actor-cold").await?, Some(actor.clone()));
         assert_eq!(claims.actor_of(&unnamed.name).await?, None);
         assert_eq!(claims.actor_of("unknown").await?, None);
+        pool.record_claim(&actor, "do-actor-cold", &ResourceLimits::default(), 1_000);
+        let recorded = recorded.0.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].sandbox_id, "do-actor-cold");
+        assert_eq!(recorded[0].actor, actor);
+        assert_eq!(recorded[0].at_ms, 1_000);
         Ok(())
     })
     .await

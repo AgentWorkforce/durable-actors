@@ -48,6 +48,7 @@ async fn lifecycle_reports_use_authenticated_identity() -> Result<()> {
                     resources: Default::default(),
                     resident: Some(kind != LifecycleKind::Stopped),
                     last_active_at_ms: None,
+                    database_bytes: None,
                     waiting: Vec::new(),
                 },
             },

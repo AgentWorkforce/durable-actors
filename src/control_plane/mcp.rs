@@ -42,8 +42,8 @@ mod views;
 use pages::{Cursor, Page};
 use views::{
     Actors, ContractReply, Deployment, Health, InstanceFilter, Inventory, Invocation, Log, Metrics,
-    Outcome, QueueWait, Request as RequestView, Session, StateHistory, StateHistoryReply,
-    StateQuery, StateReply, StateView,
+    Outcome, QueueWait, Request as RequestView, Resources, Session, StateHistory,
+    StateHistoryReply, StateQuery, StateReply, StateView,
 };
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 40_000;
@@ -52,6 +52,7 @@ const DEFAULT_PAGE_SIZE: usize = 25;
 const MAX_PAGE_SIZE: usize = 100;
 const DEFAULT_QUEUE_WAITS: usize = 10;
 const DEFAULT_WINDOW_MINUTES: u64 = 60;
+const RESOURCE_SAMPLES: u64 = 60;
 const ORGANIZATION_HEADER: &str = "x-durable-actors-organization-id";
 const INSTRUCTIONS: &str = "Inspect and call the Durable Actors deployed in your organization. \
 Start with list_projects, then pass a projectId to the other tools. \
@@ -334,6 +335,32 @@ impl DeveloperTools {
         Ok(respond(metrics.and_then(|metrics| {
             queue_waits.map(|queue_waits| Health::new(metrics, queue_waits, limit))
         })))
+    }
+
+    #[tool(
+        description = "Read an actor instance's CPU and memory, measured from outside the sandboxes it ran in, and its SQLite database size. Each sample is the highest in its period. A dormant instance uses no CPU or memory.",
+        output_schema = schema_for_output::<Resources>(),
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_actor_resources(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(request): Parameters<ProjectRequest<ResourceParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project_id = &request.project_id;
+        let params = request.input;
+        let minutes = params.since_minutes.unwrap_or(DEFAULT_WINDOW_MINUTES);
+        let to_ms = wall_clock_ms()?;
+        let from_ms = to_ms.saturating_sub(minutes.saturating_mul(60_000));
+        let query = json!({
+            "actorName": params.actor_name,
+            "actorId": params.actor_id,
+            "fromMs": from_ms,
+            "toMs": to_ms,
+            "bucketMs": (to_ms - from_ms).div_ceil(RESOURCE_SAMPLES).max(1),
+        });
+        self.read::<Resources>(&parts, project_id, "observe/resources", query)
+            .await
     }
 
     #[tool(
@@ -810,6 +837,17 @@ struct HealthParams {
     /// How many of the longest queue waits to return, up to 100. Defaults to 10.
     #[serde(skip_serializing)]
     limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ResourceParams {
+    /// Actor class name.
+    actor_name: String,
+    /// Actor instance ID.
+    actor_id: String,
+    /// Only the last N minutes, in up to 60 samples. Defaults to 60.
+    since_minutes: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]

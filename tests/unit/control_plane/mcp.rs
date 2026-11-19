@@ -12,7 +12,7 @@ use super::*;
 async fn lists_developer_tools() {
     let reply = rpc(test_router(Router::new()).await, "tools/list", json!({})).await;
     let tools = reply["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 11);
     for tool in tools {
         assert_eq!(tool["outputSchema"]["type"], "object", "{}", tool["name"]);
     }
@@ -64,6 +64,40 @@ async fn tool_calls_forward_the_credential_and_filters() {
             assert!(query.split('&').any(|item| item == pair), "{query}");
         }
     }
+}
+
+#[tokio::test]
+async fn resources_read_one_instance_with_readable_times() {
+    let api = Router::new().route(
+        "/v1/projects/{project}/observe/resources",
+        get(|uri: Uri| async move {
+            let query = uri.query().unwrap_or_default().to_owned();
+            for pair in ["actorName=Counter", "actorId=one"] {
+                assert!(query.split('&').any(|item| item == pair), "{query}");
+            }
+            Json(json!({
+                "sandboxes": [{ "claimedAtMs": 0, "cpuMillis": 500, "memoryMib": 512, "memoryLimitMib": 512 }],
+                "usage": [{ "atMs": 0, "cpuCores": 0.5, "memoryBytes": 1024 }],
+                "database": [{ "atMs": 0, "bytes": 4096 }],
+                "databaseBytes": 4096
+            }))
+        }),
+    );
+    let reply = call_tool(
+        api,
+        "get_actor_resources",
+        json!({ "actorName": "Counter", "actorId": "one" }),
+    )
+    .await;
+    assert_eq!(
+        text(&reply),
+        json!({
+            "sandboxes": [{ "since": "1970-01-01T00:00:00.000Z", "cpuMillis": 500, "memoryMib": 512, "memoryLimitMib": 512 }],
+            "databaseBytes": 4096,
+            "usage": [{ "at": "1970-01-01T00:00:00.000Z", "cpuCores": 0.5, "memoryBytes": 1024 }],
+            "database": [{ "at": "1970-01-01T00:00:00.000Z", "bytes": 4096 }]
+        })
+    );
 }
 
 #[tokio::test]
@@ -261,6 +295,7 @@ async fn every_actor_tool_hides_projects_outside_the_organization() {
         "list_requests",
         "list_logs",
         "get_health",
+        "get_actor_resources",
         "list_websocket_sessions",
         "invoke_actor",
     ] {

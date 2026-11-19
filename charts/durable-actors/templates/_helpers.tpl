@@ -4,6 +4,12 @@
 {{- define "actors.collectorName" -}}
 {{- printf "%s-collector" (include "actors.name" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+{{- define "actors.nodeCollectorName" -}}
+{{- printf "%s-node-collector" (include "actors.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- define "actors.nodeCollectorClusterName" -}}
+{{- printf "%s-%s" .Release.Namespace (include "actors.nodeCollectorName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
 {{- define "actors.nodeCacheName" -}}
 {{- printf "%s-node-cache" (include "actors.name" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -32,6 +38,9 @@
 {{- if .Values.telemetry.collector.enabled -}}
 {{- if ne .Values.analytics.backend "clickhouse" }}{{ fail "telemetry.collector requires analytics.backend=clickhouse" }}{{ end -}}
 {{- if not .Values.redis.urlSecretKey }}{{ fail "telemetry.collector requires redis.urlSecretKey for live updates" }}{{ end -}}
+{{- end -}}
+{{- if and .Values.telemetry.nodeCollector.enabled (not (and .Values.telemetry.collector.enabled .Values.telemetry.collector.platform.issuer)) -}}
+{{ fail "telemetry.nodeCollector requires telemetry.collector with platform.issuer" }}
 {{- end -}}
 {{- if .Values.ingress.enabled -}}
 {{- if or (empty .Values.ingress.className) (empty .Values.ingress.tlsSecret) }}{{ fail "ingress requires className and tlsSecret" }}{{ end -}}

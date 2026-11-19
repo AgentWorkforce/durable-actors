@@ -57,6 +57,10 @@ pub(super) fn local_router(inspector: ActorInspector) -> Router {
             get(queue_waits),
         )
         .route(
+            "/v1/projects/{project_id}/observe/resources",
+            get(resource_usage),
+        )
+        .route(
             "/v1/projects/{project_id}/observe/websockets",
             get(websocket_history),
         )
@@ -256,6 +260,22 @@ async fn queue_waits(
         .inspector
         .traces
         .queue_waits(&project, &query)
+        .await
+        .map_err(trace_query_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)).into_response())
+}
+
+async fn resource_usage(
+    State(state): State<InspectionApi>,
+    path: Path<ProjectPath>,
+    query: Result<Query<crate::request_traces::resources::ResourceQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let project = path.0.project_id;
+    let Query(query) = query.map_err(ApiError::bad_request)?;
+    let result = state
+        .inspector
+        .traces
+        .resources(&project, &query)
         .await
         .map_err(trace_query_error)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)).into_response())

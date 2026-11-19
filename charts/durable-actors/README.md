@@ -98,6 +98,8 @@ The collector accepts only host tokens and replaces any tenant attributes with t
 
 The control plane reports lifecycle reports, WebSocket connections and deployments the same way. Set `telemetry.collector.platform.issuer` to your cluster's service-account token issuer (`https://container.googleapis.com/v1/projects/PROJECT/locations/LOCATION/clusters/CLUSTER` on GKE). The collector then accepts these events on port 4319, which sandboxes cannot reach, writes them to `platform_events`, and publishes them for the dashboard's live updates. Without it, ClickHouse receives no lifecycle reports, so the dashboard lists no actors, open connections or deployed actor classes.
 
+With the platform issuer set, `telemetry.nodeCollector.enabled: true` runs a collector on each gVisor sandbox node. It reads the CPU and working set of each sandbox's runtime container from the node's kubelet every 5 seconds, which leaves out gVisor's own usage, using a ClusterRole that grants only `get` on `nodes/stats`, and sends them over OTLP/HTTP on port 4320, which sandboxes cannot reach. The collector writes them to `sandbox_usage` and publishes each sample to the project of the actor its pod was claimed for.
+
 ## Usage publishing
 
 To publish actor activation usage, set an existing Pub/Sub topic:

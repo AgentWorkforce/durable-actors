@@ -293,6 +293,14 @@
               "properties": {"issuer": {"type": "string"}}
             }
           }
+        },
+        "nodeCollector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "resources": {"type": "object"}
+          }
         }
       }
     },

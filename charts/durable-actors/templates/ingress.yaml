@@ -17,7 +17,6 @@ spec:
       http:
         paths:
           {{- if .Values.telemetry.collector.enabled }}
-          # Sandboxes outside the cluster export OTLP over gRPC through the ingress.
           {{- range list "/opentelemetry.proto.collector.trace.v1.TraceService" "/opentelemetry.proto.collector.logs.v1.LogsService" }}
           - path: {{ . }}
             pathType: Prefix

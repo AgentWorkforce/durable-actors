@@ -29,6 +29,15 @@ impl ActorExecutor for Executor {
     }
 }
 
+struct Database;
+
+#[async_trait]
+impl DatabaseSize for Database {
+    async fn database_bytes(&self) -> Option<u64> {
+        Some(4096)
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn reports_activation_heartbeat_and_graceful_shutdown() -> Result<()> {
     let (sent, mut received) = mpsc::unbounded_channel();
@@ -38,6 +47,7 @@ async fn reports_activation_heartbeat_and_graceful_shutdown() -> Result<()> {
         7,
         ResourceLimits::default(),
         Arc::new(Executor),
+        Arc::new(Database),
         observed,
     )?;
     let started = received.recv().await.unwrap();
@@ -45,6 +55,7 @@ async fn reports_activation_heartbeat_and_graceful_shutdown() -> Result<()> {
     assert_eq!(started.owner_epoch, 7);
     assert_eq!(started.sequence, 1);
     assert!(started.occurred_at_ms >= started.started_at_ms);
+    assert_eq!(started.database_bytes, Some(4096));
     let changed_at = tokio::time::Instant::now();
     status.send_modify(|status| {
         status.last_active_at_ms = Some(started.occurred_at_ms);
@@ -74,5 +85,6 @@ async fn reports_activation_heartbeat_and_graceful_shutdown() -> Result<()> {
     assert_eq!(stopped.resources, started.resources);
     assert_eq!(stopped.resident, Some(false));
     assert!(stopped.waiting.is_empty());
+    assert_eq!(stopped.database_bytes, Some(4096));
     Ok(())
 }

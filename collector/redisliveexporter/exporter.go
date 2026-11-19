@@ -27,7 +27,7 @@ func Channel(project, signal string) string {
 
 type liveExporter struct {
 	config *Config
-	client *redis.Client
+	store  liveStore
 }
 
 func (e *liveExporter) start(context.Context, component.Host) error {
@@ -40,15 +40,15 @@ func (e *liveExporter) start(context.Context, component.Host) error {
 			return err
 		}
 	}
-	e.client = redis.NewClient(options)
+	e.store = redisStore{redis.NewClient(options)}
 	return nil
 }
 
 func (e *liveExporter) shutdown(context.Context) error {
-	if e.client == nil {
+	if e.store == nil {
 		return nil
 	}
-	return e.client.Close()
+	return e.store.close()
 }
 
 func (e *liveExporter) pushTraces(ctx context.Context, traces ptrace.Traces) error {
@@ -60,27 +60,35 @@ func (e *liveExporter) pushTraces(ctx context.Context, traces ptrace.Traces) err
 }
 
 func (e *liveExporter) pushLogs(ctx context.Context, logs plog.Logs) error {
+	// Claims name projects in their records, so only trusted senders may record them.
+	if e.config.ProjectFromRecords {
+		if err := e.store.remember(ctx, sandboxClaims(logs)); err != nil {
+			return err
+		}
+	}
 	payloads, err := logsByProject(logs, e.config.ProjectFromRecords)
 	if err != nil {
 		return err
 	}
-	channel := e.config.LogsChannel
-	if channel == "" {
-		channel = "logs"
+	return e.publish(ctx, e.logsChannel(), payloads)
+}
+
+func (e *liveExporter) logsChannel() string {
+	if e.config.LogsChannel == "" {
+		return "logs"
 	}
-	return e.publish(ctx, channel, payloads)
+	return e.config.LogsChannel
 }
 
 func (e *liveExporter) publish(ctx context.Context, signal string, payloads map[string][]byte) error {
 	if len(payloads) == 0 {
 		return nil
 	}
-	pipeline := e.client.Pipeline()
+	messages := make(map[string][]byte, len(payloads))
 	for project, payload := range payloads {
-		pipeline.Publish(ctx, Channel(project, signal), payload)
+		messages[Channel(project, signal)] = payload
 	}
-	_, err := pipeline.Exec(ctx)
-	return err
+	return e.store.publish(ctx, messages)
 }
 
 func tracesByProject(traces ptrace.Traces) (map[string][]byte, error) {
@@ -127,6 +135,10 @@ func logsByProject(logs plog.Logs, fromRecords bool) (map[string][]byte, error) 
 			splitRecords(records, batch)
 		}
 	}
+	return marshalLogs(batches)
+}
+
+func marshalLogs(batches map[string]plog.Logs) (map[string][]byte, error) {
 	payloads := make(map[string][]byte, len(batches))
 	for project, batch := range batches {
 		payload, err := plogotlp.NewExportRequestFromLogs(batch).MarshalProto()

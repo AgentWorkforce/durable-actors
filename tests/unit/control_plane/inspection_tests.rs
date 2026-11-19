@@ -205,6 +205,7 @@ async fn observability_requires_admin_credentials() -> Result<()> {
         "/v1/projects/default/observe/requests",
         "/v1/projects/default/observe/metrics",
         "/v1/projects/default/observe/queue-waits",
+        "/v1/projects/default/observe/resources?actorName=Room&actorId=one&fromMs=0&toMs=1&bucketMs=1",
         "/v1/projects/default/observe/websockets",
         "/v1/projects/default/observe/state?actorName=Room&actorId=one",
         "/v1/projects/default/observe/state/history?actorName=Room&actorId=one",
@@ -329,6 +330,7 @@ impl Fixture {
                     resources: Default::default(),
                     resident: Some(kind != LifecycleKind::Stopped),
                     last_active_at_ms: None,
+                    database_bytes: None,
                     waiting,
                 },
             })
@@ -1156,6 +1158,44 @@ async fn residency_api_filters_projects_and_actors_and_validates_ranges() -> Res
             .await?
             .status(),
         StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sandbox_usage_streams_live_as_the_collector_publishes_it() -> Result<()> {
+    use crate::{
+        platform_events::{PlatformRecord, sandboxes::USAGE},
+        request_traces::otlp::{self, Signal},
+    };
+    use opentelemetry::logs::AnyValue;
+    use prost::Message;
+    let fixture = Fixture::start().await?;
+    let mut events = EventReader::open(
+        &fixture,
+        "/v1/projects/default/observe/events?signals=platform",
+    )
+    .await?;
+    let actor = fixture.actor("one");
+    let record = PlatformRecord {
+        name: USAGE,
+        at_ms: 1000,
+        attributes: vec![
+            (otlp::PROJECT_ID, AnyValue::from(actor.project_id.clone())),
+            (otlp::ACTOR_NAME, AnyValue::from(actor.actor_name.clone())),
+            (otlp::ACTOR_ID, AnyValue::from(actor.actor_id.clone())),
+        ],
+        body: Some(r#"{"cpuCores":0.5,"memoryBytes":1024}"#.into()),
+    };
+    fixture.live.send(
+        otlp::live_channel(&actor.project_id, Signal::Platform),
+        record.export_request("collector").encode_to_vec(),
+    );
+    let (name, streamed) = events.next().await?;
+    assert_eq!(name, "usage");
+    assert_eq!(
+        streamed[0],
+        json!({"actorName": "Room.with.dots", "actorId": "one", "atMs": 1000, "cpuCores": 0.5, "memoryBytes": 1024})
     );
     Ok(())
 }

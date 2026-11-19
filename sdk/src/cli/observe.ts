@@ -55,6 +55,7 @@ class Observer {
                     | "listEventHistory"
                     | "listRequests"
                     | "listResidency"
+                    | "getResources"
                     | "listLogs"
                     | "getLogHistogram"
                 >
@@ -156,6 +157,7 @@ class Observer {
             "/api/observe/requests": this.client.listRequests,
             "/api/observe/metrics": this.client.getMetrics,
             "/api/observe/queue-waits": this.client.listQueueWaits,
+            "/api/observe/resources": this.client.getResources,
             "/api/observe/websockets": this.client.listWebSockets,
             "/api/observe/logs": this.client.listLogs,
             "/api/observe/logs/histogram": this.client.getLogHistogram

@@ -46,6 +46,9 @@ pub(crate) struct LifecycleReport {
     #[serde(default)]
     pub last_active_at_ms: Option<u64>,
     pub waiting: Vec<WaitingOperation>,
+    /// The SQLite database's committed size: page count × page size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

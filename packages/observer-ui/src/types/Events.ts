@@ -14,6 +14,17 @@ export interface InstanceChange {
     staleAtMs: number | null
     lastActiveAtMs: number | null
     waiting: WaitingOperation[] | null
+    /** The SQLite database size, sampled at most every 10 seconds; null when not yet read. */
+    databaseBytes: number | null
+}
+
+/** One sample of the CPU and memory of the sandbox an instance runs in. */
+export interface ActorUsage {
+    actorName: string
+    actorId: string
+    atMs: number
+    cpuCores: number | null
+    memoryBytes: number | null
 }
 
 export interface ConnectionOpened {
@@ -59,8 +70,9 @@ export type ObserveEvent =
     | { type: "gatewayAlive"; item: GatewayAlive }
     | { type: "deployment"; item: Deployment }
     | { type: "kill"; item: ActorKill }
+    | { type: "usage"; item: ActorUsage }
 
-export const observeEventTypes: ObserveEvent["type"][] = ["request", "log", "instance", "connectionOpened", "connectionClosed", "gatewayAlive", "deployment", "kill"]
+export const observeEventTypes: ObserveEvent["type"][] = ["request", "log", "instance", "connectionOpened", "connectionClosed", "gatewayAlive", "deployment", "kill", "usage"]
 
 /** An event `observe/events/history` keeps: one that happens once. The other types have their own views. */
 export type RecordedEvent = Extract<ObserveEvent, { type: "kill" }>

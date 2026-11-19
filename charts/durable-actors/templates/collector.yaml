@@ -59,6 +59,7 @@ spec:
             - {name: health, containerPort: 13133}
             {{- if $platform }}
             - {name: otlp-internal, containerPort: 4319}
+            - {name: http-internal, containerPort: 4320}
             {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -112,7 +113,7 @@ spec:
   ports:
     - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc, appProtocol: grpc}
     {{- if $platform }}
-    # Gateways only: the sandbox network policy allows 4317 and nothing else.
     - {name: otlp-internal, port: 4319, targetPort: otlp-internal, appProtocol: grpc}
+    - {name: http-internal, port: 4320, targetPort: http-internal, appProtocol: http}
     {{- end }}
 {{- end }}

@@ -59,6 +59,7 @@ pub(crate) fn report(
             resources: Default::default(),
             resident,
             last_active_at_ms: None,
+            database_bytes: None,
             waiting: Vec::new(),
         },
     }

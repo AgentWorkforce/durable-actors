@@ -96,8 +96,7 @@ cargo test --locked -- --ignored
 For Kubernetes deployment changes:
 
 ```sh
-helm lint charts/durable-actors -f charts/durable-actors/tests/values.yaml
-bun test --timeout 60000 charts/durable-actors/tests/chart.test.mjs
+helm lint charts/durable-actors -f charts/durable-actors/ci/values.yaml
 ```
 
 For Python SDK changes, build the runtime and run from `sdk-python`:

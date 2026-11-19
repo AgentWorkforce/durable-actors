@@ -80,6 +80,7 @@ pub(super) enum ObserveEvent {
     GatewayAlive(GatewayAlive),
     Deployment(Deployment),
     Kill(ActorKill),
+    Usage(ActorUsage),
 }
 
 /// An instance as its latest lifecycle report leaves it.
@@ -94,6 +95,7 @@ pub(super) struct InstanceChange {
     pub stale_at_ms: Option<u64>,
     pub last_active_at_ms: Option<u64>,
     pub waiting: Option<Vec<WaitingOperation>>,
+    pub database_bytes: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -155,6 +157,17 @@ pub(super) struct ActorKill {
     pub reason: KillReason,
 }
 
+/// One sample of the CPU and memory of the sandbox an actor runs in.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ActorUsage {
+    pub actor_name: String,
+    pub actor_id: String,
+    pub at_ms: u64,
+    pub cpu_cores: Option<f64>,
+    pub memory_bytes: Option<u64>,
+}
+
 impl ObserveEvent {
     pub(super) fn name(&self) -> &'static str {
         match self {
@@ -166,6 +179,7 @@ impl ObserveEvent {
             Self::GatewayAlive(_) => "gatewayAlive",
             Self::Deployment(_) => "deployment",
             Self::Kill(_) => "kill",
+            Self::Usage(_) => "usage",
         }
     }
 }
@@ -270,14 +284,18 @@ pub(super) fn platform_event(log: &PlatformLog) -> Option<ObserveEvent> {
             }))
         }
         sandboxes::KILLED => kill(log),
+        sandboxes::USAGE => usage(log),
         _ => None,
     }
 }
 
 fn instance_change(log: &PlatformLog) -> Option<ObserveEvent> {
     let event: LifecycleEvent = serde_json::from_str(log.body.as_deref()?).ok()?;
-    let (actor_name, occurred_at_ms) =
-        (event.actor.actor_name.clone(), event.report.occurred_at_ms);
+    let (actor_name, occurred_at_ms, database_bytes) = (
+        event.actor.actor_name.clone(),
+        event.report.occurred_at_ms,
+        event.report.database_bytes,
+    );
     let instance = instance_overview(event, SystemClock.now_ms().ok()?);
     Some(ObserveEvent::Instance(InstanceChange {
         actor_name,
@@ -288,6 +306,7 @@ fn instance_change(log: &PlatformLog) -> Option<ObserveEvent> {
         stale_at_ms: instance.stale_at_ms,
         last_active_at_ms: instance.last_active_at_ms,
         waiting: instance.waiting,
+        database_bytes,
     }))
 }
 
@@ -328,6 +347,23 @@ fn kill(log: &PlatformLog) -> Option<ObserveEvent> {
         actor_id: log.string(otlp::ACTOR_ID)?,
         at_ms: log.at_ms,
         reason: serde_json::from_value(Value::String(log.string(otlp::KILL_REASON)?)).ok()?,
+    }))
+}
+
+fn usage(log: &PlatformLog) -> Option<ObserveEvent> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Sample {
+        cpu_cores: Option<f64>,
+        memory_bytes: Option<u64>,
+    }
+    let sample: Sample = serde_json::from_str(log.body.as_deref()?).ok()?;
+    Some(ObserveEvent::Usage(ActorUsage {
+        actor_name: log.string(otlp::ACTOR_NAME)?,
+        actor_id: log.string(otlp::ACTOR_ID)?,
+        at_ms: log.at_ms,
+        cpu_cores: sample.cpu_cores,
+        memory_bytes: sample.memory_bytes,
     }))
 }
 

@@ -5,10 +5,11 @@ import { useData } from "../../client/DatatContext.js"
 import { useTimeWindow } from "../../client/TimeRangeContext.js"
 import { formatAgo, formatClock, formatDuration } from "../../format.js"
 import { useInstanceRequests } from "../../hooks/useActorRequests.js"
+import { useEventHistory } from "../../hooks/useEventHistory.js"
 import { useResidency } from "../../hooks/useResidency.js"
+import { useResources } from "../../hooks/useResources.js"
 import { queueTime, serviceTime } from "../../lib/requestStats.js"
 import { describeWindow } from "../../lib/timeRange.js"
-// import { mockInstanceResources } from "../../mocks/instanceResources.js"
 import type { ActorInstance } from "../../types/Actors.js"
 import type { ResidencyPeriod } from "../../types/Residency.js"
 import type { TimeWindow } from "../../types/TimeRange.js"
@@ -23,10 +24,8 @@ import { Skeleton } from "../ui/skeleton.js"
 import { ConnectionsCard } from "./connectionsCard.js"
 import { EventsCard } from "./eventsCard.js"
 import { LogsCard, logsCardId } from "./logsCard.js"
-// import { MemoryCard } from "./memoryCard.js"
 import { RequestsCard } from "./requestsCard.js"
-
-// import { StorageCard } from "./storageCard.js"
+import { CpuCard, MemoryCard, StorageCard } from "./resourceCards.js"
 
 export function InstancePage() {
     const { actorName = "", actorId = "" } = useParams()
@@ -34,6 +33,9 @@ export function InstancePage() {
     const timeWindow = useTimeWindow()
     const { requests: ownRequests, isError: isRequestsError } = useInstanceRequests(actorName, actorId)
     const { residency, isError: isResidencyError } = useResidency(actorName, timeWindow, actorId)
+    const { resources, isError: isResourcesError } = useResources(actorName, actorId, timeWindow)
+    const { history: killHistory } = useEventHistory(["kill"], timeWindow, actorName, actorId)
+    const kills = (killHistory?.events ?? []).map(event => event.item).reverse()
     const instance = actorTypes?.actors.find(type => type.actorName === actorName)?.instances.find(candidate => candidate.actorId === actorId) ?? null
     const ownSessions = sessions?.filter(session => session.actorName === actorName && session.actorId === actorId) ?? null
     const livePeriods = residency && (groupLivePeriods(residency).get(actorId) ?? [])
@@ -42,8 +44,6 @@ export function InstancePage() {
         setLogRequestId(requestId)
         document.getElementById(logsCardId)?.scrollIntoView({ behavior: "smooth", block: "start" })
     }
-    // observerClient doesn't serve storage or memory yet; swap this mock for those endpoints once it does.
-    // const resources = instance && mockInstanceResources(instance)
 
     return (
         <section aria-labelledby="instance-heading" className="flex flex-col gap-5">
@@ -74,8 +74,9 @@ export function InstancePage() {
                             failed={isRequestsError}
                             timeWindow={timeWindow}
                         />
-                        {/* <StorageCard storage={resources?.storage ?? null} failed={isError} />
-                        <MemoryCard memory={resources?.memory ?? null} loading={!instance && !isError} failed={isError} /> */}
+                        <CpuCard resources={resources} failed={isResourcesError} timeWindow={timeWindow} />
+                        <MemoryCard resources={resources} kills={kills} failed={isResourcesError} timeWindow={timeWindow} />
+                        <StorageCard resources={resources} failed={isResourcesError} timeWindow={timeWindow} />
                     </div>
                     <RequestsCard requests={ownRequests} failed={isRequestsError} timeWindow={timeWindow} onShowLogs={showRequestLogs} />
                     <ConnectionsCard

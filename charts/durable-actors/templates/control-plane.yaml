@@ -15,7 +15,6 @@ metadata:
 spec:
   replicas: {{ $workload.replicas }}
   {{- if eq $workload.role "pool_manager" }}
-  # Exactly one pool manager: the old pod stops before its replacement starts.
   strategy: {type: Recreate}
   {{- end }}
   selector:
@@ -70,7 +69,6 @@ spec:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 2
           {{- end }}
-          # The pool manager reports unhealthy once its housekeeping loop stops completing passes.
           livenessProbe:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 10
@@ -183,7 +181,6 @@ spec:
         - name: tmp
           emptyDir: {}
         {{- if and $.Values.telemetry.collector.enabled $.Values.telemetry.collector.platform.issuer }}
-        # The collector accepts platform events only with a token for this audience.
         - name: platform-telemetry
           projected:
             sources:

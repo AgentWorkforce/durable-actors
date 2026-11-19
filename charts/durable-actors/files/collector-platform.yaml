@@ -1,7 +1,3 @@
-# Events the control plane reports (WebSocket connections and deployments), merged into
-# collector.yaml when enabled. The control plane is trusted and reports for many projects at once,
-# so it authenticates with Kubernetes service-account tokens on its own port, which sandboxes
-# cannot reach, and each record carries its project. Host tokens are not accepted here.
 extensions:
   oidc/platform:
     providers:
@@ -15,6 +11,10 @@ receivers:
         endpoint: 0.0.0.0:4319
         auth:
           authenticator: oidc/platform
+      http:
+        endpoint: 0.0.0.0:4320
+        auth:
+          authenticator: oidc/platform
 
 exporters:
   clickhouse/platform:
@@ -22,9 +22,10 @@ exporters:
     database: ${env:CLICKHOUSE_DATABASE}
     username: ${env:CLICKHOUSE_USER}
     password: ${env:CLICKHOUSE_PASSWORD}
-    # The control plane owns the schema (src/request_traces/persistence/clickhouse/schema.sql).
     create_schema: false
     logs_table_name: platform_events
+    metrics_tables:
+      gauge: {name: sandbox_usage}
     sending_queue:
       batch: {}
   redislive/platform:
@@ -34,10 +35,13 @@ exporters:
     project_from_records: true
 
 service:
-  # Lists replace rather than merge, so this repeats collector.yaml's extensions.
   extensions: [health_check, oidc, oidc/platform]
   pipelines:
     logs/platform:
+      receivers: [otlp/internal]
+      processors: [memory_limiter]
+      exporters: [clickhouse/platform, redislive/platform]
+    metrics/platform:
       receivers: [otlp/internal]
       processors: [memory_limiter]
       exporters: [clickhouse/platform, redislive/platform]

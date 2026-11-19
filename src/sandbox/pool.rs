@@ -8,6 +8,7 @@ use super::{CreateSpareRequest, ResourceLimits, SandboxProvider, SpareHandle, Sp
 use crate::{
     actor::ActorKey,
     control_plane::admin::{AdminRegistry, HostLaunchSpec},
+    platform_events::{PlatformEvents, sandboxes::SandboxClaim},
     postgres::PostgresDatabase,
 };
 
@@ -45,6 +46,7 @@ pub(crate) struct SparePool {
     provider: Arc<dyn SandboxProvider>,
     pub config: PoolConfig,
     runtime_images: Option<crate::control_plane::RuntimeImages>,
+    claims: Arc<dyn PlatformEvents<SandboxClaim>>,
     heartbeat: std::sync::atomic::AtomicU64,
     refills: replenishment::RefillTurns,
 }
@@ -56,20 +58,29 @@ impl SparePool {
         provider: Arc<dyn SandboxProvider>,
         config: PoolConfig,
     ) -> Arc<Self> {
-        Self::with_runtime_images(database, provider, config, None)
+        Self::with_runtime_images(
+            database,
+            provider,
+            config,
+            None,
+            Arc::new(crate::platform_events::NoPlatformEvents),
+        )
     }
 
+    /// `claims` records which actor each claimed sandbox runs.
     pub fn with_runtime_images(
         database: PostgresDatabase,
         provider: Arc<dyn SandboxProvider>,
         config: PoolConfig,
         runtime_images: Option<crate::control_plane::RuntimeImages>,
+        claims: Arc<dyn PlatformEvents<SandboxClaim>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store: PoolStore(database, config.kind),
             provider,
             config,
             runtime_images,
+            claims,
             heartbeat: now_ms().into(),
             refills: Default::default(),
         })
@@ -98,6 +109,22 @@ impl SparePool {
             )
             .await?;
         Ok(result)
+    }
+
+    /// Records which actor a sandbox runs, from `claimed_at_ms`, once the sandbox is running it.
+    pub(crate) fn record_claim(
+        &self,
+        actor: &ActorKey,
+        sandbox_id: &str,
+        resources: &ResourceLimits,
+        claimed_at_ms: u64,
+    ) {
+        self.claims.record(SandboxClaim {
+            actor: actor.clone(),
+            sandbox_id: sandbox_id.to_owned(),
+            resources: resources.clone(),
+            at_ms: claimed_at_ms,
+        });
     }
 
     fn has_tier(&self, resources: &ResourceLimits) -> bool {
