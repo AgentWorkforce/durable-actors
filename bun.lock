@@ -167,7 +167,7 @@
     },
     "packages/observer-ui": {
       "name": "durable-actors-observer",
-      "version": "0.19.0",
+      "version": "0.19.1",
       "dependencies": {
         "@radix-ui/react-dialog": "^1.1.23",
         "@radix-ui/react-popover": "^1.1.23",
@@ -227,7 +227,7 @@
     },
     "sdk": {
       "name": "durable-actors",
-      "version": "0.19.0",
+      "version": "0.19.1",
       "bin": {
         "durable-actors": "bin/durable-actors.js",
       },
