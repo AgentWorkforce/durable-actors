@@ -13,13 +13,17 @@ use axum::{
     routing::any,
 };
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::{
-        tool::{Extension, schema_for_output},
+        tool::{Extension, ToolCallContext, schema_for_output},
         wrapper::Parameters,
     },
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ServerCapabilities, ServerConfig,
+    },
     schemars::{self, JsonSchema},
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
@@ -36,6 +40,7 @@ use super::{
     public_api::{ApiError, authorized_admin},
 };
 
+mod call_log;
 mod pages;
 mod views;
 
@@ -53,7 +58,7 @@ const MAX_PAGE_SIZE: usize = 100;
 const DEFAULT_QUEUE_WAITS: usize = 10;
 const DEFAULT_WINDOW_MINUTES: u64 = 60;
 const RESOURCE_SAMPLES: u64 = 60;
-const ORGANIZATION_HEADER: &str = "x-durable-actors-organization-id";
+pub(super) const ORGANIZATION_HEADER: &str = "x-durable-actors-organization-id";
 const INSTRUCTIONS: &str = "Inspect and call the Durable Actors deployed in your organization. \
 Start with list_projects, then pass a projectId to the other tools. \
 Use describe_deployment to learn the actor classes, their methods and types, then \
@@ -446,6 +451,19 @@ impl ServerHandler for DeveloperTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let call = call_log::ToolCall::start(&request, &context);
+        let response = Self::tool_router()
+            .call(ToolCallContext::new(self, request, context))
+            .await;
+        call.finish(&response);
+        response
     }
 }
 

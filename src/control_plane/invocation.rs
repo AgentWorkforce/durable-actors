@@ -72,9 +72,18 @@ pub(super) async fn invoke(
     };
     invocation.validate().map_err(ApiError::bad_request)?;
     let outcome = resolve_and_dispatch(&state, &headers, request.home_region, &invocation).await?;
+    let failure = outcome.failure.clone();
     let body =
         JsonBody::with_field(&json!({}), "outcome", outcome.text).map_err(ApiError::internal)?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], body).into_response())
+    let mut response = ([(header::CACHE_CONTROL, "no-store")], body).into_response();
+    if let Some(code) = failure {
+        let failure = super::request_outcome::Failure {
+            code,
+            message: None,
+        };
+        response.extensions_mut().insert(failure);
+    }
+    Ok(response)
 }
 
 pub(super) async fn invoke_from_host(
@@ -299,13 +308,17 @@ async fn send_invocation(
         Ok(response) => response,
         Err(error) if error.is_connect() => {
             return Ok(HostReply::not_run(
+                "upstream_not_reached",
                 json!({"type":"not_executed", "reason":"upstream_not_reached"}),
             ));
         }
         Err(_) => return Err(outcome_unknown()),
     };
     if response.status() == StatusCode::UNAUTHORIZED {
-        return Ok(HostReply::not_run(json!({"type":"unauthenticated"})));
+        return Ok(HostReply::not_run(
+            "host_unauthenticated",
+            json!({"type":"unauthenticated"}),
+        ));
     }
     if !response.status().is_success() {
         return Err(outcome_unknown());
@@ -316,13 +329,16 @@ async fn send_invocation(
 /// An invocation's outcome as the host's text, which the caller receives unchanged.
 pub(super) struct HostReply {
     ran: bool,
+    /// The failure code, or why the invocation did not run.
+    failure: Option<String>,
     text: JsonPayload,
 }
 
 impl HostReply {
-    fn not_run(reply: Value) -> Self {
+    fn not_run(failure: &str, reply: Value) -> Self {
         Self {
             ran: false,
+            failure: Some(failure.to_owned()),
             text: reply.into(),
         }
     }
@@ -341,6 +357,7 @@ impl HostReply {
             let chunks = response.bytes_stream().map(|chunk| Ok(chunk?));
             return Ok(Self {
                 ran: true,
+                failure: None,
                 text: JsonStream::new(chunks, len).into(),
             });
         }
@@ -372,6 +389,7 @@ impl HostReply {
         };
         Ok(Self {
             ran,
+            failure: head.code.or(head.reason),
             text: text.into(),
         })
     }

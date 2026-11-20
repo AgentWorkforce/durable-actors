@@ -706,6 +706,10 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let failure = super::request_outcome::Failure {
+            code: self.code.clone(),
+            message: Some(self.message.clone()),
+        };
         let mut response = (
             self.status,
             Json(ErrorDocument {
@@ -716,6 +720,7 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response();
+        response.extensions_mut().insert(failure);
         if self.status == StatusCode::TOO_MANY_REQUESTS {
             response
                 .headers_mut()

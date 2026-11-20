@@ -31,6 +31,8 @@ mod organization_limits;
 mod protocol;
 mod public_api;
 mod regions;
+mod request_log;
+mod request_outcome;
 mod routes;
 mod service;
 pub(crate) mod session;

@@ -331,9 +331,11 @@ async fn control_plane_routes(
     let public_api = super::public_api::router(service.clone(), admin.clone())
         .merge(super::inspection::router(inspector, admin.clone()))
         .merge(discovery);
-    let public_api = public_api
-        .clone()
-        .merge(super::mcp::router(public_api, admin));
+    let public_api = super::request_log::logged(
+        public_api
+            .clone()
+            .merge(super::mcp::router(public_api, admin)),
+    );
     let internal_api = service.into_internal_service();
     Ok(tonic::service::Routes::from(public_api).add_service(internal_api))
 }

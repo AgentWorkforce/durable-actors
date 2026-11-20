@@ -31,5 +31,8 @@ mod sockets;
 #[cfg(test)]
 extern crate self as durable_actors;
 #[cfg(test)]
+#[path = "../tests/fixtures/logs.rs"]
+mod test_logs;
+#[cfg(test)]
 #[path = "../tests/fixtures/sqlite.rs"]
 mod test_sqlite;

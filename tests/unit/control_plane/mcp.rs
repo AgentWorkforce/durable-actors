@@ -161,6 +161,44 @@ async fn sessions_page_with_the_status_gateways_reported() {
 }
 
 #[tokio::test]
+async fn tool_calls_log_what_they_touched_but_not_their_arguments() {
+    let logs = crate::test_logs::LogCapture::start();
+    let api = Router::new().route(
+        "/v1/projects/demo/actors/Counter/one/invoke",
+        post(|| async { Json(json!({ "outcome": { "type": "completed", "result": 7 } })) }),
+    );
+    let arguments = json!({
+        "actorName": "Counter", "actorId": "one", "method": "increment", "args": ["private"]
+    });
+    call_tool(api, "invoke_actor", arguments).await;
+
+    let lines = logs.lines();
+    let line = lines
+        .iter()
+        .find(|line| line["event"] == "mcp_tool_call")
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert_eq!(line["mcp.tool_name"], "invoke_actor");
+    assert!(
+        line["mcp.request_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        line["mcp.response_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(line["organization_id"], "org-test");
+    assert_eq!(line["project_id"], "demo");
+    assert_eq!(line["actor_name"], "Counter");
+    assert_eq!(line["actor_id"], "one");
+    assert_eq!(line["actor_method"], "increment");
+    assert_eq!(line["outcome"], "completed");
+    assert_eq!(line["fault"], "none");
+    assert!(!format!("{lines:?}").contains("private"), "{lines:?}");
+}
+
+#[tokio::test]
 async fn invalid_cursors_are_tool_errors_the_model_can_fix() {
     let reply = call_tool(
         Router::new(),
