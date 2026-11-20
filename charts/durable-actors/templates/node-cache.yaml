@@ -25,7 +25,8 @@ spec:
         runAsUser: 10000
         runAsGroup: 10000
         fsGroup: 10000
-      {{- if .Values.nodeCache.hostPath }}
+      {{- $slots := .Values.nodeCache.sqliteSlots.enabled }}
+      {{- if and .Values.nodeCache.hostPath (not $slots) }}
       initContainers:
         - name: cache-owner
           image: {{ include "actors.image" .Values.images.controlPlane | quote }}
@@ -48,9 +49,17 @@ spec:
           ports:
             - {name: http, containerPort: 7103}
           securityContext:
+            {{- if $slots }}
+            runAsUser: 0
+            runAsNonRoot: false
+            {{- end }}
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: {drop: [ALL]}
+            capabilities:
+              drop: [ALL]
+              {{- if $slots }}
+              add: [DAC_OVERRIDE]
+              {{- end }}
           resources:
             {{- toYaml .Values.nodeCache.resources | nindent 12 }}
           readinessProbe:
@@ -62,11 +71,17 @@ spec:
             - {name: DURABLE_ACTORS_NODE_CACHE_MAX_ENTRIES, value: {{ int64 .Values.nodeCache.maxEntries | quote }}}
             - name: DURABLE_ACTORS_CONTROL_PLANE_URL
               value: {{ printf "http://%s.%s.svc.cluster.local:7100" (include "actors.name" .) .Release.Namespace | quote }}
+            {{- if $slots }}
+            - {name: DURABLE_ACTORS_NODE_CACHE_DIR, value: {{ printf "/disk%s" (trimPrefix .Values.nodeCache.sqliteSlots.diskRoot .Values.nodeCache.hostPath) | quote }}}
+            - {name: DURABLE_ACTORS_NODE_CACHE_PODS_DIR, value: /disk/kubelet/pods}
+            {{- end }}
           volumeMounts:
-            - {name: cache, mountPath: /cache}
+            - {name: cache, mountPath: {{ ternary "/disk" "/cache" $slots }}}
       volumes:
         - name: cache
-          {{- if .Values.nodeCache.hostPath }}
+          {{- if $slots }}
+          hostPath: {path: {{ .Values.nodeCache.sqliteSlots.diskRoot | quote }}, type: Directory}
+          {{- else if .Values.nodeCache.hostPath }}
           hostPath: {path: {{ .Values.nodeCache.hostPath | quote }}, type: DirectoryOrCreate}
           {{- else }}
           emptyDir: {sizeLimit: {{ printf "%dGi" (add .Values.nodeCache.capacityGiB 1) }}}

@@ -959,6 +959,10 @@ fn sandbox_backend(
                         1024,
                     )? as usize,
                     node_cache_url: node_cache_url(get)?,
+                    sqlite_slot_gib: get("DURABLE_ACTORS_GKE_SQLITE_SLOT_GIB")
+                        .map(|gib| gib.parse())
+                        .transpose()
+                        .context("DURABLE_ACTORS_GKE_SQLITE_SLOT_GIB must be an integer")?,
                     runtime_class: get("DURABLE_ACTORS_GKE_RUNTIME_CLASS")
                         .filter(|class| !class.is_empty())
                         .unwrap_or_else(|| GKE_RUNTIME_CLASS.into()),

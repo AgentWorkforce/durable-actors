@@ -1778,6 +1778,7 @@ fn socket_authorization_uses_actor_scope_without_reading_ownership() -> Result<(
         region: "us-east".into(),
         host_config_key: None,
         invocation: None,
+        slot: None,
     };
     let placement = ObjectPlacement {
         object: actor.storage_key(),

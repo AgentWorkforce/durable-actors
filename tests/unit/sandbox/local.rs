@@ -307,6 +307,7 @@ impl LocalFixture {
                 None,
                 directory.path().join("hosts.sqlite3"),
                 STARTUP_DEADLINE,
+                None,
             )
             .await?,
         );
@@ -423,6 +424,7 @@ async fn shutdown_rejects_new_hosts_before_starting_a_process() -> Result<()> {
         None,
         project.join("hosts.sqlite3"),
         STARTUP_DEADLINE,
+        None,
     )
     .await?;
     provider.shutdown().await;

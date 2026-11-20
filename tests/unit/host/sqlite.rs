@@ -273,6 +273,22 @@ async fn ordinary_sql_autocommits_and_explicit_transactions_group_writes() -> Re
 }
 
 #[tokio::test]
+async fn vacuum_counts_as_a_commit() -> Result<()> {
+    let (_directory, database) = database().await?;
+    exec(&database, "CREATE TABLE notes (body TEXT)", vec![], false).await?;
+    exec(
+        &database,
+        "INSERT INTO notes VALUES ('kept')",
+        vec![],
+        false,
+    )
+    .await?;
+    exec(&database, "DELETE FROM notes", vec![], false).await?;
+    assert!(exec(&database, "VACUUM", vec![], false).await?.committed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn raw_sql_savepoints_preserve_outer_writes_and_only_commit_on_outer_release() -> Result<()> {
     let (_directory, database) = database().await?;
     exec(&database, "CREATE TABLE notes (body TEXT)", vec![], true).await?;

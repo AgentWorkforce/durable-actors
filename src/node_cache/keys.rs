@@ -32,7 +32,6 @@ impl HostTokens {
         tokens
     }
 
-    #[cfg(test)]
     pub fn fixed(verifier: ActorJwtVerifier) -> Arc<Self> {
         Arc::new(Self {
             verifier: RwLock::new(Some(verifier)),

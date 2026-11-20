@@ -76,6 +76,10 @@ nodeCache:
   capacityGiB: 20
   maxEntries: 500000
   hostPath: ""
+  sqliteSlots:
+    enabled: false
+    sizeGiB: 8
+    diskRoot: ""
   nodeSelector: {}
   resources:
     requests: {cpu: 100m, memory: 128Mi}

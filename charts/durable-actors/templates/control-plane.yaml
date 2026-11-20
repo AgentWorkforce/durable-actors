@@ -115,6 +115,9 @@ spec:
             {{- if $.Values.nodeCache.enabled }}
             - name: DURABLE_ACTORS_GKE_NODE_CACHE_URL
               value: {{ printf "http://%s.%s.svc.cluster.local:7103" (include "actors.nodeCacheName" $) $.Release.Namespace | quote }}
+            {{- if $.Values.nodeCache.sqliteSlots.enabled }}
+            - {name: DURABLE_ACTORS_GKE_SQLITE_SLOT_GIB, value: {{ $.Values.nodeCache.sqliteSlots.sizeGiB | quote }}}
+            {{- end }}
             {{- end }}
             - {name: DURABLE_ACTORS_PERSISTENCE, value: {{ $.Values.storage.mode | quote }}}
             - {name: DURABLE_ACTORS_BUCKET, value: {{ $.Values.storage.bucket | quote }}}

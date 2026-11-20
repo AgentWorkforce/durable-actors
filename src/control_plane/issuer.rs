@@ -234,6 +234,30 @@ impl ActorJwtIssuer {
         region: &str,
         actor: &ActorKey,
     ) -> Result<IssuedActorToken> {
+        self.issue_host_in_slot(
+            organization_id,
+            host_id,
+            session_id,
+            host_config_key,
+            region,
+            actor,
+            None,
+        )
+    }
+
+    /// A host token that also names the node slot of the sandbox the host runs in, so the node
+    /// cache moves databases only through the slot the control plane assigned.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue_host_in_slot(
+        &self,
+        organization_id: &str,
+        host_id: &HostId,
+        session_id: &str,
+        host_config_key: &str,
+        region: &str,
+        actor: &ActorKey,
+        slot: Option<&str>,
+    ) -> Result<IssuedActorToken> {
         actor.validate()?;
         let now_ms = unix_millis()?;
         let expires_at_ms =
@@ -256,6 +280,7 @@ impl ActorJwtIssuer {
             nbf: now_ms / 1000,
             exp: expires_at_ms / 1000,
             invocation: None,
+            slot: slot.map(str::to_owned),
             telemetry: Some(TelemetryClaims {
                 project_id: actor.project_id.clone(),
                 actor_name: actor.actor_name.clone(),
@@ -308,6 +333,7 @@ impl ActorJwtIssuer {
             exp: expires_at,
             actor: actor.clone(),
             telemetry: None,
+            slot: None,
             invocation: Some(ActorInvocationCapability {
                 route: super::gateway::backend_origin(route)?.to_string(),
                 actor: actor.clone(),
@@ -361,6 +387,8 @@ struct ActorJwtClaims {
     exp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     invocation: Option<ActorInvocationCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot: Option<String>,
     // Top-level copies of the actor key so the telemetry collector can read them as flat claims.
     #[serde(flatten)]
     telemetry: Option<TelemetryClaims>,

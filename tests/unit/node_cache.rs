@@ -30,40 +30,38 @@ async fn hosts_share_code_through_the_node_cache() -> Result<()> {
 }
 
 #[tokio::test]
-async fn saved_databases_are_only_visible_to_hosts_of_the_same_actor() -> Result<()> {
+async fn a_host_moves_databases_only_through_the_slot_its_token_names() -> Result<()> {
     let issuer = issuer()?;
     let cache = NodeCache::start(&issuer).await?;
-    let database = tempfile::NamedTempFile::new()?;
-    std::fs::write(database.path(), b"sqlite bytes")?;
-    let snapshot = sha256(b"snapshot");
-    let owner = cache.client(&host_token(&issuer, "one")?)?;
+    let (mine, other) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    for slot in [&mine, &other] {
+        let database = cache.slot(slot).join("db");
+        std::fs::create_dir_all(&database)?;
+        std::fs::write(database.join("actor.sqlite"), b"pages")?;
+    }
+    let snapshot = crate::storage::SnapshotRef {
+        object: "state/1".into(),
+        state_version: 1,
+        request_id: "request-1".into(),
+        digest: sha256(b"state"),
+    };
+    let unslotted = cache.client(&host_token(&issuer, "one")?)?;
+    assert!(unslotted.park_slot(&snapshot, 1).await.is_err());
 
-    owner.store_database(&snapshot, database.path()).await?;
+    let host = cache.client(&slotted_token(&issuer, "one", &mine)?)?;
+    host.park_slot(&snapshot, 1).await?;
 
-    let restored = owner.database(&snapshot).await?.unwrap().receive().await?;
-    assert_eq!(std::fs::read(restored.path())?, b"sqlite bytes");
-    let other = cache.client(&host_token(&issuer, "two")?)?;
-    assert!(other.database(&snapshot).await?.is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn saved_snapshots_are_received_whole() -> Result<()> {
-    let issuer = issuer()?;
-    let cache = NodeCache::start(&issuer).await?;
-    let bytes = (0..600 * 1024).map(|i| i as u8).collect::<Vec<_>>();
-    let digest = sha256(&bytes);
-    let payload = crate::payload::copy(bytes.as_slice())?;
-    let host = cache.client(&host_token(&issuer, "one")?)?;
-    assert!(host.snapshot(&digest).await?.is_none());
-    host.store_snapshot(&digest, payload.clone()).await?;
-    assert_eq!(host.snapshot(&digest).await?, Some(payload));
+    assert!(!cache.slot(&mine).join("db").exists());
+    assert!(cache.slot(&other).join("db/actor.sqlite").exists());
     Ok(())
 }
 
 struct NodeCache {
     url: String,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     _server: AbortOnDropHandle<std::io::Result<()>>,
 }
 
@@ -81,14 +79,30 @@ impl NodeCache {
         )?);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);
-        let routes = server::router(store, tokens);
+        let slots = Arc::new(
+            slots::SqliteSlots::open(
+                directory.path().into(),
+                Some(slots::SlotLayout::Kubelet(directory.path().join("pods"))),
+                store.clone(),
+            )
+            .await?,
+        );
+        let routes = server::router(store, slots, tokens);
         Ok(Self {
             url,
-            _directory: directory,
+            directory,
             _server: AbortOnDropHandle::new(tokio::spawn(async move {
                 axum::serve(listener, routes).await
             })),
         })
+    }
+
+    fn slot(&self, uid: &str) -> std::path::PathBuf {
+        self.directory
+            .path()
+            .join("pods")
+            .join(uid)
+            .join("volumes/kubernetes.io~empty-dir/slot")
     }
 
     fn client(&self, token: &str) -> Result<NodeCacheClient> {
@@ -121,6 +135,24 @@ fn host_token(issuer: &ActorJwtIssuer, actor_id: &str) -> Result<String> {
                 actor_name: "Counter".into(),
                 actor_id: actor_id.into(),
             },
+        )?
+        .token)
+}
+
+fn slotted_token(issuer: &ActorJwtIssuer, actor_id: &str, slot: &str) -> Result<String> {
+    Ok(issuer
+        .issue_host_in_slot(
+            "org-test",
+            &HostId::new("host.v3.r1.one"),
+            &uuid::Uuid::new_v4().to_string(),
+            "r1",
+            "us-west",
+            &ActorKey {
+                project_id: "default".into(),
+                actor_name: "Counter".into(),
+                actor_id: actor_id.into(),
+            },
+            Some(slot),
         )?
         .token)
 }

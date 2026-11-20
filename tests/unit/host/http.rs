@@ -26,6 +26,7 @@ fn direct_capability_is_bound_to_the_actor_host_session_and_epoch() {
             owner_epoch: 3,
             grant: None,
         }),
+        slot: None,
     };
 
     assert!(validate_host_request(&principal, &host_id, "another-session", &actor, 3).is_err());

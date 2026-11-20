@@ -6,9 +6,11 @@ use tokio::net::TcpListener;
 mod client;
 mod keys;
 mod server;
+mod slots;
 mod store;
 
-pub(crate) use client::{DatabaseDownload, NodeCacheClient, NodeCacheConnection};
+pub(crate) use client::{NodeCacheClient, NodeCacheConnection};
+pub(crate) use slots::SlotFile;
 
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 /// tokio reads a file through one thread-pool hop per chunk, which at `ReaderStream`'s 4 KiB
@@ -16,26 +18,60 @@ const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 256 * 1024;
 /// Each indexed entry holds about 350 bytes of memory, so this default fits a 256 MiB cache pod.
 const DEFAULT_MAX_ENTRIES: u64 = 500_000;
-/// Larger databases take longer to export at shutdown than they save at the next activation.
-pub(crate) const MAX_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
+const LOCAL_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 pub async fn serve_node_cache(shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
     let config = NodeCacheConfig::from_lookup(|name| std::env::var(name).ok())?;
     let store = Arc::new(
-        store::DiskStore::open(config.directory, config.capacity_bytes, config.max_entries).await?,
+        store::DiskStore::open(
+            config.directory.clone(),
+            config.capacity_bytes,
+            config.max_entries,
+        )
+        .await?,
+    );
+    let slots = Arc::new(
+        slots::SqliteSlots::open(
+            config.directory,
+            config.pods_directory.map(slots::SlotLayout::Kubelet),
+            store.clone(),
+        )
+        .await?,
     );
     let tokens = keys::HostTokens::load(config.verifier);
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "node cache is ready");
-    axum::serve(listener, server::router(store, tokens))
+    axum::serve(listener, server::router(store, slots, tokens))
         .with_graceful_shutdown(shutdown)
         .await
         .context("serve node cache")
 }
 
+/// The node cache inside the local runtime, which plays kubelet: each host gets a directory in
+/// `slots`, deleted when the host exits, and parks its database in `directory`.
+pub(crate) async fn local_router(
+    directory: PathBuf,
+    slots: PathBuf,
+    verifier: crate::control_plane::ActorJwtVerifier,
+) -> Result<axum::Router> {
+    let store = Arc::new(
+        store::DiskStore::open(directory.clone(), LOCAL_CAPACITY_BYTES, DEFAULT_MAX_ENTRIES)
+            .await?,
+    );
+    let layout = Some(slots::SlotLayout::Hosts(slots));
+    let slots = Arc::new(slots::SqliteSlots::open(directory, layout, store.clone()).await?);
+    Ok(server::router(
+        store,
+        slots,
+        keys::HostTokens::fixed(verifier),
+    ))
+}
+
 struct NodeCacheConfig {
     bind: SocketAddr,
     directory: PathBuf,
+    /// Kubelet's per-pod directories, on the same filesystem as `directory`; slots are off without.
+    pods_directory: Option<PathBuf>,
     capacity_bytes: u64,
     max_entries: u64,
     verifier: keys::VerifierConfig,
@@ -68,6 +104,7 @@ impl NodeCacheConfig {
             directory: get("DURABLE_ACTORS_NODE_CACHE_DIR")
                 .unwrap_or_else(|| "/cache".into())
                 .into(),
+            pods_directory: get("DURABLE_ACTORS_NODE_CACHE_PODS_DIR").map(PathBuf::from),
             capacity_bytes,
             max_entries,
             verifier: keys::VerifierConfig {
@@ -92,6 +129,13 @@ impl NodeCacheConfig {
             },
         })
     }
+}
+
+/// Actor state is keyed by a digest of the actor, so paths never carry customer names.
+fn actor_digest(actor: &crate::actor::ActorKey) -> String {
+    use aws_lc_rs::digest::{SHA256, digest};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(digest(&SHA256, actor.storage_key().as_str().as_bytes()).as_ref())
 }
 
 fn valid_digest(digest: &str) -> bool {

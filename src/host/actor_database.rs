@@ -46,12 +46,9 @@ pub(crate) trait ActorStorage: Send + Sync {
     /// across activations; `None` starts a new history with a full copy.
     fn resume_parent(
         &self,
-        _snapshot: &VerifiedSnapshot,
+        _head: &crate::storage::SnapshotRef,
     ) -> Result<Option<crate::storage::SnapshotRef>> {
         Ok(None)
-    }
-    fn take_saved_database(&self, _digest: &str) -> Option<tempfile::NamedTempFile> {
-        None
     }
 }
 
@@ -60,6 +57,8 @@ pub(crate) struct ActorActivation {
     pub owner_epoch: u64,
     pub state_version: u64,
     pub state: Option<VerifiedSnapshot>,
+    /// The head's reference; without `state`, the node holds the head's closed database.
+    pub head: Option<crate::storage::SnapshotRef>,
 }
 
 #[derive(Clone, Default)]
@@ -206,29 +205,31 @@ impl HostDatabase {
             .context("database service stopped during eviction")
     }
 
-    /// Best effort within `budget`: a missing entry only means the next activation rebuilds the
-    /// database from its history.
-    pub(super) async fn save_to_node_cache(&self, budget: std::time::Duration) {
+    /// Best effort within `budget`: an unparked database only means the next activation rebuilds
+    /// it from its history.
+    pub(super) async fn park(&self, budget: std::time::Duration) {
         let started = std::time::Instant::now();
-        let saved = tokio::time::timeout(budget, async {
-            let (reply, saved) = oneshot::channel();
-            self.send(Command::SaveToNodeCache { reply }).await?;
-            saved
+        let parked = tokio::time::timeout(budget, async {
+            let (reply, parked) = oneshot::channel();
+            self.send(Command::Park { reply }).await?;
+            parked
                 .await
-                .context("database service stopped while saving")?
+                .context("database service stopped while parking")?
         })
         .await
-        .context("node cache save timed out")
+        .context("parking timed out")
         .and_then(|result| result);
-        match saved {
+        match parked {
             Ok(None) => {}
-            Ok(Some(bytes)) => tracing::info!(
-                event = "actor_sqlite_saved",
-                bytes,
+            Ok(Some(file)) => tracing::info!(
+                event = "actor_sqlite_parked",
+                bytes = file.bytes,
+                device = file.device,
+                inode = file.inode,
                 duration_ms = started.elapsed().as_secs_f64() * 1000.0
             ),
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "node cache database save failed")
+                tracing::warn!(error = %format!("{error:#}"), "database not parked")
             }
         }
     }
@@ -398,8 +399,8 @@ enum Command {
     Reset {
         reply: oneshot::Sender<()>,
     },
-    SaveToNodeCache {
-        reply: oneshot::Sender<Result<Option<u64>>>,
+    Park {
+        reply: oneshot::Sender<Result<Option<crate::node_cache::SlotFile>>>,
     },
     DatabaseSize {
         reply: oneshot::Sender<Option<u64>>,
@@ -473,8 +474,8 @@ impl DatabaseService {
                 self.session.reset();
                 let _ = reply.send(());
             }
-            Command::SaveToNodeCache { reply } => {
-                let _ = reply.send(self.session.save_to_node_cache().await);
+            Command::Park { reply } => {
+                let _ = reply.send(self.session.park().await);
             }
             Command::DatabaseSize { reply } => {
                 let _ = reply.send(self.session.database_bytes().await);

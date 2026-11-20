@@ -312,6 +312,15 @@
         "capacityGiB": {"type": "integer", "minimum": 1},
         "maxEntries": {"type": "integer", "minimum": 1},
         "hostPath": {"type": "string", "pattern": "^(/.+)?$"},
+        "sqliteSlots": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "sizeGiB": {"type": "integer", "minimum": 1},
+            "diskRoot": {"type": "string", "pattern": "^(/.+)?$"}
+          }
+        },
         "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
         "resources": {"type": "object"}
       }

@@ -1,36 +1,52 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Result, ensure};
-use aws_lc_rs::digest::{Context as Digest, SHA256, digest};
+use aws_lc_rs::digest::{Context as Digest, SHA256};
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Json, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use super::{FILE_CHUNK_BYTES, MAX_ENTRY_BYTES, keys::HostTokens, store::DiskStore, valid_digest};
-use crate::{actor::ActorKey, control_plane::ActorPrincipal};
+use super::{
+    FILE_CHUNK_BYTES, MAX_ENTRY_BYTES,
+    keys::HostTokens,
+    slots::{SlotCheckout, SlotPark, SqliteSlots},
+    store::DiskStore,
+    valid_digest,
+};
+use crate::control_plane::ActorPrincipal;
 
 #[derive(Clone)]
 struct NodeCache {
     store: Arc<DiskStore>,
+    slots: Arc<SqliteSlots>,
     tokens: Arc<HostTokens>,
 }
 
-pub(super) fn router(store: Arc<DiskStore>, tokens: Arc<HostTokens>) -> Router {
+pub(super) fn router(
+    store: Arc<DiskStore>,
+    slots: Arc<SqliteSlots>,
+    tokens: Arc<HostTokens>,
+) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/code/{digest}", get(read_code).put(write_code))
-        .route("/sqlite/{digest}", get(read_database).put(write_database))
-        .route("/snapshot/{digest}", get(read_snapshot).put(write_snapshot))
-        .with_state(NodeCache { store, tokens })
+        .route("/sqlite/parked/{digest}", get(is_parked))
+        .route("/slot/checkout", post(check_out))
+        .route("/slot/park", post(park))
+        .with_state(NodeCache {
+            store,
+            slots,
+            tokens,
+        })
 }
 
 async fn read_code(
@@ -51,95 +67,119 @@ async fn write_code(
     body: Body,
 ) -> StatusCode {
     match cache.authorize(&headers, &digest) {
-        Ok(_) => {
-            cache
-                .receive(&code_key(&digest), body, Some(&digest), Keep::Every)
-                .await
-        }
+        Ok(_) => cache.receive(&code_key(&digest), body, &digest).await,
         Err(status) => status,
     }
 }
 
-async fn read_database(
+async fn is_parked(
     State(cache): State<NodeCache>,
     Path(digest): Path<String>,
     headers: HeaderMap,
-) -> Response {
-    match cache.authorize(&headers, &digest) {
-        Ok(host) => {
-            cache
-                .serve(&actor_key("sqlite", &host.actor, &digest))
-                .await
-        }
-        Err(status) => status.into_response(),
-    }
-}
-
-async fn write_database(
-    State(cache): State<NodeCache>,
-    Path(digest): Path<String>,
-    headers: HeaderMap,
-    body: Body,
 ) -> StatusCode {
     match cache.authorize(&headers, &digest) {
-        Ok(host) => {
-            cache
-                .receive(
-                    &actor_key("sqlite", &host.actor, &digest),
-                    body,
-                    None,
-                    Keep::Latest,
-                )
-                .await
-        }
+        Ok(host) if cache.slots.is_parked(&host.actor, &digest).await => StatusCode::NO_CONTENT,
+        Ok(_) => StatusCode::NOT_FOUND,
         Err(status) => status,
     }
 }
 
-async fn read_snapshot(
+async fn check_out(
     State(cache): State<NodeCache>,
-    Path(digest): Path<String>,
     headers: HeaderMap,
+    Json(request): Json<SlotCheckout>,
 ) -> Response {
-    match cache.authorize(&headers, &digest) {
-        Ok(host) => {
-            cache
-                .serve(&actor_key("snapshot", &host.actor, &digest))
-                .await
+    let (host, slot) = match cache.slot_holder(&headers) {
+        Ok(holder) => holder,
+        Err(status) => return status.into_response(),
+    };
+    let started = Instant::now();
+    match cache
+        .slots
+        .check_out(&host.actor, &slot, request.snapshot)
+        .await
+    {
+        Ok(reused) => {
+            tracing::info!(
+                event = "sqlite_slot_checkout",
+                host_id = %host.host_id,
+                reused = reused.is_some(),
+                bytes = reused.as_ref().map(|file| file.bytes),
+                device = reused.as_ref().map(|file| file.device),
+                inode = reused.as_ref().map(|file| file.inode),
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0
+            );
+            Json(reused).into_response()
         }
-        Err(status) => status.into_response(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), host_id = %host.host_id, "slot checkout failed");
+            StatusCode::CONFLICT.into_response()
+        }
     }
 }
 
-async fn write_snapshot(
+async fn park(
     State(cache): State<NodeCache>,
-    Path(digest): Path<String>,
     headers: HeaderMap,
-    body: Body,
-) -> StatusCode {
-    match cache.authorize(&headers, &digest) {
-        Ok(host) => {
-            let key = actor_key("snapshot", &host.actor, &digest);
-            cache.receive(&key, body, Some(&digest), Keep::Latest).await
+    Json(request): Json<SlotPark>,
+) -> Response {
+    let (host, slot) = match cache.slot_holder(&headers) {
+        Ok(holder) => holder,
+        Err(status) => return status.into_response(),
+    };
+    let started = Instant::now();
+    match cache
+        .slots
+        .park(&host.actor, &slot, request.snapshot, request.txid)
+        .await
+    {
+        Ok(file) => {
+            tracing::info!(
+                event = "sqlite_slot_park",
+                host_id = %host.host_id,
+                bytes = file.bytes,
+                device = file.device,
+                inode = file.inode,
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0
+            );
+            Json(file).into_response()
         }
-        Err(status) => status,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), host_id = %host.host_id, "slot park failed");
+            StatusCode::CONFLICT.into_response()
+        }
     }
 }
 
 impl NodeCache {
     fn authorize(&self, headers: &HeaderMap, digest: &str) -> Result<ActorPrincipal, StatusCode> {
-        let authorization = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let host = self
-            .tokens
-            .verify(authorization)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let host = self.authenticate(headers)?;
         if !valid_digest(digest) {
             return Err(StatusCode::BAD_REQUEST);
         }
         Ok(host)
+    }
+
+    /// The host and the slot its token names: the slot comes from the control plane's signature,
+    /// never from the request, so a host can only move databases through its own sandbox.
+    fn slot_holder(&self, headers: &HeaderMap) -> Result<(ActorPrincipal, String), StatusCode> {
+        let host = self.authenticate(headers)?;
+        let slot = self
+            .slots
+            .slot_of(&host)
+            .ok_or(StatusCode::FORBIDDEN)?
+            .to_owned();
+        Ok((host, slot))
+    }
+
+    fn authenticate(&self, headers: &HeaderMap) -> Result<ActorPrincipal, StatusCode> {
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        self.tokens
+            .verify(authorization)
+            .map_err(|_| StatusCode::UNAUTHORIZED)
     }
 
     async fn serve(&self, key: &str) -> Response {
@@ -153,8 +193,8 @@ impl NodeCache {
         }
     }
 
-    async fn receive(&self, key: &str, body: Body, digest: Option<&str>, keep: Keep) -> StatusCode {
-        match self.store_body(key, body, digest, keep).await {
+    async fn receive(&self, key: &str, body: Body, digest: &str) -> StatusCode {
+        match self.store_body(key, body, digest).await {
             Ok(()) => StatusCode::CREATED,
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "rejected node cache upload");
@@ -163,13 +203,7 @@ impl NodeCache {
         }
     }
 
-    async fn store_body(
-        &self,
-        key: &str,
-        body: Body,
-        digest: Option<&str>,
-        keep: Keep,
-    ) -> Result<()> {
+    async fn store_body(&self, key: &str, body: Body, digest: &str) -> Result<()> {
         let staged = self.store.stage()?;
         let mut file = tokio::fs::File::from_std(staged.reopen()?);
         let mut hash = Digest::new(&SHA256);
@@ -183,38 +217,16 @@ impl NodeCache {
         }
         file.flush().await?;
         ensure!(
-            digest.is_none_or(|digest| URL_SAFE_NO_PAD.encode(hash.finish().as_ref()) == digest),
+            URL_SAFE_NO_PAD.encode(hash.finish().as_ref()) == digest,
             "content digest mismatch"
         );
         // Entries outlive this process, so one must be on disk before its name is.
         file.sync_all().await?;
         drop(file);
-        match keep {
-            Keep::Every => self.store.insert(key, staged, size).await,
-            Keep::Latest => self.store.insert_latest(key, staged, size).await,
-        }
+        self.store.insert(key, staged, size).await
     }
-}
-
-/// Code is shared by content digest; an actor's database and snapshot are only worth keeping at
-/// the version its next activation will ask for.
-#[derive(Clone, Copy)]
-enum Keep {
-    Every,
-    Latest,
 }
 
 fn code_key(digest: &str) -> String {
     format!("code/{digest}")
-}
-
-/// Actor state is keyed by the actor in the host token, so a host can neither read nor replace
-/// another actor's database or snapshot. Each actor's versions share a directory, so a new
-/// version can drop the ones it supersedes.
-fn actor_key(kind: &str, actor: &ActorKey, snapshot: &str) -> String {
-    let actor = digest(&SHA256, actor.storage_key().as_str().as_bytes());
-    format!(
-        "{kind}/{}/{snapshot}",
-        URL_SAFE_NO_PAD.encode(actor.as_ref())
-    )
 }

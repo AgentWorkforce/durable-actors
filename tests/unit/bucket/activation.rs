@@ -33,7 +33,10 @@ async fn state_writes_require_local_ownership_and_a_matching_lease() -> Result<(
 
 #[tokio::test]
 async fn sqlite_dependencies_must_exist_in_the_snapshot_backend_before_publication() -> Result<()> {
-    use crate::litestream::{Litestream, Replicator, storage::SqliteCapture};
+    use crate::litestream::{
+        Litestream, Replicator,
+        storage::{CaptureDirectory, SqliteCapture},
+    };
     use crate::state_log::{SqliteSnapshot, StateSnapshot};
     use crate::state_transport::SnapshotWriter;
 
@@ -57,7 +60,8 @@ async fn sqlite_dependencies_must_exist_in_the_snapshot_backend_before_publicati
         .prepare_actor_write(&f.actor, &active.placement.lease, 1, 2)
         .await?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone(), None).await?;
+    let mut capture =
+        SqliteCapture::new(CaptureDirectory::temporary()?, replication.clone(), None).await?;
     let database = rusqlite::Connection::open(capture.path())?;
     database.execute("INSERT INTO __terse_fields VALUES ('seed', '1')", [])?;
     let initial = replication.sync(&capture.path()).await?;
@@ -784,6 +788,69 @@ async fn clean_shutdown_reactivates_from_the_checkpoint_without_listing_or_sessi
                 .await?;
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_parked_base_activates_without_reading_its_snapshot() -> Result<()> {
+    use crate::{state_log::StateSnapshot, state_transport::SnapshotWriter};
+    let f = Fixture::new()?;
+    let first = request("first");
+    let loaded = f
+        .runtime
+        .register_activation(&f.actor, &first, "us-east", true, None)
+        .await?;
+    let plan = f
+        .runtime
+        .prepare_actor_write(&f.actor, &loaded.placement.lease, 1, 1)
+        .await?;
+    let snapshot = StateSnapshot::new(
+        1,
+        1,
+        "committed".into(),
+        crate::test_sqlite::snapshot(serde_json::json!({"count": 42}))?,
+        serde_json::json!(42),
+    )?
+    .encode()?;
+    f.runtime.write_snapshot(&plan, snapshot).await?;
+    let checkpoint = f
+        .runtime
+        .drain_activation(
+            &f.actor,
+            &first.id,
+            &first.session_id,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await?;
+    f.runtime
+        .release_with_checkpoint(&f.actor, &first.id, &first.session_id, Some(checkpoint))
+        .await?;
+    let (_, hint) = f
+        .runtime
+        .get_owner_with_hint(&f.actor.storage_key())
+        .await?;
+    let base = hint.as_ref().unwrap().sealed_base().cloned().unwrap();
+    f.bucket.reads.store(0, Ordering::SeqCst);
+
+    let cached = CachedBase {
+        parked: Some(base.clone()),
+    };
+    let loaded = f
+        .runtime
+        .register_activation_with(
+            &f.actor,
+            &request("next"),
+            "us-east",
+            false,
+            hint.as_ref(),
+            &cached,
+        )
+        .await?;
+
+    assert!(loaded.state.is_none());
+    assert_eq!(loaded.head, Some(base.clone()));
+    assert_eq!(loaded.placement.state_version, base.state_version);
+    assert_eq!(f.bucket.reads.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

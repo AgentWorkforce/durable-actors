@@ -71,32 +71,71 @@ impl LtxFile {
 
 pub(crate) struct SqliteCapture {
     replication: Arc<dyn Replicator>,
-    directory: Option<tempfile::TempDir>,
+    directory: Option<CaptureDirectory>,
+    registered: bool,
     txid: u64,
     published: u64,
+}
+
+/// Where the database lives: a temporary directory, or a node slot whose `db` directory outlives
+/// the host. The local replica only stages LTX files, so it always stays in temporary storage.
+pub(crate) enum CaptureDirectory {
+    Temporary(tempfile::TempDir),
+    Slot {
+        database: PathBuf,
+        scratch: tempfile::TempDir,
+    },
+}
+
+impl CaptureDirectory {
+    pub(crate) fn temporary() -> Result<Self> {
+        Ok(Self::Temporary(tempfile::tempdir()?))
+    }
+
+    pub(crate) fn slot(database: PathBuf) -> Result<Self> {
+        Ok(Self::Slot {
+            database,
+            scratch: tempfile::tempdir()?,
+        })
+    }
+
+    pub(crate) fn database(&self) -> &Path {
+        match self {
+            Self::Temporary(directory) => directory.path(),
+            Self::Slot { database, .. } => database,
+        }
+    }
+
+    fn replica(&self) -> PathBuf {
+        match self {
+            Self::Temporary(directory) => directory.path().join("replica"),
+            Self::Slot { scratch, .. } => scratch.path().join("replica"),
+        }
+    }
 }
 
 impl SqliteCapture {
     /// `full_snapshots` is how often Litestream adds a full copy to the captured history, for
     /// stores without checkpoints of their own.
     pub(crate) async fn new(
+        directory: CaptureDirectory,
         replication: Arc<dyn Replicator>,
         full_snapshots: Option<Duration>,
     ) -> Result<Self> {
-        Self::open(replication, tempfile::tempdir()?, full_snapshots, None).await
+        Self::open(replication, directory, full_snapshots, None).await
     }
 
     /// With `resume`, capture continues the restored history, so the next commit is a delta at
     /// `txid + 1`; otherwise it starts a new history whose first commit holds every page.
     pub(crate) async fn restore(
+        directory: CaptureDirectory,
         replication: Arc<dyn Replicator>,
         files: &[LtxFile],
         txid: u64,
         full_snapshots: Option<Duration>,
         resume: bool,
     ) -> Result<Self> {
-        let directory = tempfile::tempdir()?;
-        restore_database(replication.as_ref(), directory.path(), files, txid).await?;
+        restore_database(replication.as_ref(), directory.database(), files, txid).await?;
         Self::open(
             replication,
             directory,
@@ -106,15 +145,14 @@ impl SqliteCapture {
         .await
     }
 
-    pub(crate) async fn adopt(
+    /// Opens a database already in `directory` that was closed at `txid`.
+    pub(crate) async fn reopen(
+        directory: CaptureDirectory,
         replication: Arc<dyn Replicator>,
-        database: tempfile::NamedTempFile,
         txid: u64,
         full_snapshots: Option<Duration>,
         resume: bool,
     ) -> Result<Self> {
-        let directory = tempfile::tempdir()?;
-        database.persist(directory.path().join("actor.sqlite"))?;
         Self::open(
             replication,
             directory,
@@ -124,36 +162,34 @@ impl SqliteCapture {
         .await
     }
 
-    /// A page-for-page copy of the committed database, or `None` when it is larger than
-    /// `max_bytes`. A resumed capture appends page deltas to the history the copy was saved at,
-    /// so unlike `VACUUM INTO` the copy keeps every page where that history put it.
-    pub(crate) async fn export(&self, max_bytes: u64) -> Result<Option<tempfile::NamedTempFile>> {
-        let source = self.path();
+    /// Stops capture and leaves the committed database alone in its directory, synced, with its
+    /// WAL folded in, so another host can reopen it.
+    pub(crate) async fn close(mut self) -> Result<()> {
+        let path = self.path();
+        self.registered = false;
+        self.replication.unregister(&path).await?;
+        let directory = self.directory.take().context("live SQLite directory")?;
         tokio::task::spawn_blocking(move || {
-            let source_wal = wal_path(&source);
-            if file_size(&source)? + file_size(&source_wal)? > max_bytes {
-                return Ok(None);
-            }
-            let output = tempfile::NamedTempFile::new()?;
-            std::fs::copy(&source, output.path())?;
-            if file_size(&source_wal)? > 0 {
-                std::fs::copy(&source_wal, wal_path(output.path()))?;
-            }
-            fold_wal(output.path())?;
-            Ok(Some(output))
+            fold_wal(&path)?;
+            std::fs::File::open(&path)?.sync_all()?;
+            std::fs::File::open(directory.database())?.sync_all()?;
+            anyhow::Ok(())
         })
         .await?
     }
 
+    pub(crate) fn in_slot(&self) -> bool {
+        matches!(self.directory, Some(CaptureDirectory::Slot { .. }))
+    }
+
     pub(crate) fn path(&self) -> PathBuf {
-        self.directory
-            .as_ref()
-            .expect("live SQLite directory")
-            .path()
-            .join("actor.sqlite")
+        self.live_directory().database().join("actor.sqlite")
     }
     fn replica(&self) -> PathBuf {
-        self.path().with_file_name("replica")
+        self.live_directory().replica()
+    }
+    fn live_directory(&self) -> &CaptureDirectory {
+        self.directory.as_ref().expect("live SQLite directory")
     }
     pub(crate) fn txid(&self) -> u64 {
         self.txid
@@ -161,7 +197,7 @@ impl SqliteCapture {
 
     pub(crate) async fn capture(&mut self, txid: u64) -> Result<Vec<LtxFile>> {
         ensure!(txid >= self.txid, "SQLite transaction went backwards");
-        let files = collect_ltx_files(&self.path(), self.published, txid).await?;
+        let files = collect_ltx_files(&self.replica(), self.published, txid).await?;
         // The captured files travel in this commit's snapshot, so the local copies are spent.
         if let Err(error) = self.prune(txid).await {
             tracing::warn!(error = %format!("{error:#}"), "local LTX cleanup deferred");
@@ -192,13 +228,14 @@ impl SqliteCapture {
     // that only reads never pays for it.
     async fn open(
         replication: Arc<dyn Replicator>,
-        directory: tempfile::TempDir,
+        directory: CaptureDirectory,
         full_snapshots: Option<Duration>,
         resume_at: Option<u64>,
     ) -> Result<Self> {
         let mut capture = Self {
             replication,
             directory: Some(directory),
+            registered: false,
             txid: 0,
             published: 0,
         };
@@ -218,6 +255,7 @@ impl SqliteCapture {
                 resume_at,
             )
             .await?;
+        capture.registered = true;
         capture.txid = position;
         capture.published = position;
         Ok(capture)
@@ -226,9 +264,14 @@ impl SqliteCapture {
 
 impl Drop for SqliteCapture {
     fn drop(&mut self) {
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        if !self.registered {
+            return;
+        }
         let replication = self.replication.clone();
-        let path = self.path();
-        let directory = self.directory.take();
+        let path = directory.database().join("actor.sqlite");
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _ = replication.unregister(&path).await;
@@ -265,18 +308,18 @@ fn file_size(path: &Path) -> Result<u64> {
 }
 
 pub(crate) async fn collect_ltx_files(
-    path: &Path,
+    replica: &Path,
     after: u64,
     through: u64,
 ) -> Result<Vec<LtxFile>> {
-    let checkpoint = read_ltx_files(path, after, 9, through)
+    let checkpoint = read_ltx_files(replica, after, 9, through)
         .await?
         .into_iter()
         .filter(|file| file.last > after)
         .max_by_key(|file| file.last);
     let mut next = checkpoint.as_ref().map_or(after + 1, |file| file.last + 1);
     let mut files = checkpoint.into_iter().collect::<Vec<_>>();
-    for file in read_ltx_files(path, after, 0, through).await? {
+    for file in read_ltx_files(replica, after, 0, through).await? {
         if file.last < next {
             continue;
         }
@@ -299,11 +342,13 @@ pub(crate) async fn collect_ltx_files(
     Ok(files)
 }
 
-async fn read_ltx_files(path: &Path, after: u64, level: u8, through: u64) -> Result<Vec<LtxFile>> {
-    let directory = path
-        .with_file_name("replica")
-        .join("ltx")
-        .join(level.to_string());
+async fn read_ltx_files(
+    replica: &Path,
+    after: u64,
+    level: u8,
+    through: u64,
+) -> Result<Vec<LtxFile>> {
+    let directory = replica.join("ltx").join(level.to_string());
     let mut entries = match tokio::fs::read_dir(directory).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),

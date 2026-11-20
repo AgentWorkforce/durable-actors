@@ -28,6 +28,7 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
         ],
         "test-token",
         Some("http://node-cache:7103"),
+        None,
         GKE_RUNTIME_CLASS,
     )?;
     assert_eq!(
@@ -506,6 +507,7 @@ async fn reporting_cluster(
             zones: BTreeMap::from([("north-america-west".into(), vec!["us-west4-a".into()])]),
             reap_concurrency: 4,
             node_cache_url: None,
+            sqlite_slot_gib: None,
             runtime_class: GKE_RUNTIME_CLASS.into(),
         },
         kills,
@@ -601,9 +603,44 @@ fn spare_under(runtime_class: &str) -> Pod {
         &["us-west4-a".into()],
         "token",
         None,
+        None,
         runtime_class,
     )
     .unwrap()
+}
+
+#[test]
+fn a_spare_gets_a_sized_database_slot_the_node_cache_can_reach() -> Result<()> {
+    let pod = spare_pod(
+        &spare_request("actor"),
+        &["us-west4-a".into()],
+        "token",
+        Some("http://node-cache:7103"),
+        Some(8),
+        "gvisor-with-overhead",
+    )?;
+    let annotations = pod.metadata.annotations.unwrap();
+    assert_eq!(annotations["dev.gvisor.spec.mount.slot.share"], "shared");
+    let spec = pod.spec.unwrap();
+    let slot = spec
+        .volumes
+        .unwrap()
+        .into_iter()
+        .find(|volume| volume.name == "slot")
+        .unwrap();
+    assert_eq!(
+        slot.empty_dir.unwrap().size_limit,
+        Some(Quantity("8Gi".into()))
+    );
+    assert!(
+        spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|mount| mount.name == "slot" && mount.mount_path == "/slot")
+    );
+    Ok(())
 }
 
 /// The expected values are what GKE writes on a spare under its own class.

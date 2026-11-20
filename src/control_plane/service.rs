@@ -595,7 +595,7 @@ impl ControlPlaneService {
                     .await?;
                 let replacement_token = self
                     .host_token_issuer
-                    .issue_host(
+                    .issue_host_in_slot(
                         &spec.organization_id,
                         &principal.host_id,
                         &principal.session_id,
@@ -605,6 +605,7 @@ impl ControlPlaneService {
                             .context("host configuration missing")?,
                         &principal.region,
                         &principal.actor,
+                        principal.slot.as_deref(),
                     )?
                     .token;
                 Ok(ControlPlaneCommandReply::StorageAccess {
@@ -1290,6 +1291,26 @@ impl SandboxHostProvisioner {
         };
         let (runtime_config, spare) = tokio::join!(token, spare);
         request.spare = spare?;
+        // A claimed spare's slot is its pod's scratch volume, which the node cache finds by pod UID.
+        if let Some(slot) = request
+            .spare
+            .as_ref()
+            .and_then(|spare| spare.resource_id.splitn(3, '/').nth(2))
+            .map(str::to_owned)
+        {
+            request.host_token = self
+                .issuer
+                .issue_host_in_slot(
+                    &spec.organization_id,
+                    &request.host_id,
+                    &request.session_id,
+                    &request.host_config_key,
+                    region,
+                    actor,
+                    Some(&slot),
+                )?
+                .token;
+        }
         if let Some(pool) = &self.pool {
             if request.spare.is_none() {
                 pool.reserve_host(

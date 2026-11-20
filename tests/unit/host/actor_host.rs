@@ -1573,35 +1573,6 @@ async fn early_database_preparation_restores_once_without_hydrating_customer_cod
     Ok(())
 }
 
-#[tokio::test]
-async fn unreadable_cached_database_falls_back_to_history() -> Result<()> {
-    let sqlite = crate::test_sqlite::snapshot(json!({"count": 41}))?;
-    let snapshot = StateSnapshot::new(3, 6, "previous".into(), sqlite, json!(41))?.encode()?;
-    let cached = tempfile::NamedTempFile::new()?;
-    std::fs::write(cached.path(), b"not a database")?;
-    let authority = Arc::new(FakeAuthority {
-        activation_state: Some(snapshot),
-        saved_database: Mutex::new(Some(cached)),
-        ..Default::default()
-    });
-    let database = HostDatabase::new(
-        HostEndpoint {
-            id: super::super::HostId::new("cached-host"),
-            route: "http://host".into(),
-        },
-        authority.clone(),
-        Arc::new(FakeStateTransport::default()),
-        replication().await,
-        None,
-    );
-    assert!(matches!(
-        database.activate().await?,
-        PreparedActivation::Hydrate { .. }
-    ));
-    assert_eq!(authority.sqlite_reads.load(Ordering::SeqCst), 1);
-    Ok(())
-}
-
 #[derive(Default)]
 struct FakeAuthority {
     persisted: Option<Arc<FakeStateTransport>>,
@@ -1612,7 +1583,6 @@ struct FakeAuthority {
     initial_state: Option<(u64, crate::payload::Payload)>,
     activation_state: Option<crate::payload::Payload>,
     preparations: Mutex<Vec<u64>>,
-    saved_database: Mutex<Option<tempfile::NamedTempFile>>,
 }
 
 #[async_trait]
@@ -1632,6 +1602,7 @@ impl ActorStorage for FakeAuthority {
             state_version: state
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.reference.state_version),
+            head: state.as_ref().map(|snapshot| snapshot.reference.clone()),
             state,
         })
     }
@@ -1657,9 +1628,6 @@ impl ActorStorage for FakeAuthority {
             Some((version, bytes)) => Ok((version, Some(verified(bytes)?))),
             None => Ok((0, None)),
         }
-    }
-    fn take_saved_database(&self, _digest: &str) -> Option<tempfile::NamedTempFile> {
-        self.saved_database.lock().unwrap().take()
     }
     async fn read_sqlite(
         &self,

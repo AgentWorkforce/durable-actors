@@ -165,7 +165,7 @@ async fn live_checkpoint_inputs_are_read_as_one_bounded_range() -> Result<()> {
 
 #[tokio::test]
 async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
-    use crate::litestream::storage::{SqliteCapture, restored_fields};
+    use crate::litestream::storage::{CaptureDirectory, SqliteCapture, restored_fields};
     let f = Fixture::new()?;
     let writer = f.store()?;
     let (replication, history) = write_history(&f, &writer, 35).await?;
@@ -244,9 +244,15 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
         })
         .sum();
     assert!(sqlite.files[0].data.len() < original_size);
-    let restored =
-        SqliteCapture::restore(replication.clone(), &sqlite.files, sqlite.txid, None, false)
-            .await?;
+    let restored = SqliteCapture::restore(
+        CaptureDirectory::temporary()?,
+        replication.clone(),
+        &sqlite.files,
+        sqlite.txid,
+        None,
+        false,
+    )
+    .await?;
     let db = rusqlite::Connection::open(restored.path())?;
     assert_eq!(
         crate::litestream::storage::read_fields(&db)?,
@@ -433,10 +439,14 @@ async fn write_history(
     writer: &RapidSnapshots,
     count: u64,
 ) -> Result<(Arc<crate::litestream::Litestream>, Vec<Payload>)> {
-    use crate::litestream::{Litestream, Replicator, storage::SqliteCapture};
+    use crate::litestream::{
+        Litestream, Replicator,
+        storage::{CaptureDirectory, SqliteCapture},
+    };
     writer.start(&f.stream).await?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone(), None).await?;
+    let mut capture =
+        SqliteCapture::new(CaptureDirectory::temporary()?, replication.clone(), None).await?;
     let db = rusqlite::Connection::open(capture.path())?;
     db.execute_batch(
         "CREATE TABLE entries(value INTEGER); INSERT INTO __terse_fields VALUES ('count', '0');",
@@ -623,13 +633,17 @@ async fn partial_flush_cannot_acknowledge_a_write_and_remains_recoverable() -> R
 #[tokio::test]
 async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> {
     use crate::{
-        litestream::{Litestream, Replicator, storage::SqliteCapture},
+        litestream::{
+            Litestream, Replicator,
+            storage::{CaptureDirectory, SqliteCapture},
+        },
         state_log::SqliteSnapshot,
         storage::SnapshotRef,
     };
     let f = Fixture::new()?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone(), None).await?;
+    let mut capture =
+        SqliteCapture::new(CaptureDirectory::temporary()?, replication.clone(), None).await?;
     let db = rusqlite::Connection::open(capture.path())?;
     db.execute_batch("INSERT INTO __terse_fields VALUES ('count','1'); CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES (1);")?;
     let txid = replication.sync(&capture.path()).await?;
@@ -677,7 +691,15 @@ async fn archived_sqlite_parent_and_rapid_tail_restore_together() -> Result<()> 
     parent.verify(&parent_bytes)?;
     let mut files = StateSnapshot::decode(&parent_bytes)?.sqlite.files;
     files.extend(second.sqlite.files);
-    let restored = SqliteCapture::restore(replication, &files, txid, None, false).await?;
+    let restored = SqliteCapture::restore(
+        CaptureDirectory::temporary()?,
+        replication,
+        &files,
+        txid,
+        None,
+        false,
+    )
+    .await?;
     let db = rusqlite::Connection::open(restored.path())?;
     assert_eq!(
         db.query_row(

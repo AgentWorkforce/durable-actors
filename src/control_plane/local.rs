@@ -147,6 +147,7 @@ pub async fn serve_local(
             options.sdk_host.clone(),
             directory.join("local-hosts.sqlite3"),
             Duration::from_millis(options.host_ready_timeout_ms),
+            Some(directory.canonicalize()?.join("slots")),
         )
         .await?,
     );
@@ -457,8 +458,21 @@ async fn local_routes(
         stop,
         alarms: std::sync::Once::new(),
     };
+    let node_cache = crate::node_cache::local_router(
+        directory.canonicalize()?.join("node-cache"),
+        directory.canonicalize()?.join("slots"),
+        ActorJwtVerifier::for_scope(
+            telemetry_keys.clone(),
+            "durable-actors-control-plane",
+            "durable-actors-authority",
+            ActorTokenPurpose::ControlPlane,
+            Duration::from_secs(86_400),
+        )?,
+    )
+    .await?;
     let public = public_api::router(service.clone(), admin.clone())
-        .merge(super::inspection::local_router(inspector));
+        .merge(super::inspection::local_router(inspector))
+        .nest("/node-cache", node_cache);
     let public = public
         .clone()
         .merge(super::mcp::local_router(public, admin));

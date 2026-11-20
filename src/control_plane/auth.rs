@@ -37,6 +37,8 @@ pub(crate) struct ActorPrincipal {
     pub region: String,
     pub host_config_key: Option<String>,
     pub invocation: Option<ActorInvocationCapability>,
+    /// The node slot the control plane assigned this host's sandbox, if it has one.
+    pub slot: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +79,8 @@ struct ActorJwtClaims {
     exp: i64,
     #[serde(default)]
     invocation: Option<ActorInvocationCapability>,
+    #[serde(default)]
+    slot: Option<String>,
 }
 
 impl ActorJwtVerifier {
@@ -242,6 +246,7 @@ impl ActorJwtVerifier {
             region: claims.region,
             host_config_key: claims.host_config_key,
             invocation: claims.invocation,
+            slot: claims.slot,
         };
         ensure!(
             principal.host_id.as_str().starts_with("host.v3."),

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use moka::{future::Cache, notification::RemovalCause, policy::EvictionPolicy};
 
 const STAGING: &str = "staging";
+pub(super) const PARKED: &str = "actors";
 
 pub(super) struct DiskStore {
     root: PathBuf,
@@ -55,27 +56,13 @@ impl DiskStore {
         Ok(())
     }
 
-    /// Inserts `key` and drops the other entries in its directory, the versions it supersedes.
-    pub async fn insert_latest(
-        &self,
-        key: &str,
-        staged: tempfile::NamedTempFile,
-        size: u64,
-    ) -> Result<()> {
-        self.insert(key, staged, size).await?;
-        let path = self.root.join(key);
-        let mut siblings =
-            tokio::fs::read_dir(path.parent().context("cache entry has no parent")?).await?;
-        while let Some(sibling) = siblings.next_entry().await? {
-            if sibling.path() != path {
-                let older = sibling.path();
-                let older = older.strip_prefix(&self.root)?.to_str();
-                self.entries
-                    .invalidate(older.context("cache key is not UTF-8")?)
-                    .await;
-            }
-        }
-        Ok(())
+    /// Counts a directory `SqliteSlots` manages against the capacity; eviction deletes it whole.
+    pub async fn track(&self, key: &str, size: u64) {
+        self.entries.insert(key.to_owned(), size).await;
+    }
+
+    pub async fn forget(&self, key: &str) {
+        self.entries.invalidate(key).await;
     }
 
     /// Files a previous process left, oldest first so the newest survive any eviction on reopen.
@@ -83,10 +70,18 @@ impl DiskStore {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
             let mut found = Vec::new();
-            for entry in walkdir::WalkDir::new(&root).min_depth(1) {
+            let others = |entry: &walkdir::DirEntry| {
+                entry.depth() != 1
+                    || ![STAGING, PARKED].contains(&entry.file_name().to_str().unwrap_or_default())
+            };
+            for entry in walkdir::WalkDir::new(&root)
+                .min_depth(1)
+                .into_iter()
+                .filter_entry(others)
+            {
                 let entry = entry?;
                 let key = entry.path().strip_prefix(&root)?;
-                if entry.file_type().is_file() && !key.starts_with(STAGING) {
+                if entry.file_type().is_file() {
                     let key = key.to_str().context("cache key is not UTF-8")?.to_owned();
                     let metadata = entry.metadata()?;
                     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -115,7 +110,12 @@ fn entries(root: PathBuf, capacity_bytes: u64, max_entries: u64) -> Cache<String
         .eviction_listener(move |key: Arc<String>, _, cause| {
             // A replacement has already renamed its own file over this one.
             if cause != RemovalCause::Replaced {
-                let _ = std::fs::remove_file(root.join(key.as_str()));
+                let path = root.join(key.as_str());
+                let _ = if key.starts_with(PARKED) {
+                    std::fs::remove_dir_all(path)
+                } else {
+                    std::fs::remove_file(path)
+                };
             }
         })
         .build()

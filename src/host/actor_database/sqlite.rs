@@ -162,6 +162,11 @@ impl Engine {
         rows: &mut dyn RowSink,
     ) -> Result<DatabaseResult> {
         let statement = self.prepare_actor_statement(sql)?;
+        // The commit hook misses some writes, such as VACUUM, so a statement that can write counts
+        // as a commit outside a transaction. The rollback hook clears it if the statement fails.
+        if !statement.readonly() {
+            self.committed.store(true, Ordering::Relaxed);
+        }
         send_rows(statement, rusqlite::params_from_iter(bindings), rows)
     }
 

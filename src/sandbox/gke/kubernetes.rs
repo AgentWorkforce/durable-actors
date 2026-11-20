@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use futures_util::StreamExt;
 use k8s_openapi::{
-    api::core::v1::{Container, EnvVar, NodeSelectorRequirement, Pod, PodSpec},
+    api::core::v1::{
+        Container, EmptyDirVolumeSource, EnvVar, NodeSelectorRequirement, Pod, PodSpec, Volume,
+        VolumeMount,
+    },
     apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{
@@ -23,6 +26,8 @@ use crate::sandbox::kube_retry::retry_throttled;
 const MANAGED: &str = "app.kubernetes.io/managed-by=terse";
 /// The RuntimeClass GKE provides for gVisor.
 pub(crate) const GKE_RUNTIME_CLASS: &str = "gvisor";
+/// The volume the node cache moves an actor's database in and out of from outside the sandbox.
+const SLOT_VOLUME: &str = "slot";
 
 #[derive(Clone, Debug)]
 pub(crate) struct GkeConfig {
@@ -30,6 +35,8 @@ pub(crate) struct GkeConfig {
     pub zones: BTreeMap<String, Vec<String>>,
     pub reap_concurrency: usize,
     pub node_cache_url: Option<String>,
+    /// The size of each spare's database slot, which kubelet enforces and deletes with the pod.
+    pub sqlite_slot_gib: Option<u32>,
     pub runtime_class: String,
 }
 
@@ -131,6 +138,7 @@ impl SandboxCluster for Kubernetes {
             self.zones(&request.canonical_region)?,
             &token,
             self.config.node_cache_url.as_deref(),
+            self.config.sqlite_slot_gib,
             &self.config.runtime_class,
         )?;
         let ready = self.start(pod).await?;
@@ -278,6 +286,7 @@ fn spare_pod(
     zones: &[String],
     token: &str,
     node_cache_url: Option<&str>,
+    sqlite_slot_gib: Option<u32>,
     runtime_class: &str,
 ) -> Result<Pod> {
     let mut pod: Pod = serde_yaml::from_str(SPARE_POD).context("spare pod manifest")?;
@@ -300,7 +309,21 @@ fn spare_pod(
         .env
         .get_or_insert_with(Vec::new)
         .extend(spare_env(request, token, node_cache_url)?);
-    if runtime_class != GKE_RUNTIME_CLASS {
+    let slot = node_cache_url.and(sqlite_slot_gib);
+    if let Some(gib) = slot {
+        add_slot(spec, gib);
+    }
+    if runtime_class == GKE_RUNTIME_CLASS {
+        if slot.is_some() {
+            pod.metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(
+                    format!("dev.gvisor.empty-dir.{SLOT_VOLUME}.force-shared"),
+                    "true".into(),
+                );
+        }
+    } else {
         spec.runtime_class_name = Some(runtime_class.to_owned());
         let mounts = mount_annotations(spec);
         pod.metadata
@@ -309,6 +332,28 @@ fn spare_pod(
             .extend(mounts);
     }
     Ok(pod)
+}
+
+/// The scratch volume the actor's database lives in, which the node cache finds by the pod's UID
+/// in the host token. Kubelet caps it and deletes it with the pod, along with any database the
+/// host never parked.
+fn add_slot(spec: &mut PodSpec, gib: u32) {
+    spec.volumes.get_or_insert_with(Vec::new).push(Volume {
+        name: SLOT_VOLUME.into(),
+        empty_dir: Some(EmptyDirVolumeSource {
+            size_limit: Some(Quantity(format!("{gib}Gi"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    spec.containers[0]
+        .volume_mounts
+        .get_or_insert_with(Vec::new)
+        .push(VolumeMount {
+            name: SLOT_VOLUME.into(),
+            mount_path: "/slot".into(),
+            ..Default::default()
+        });
 }
 
 fn zone_requirement(spec: &mut PodSpec) -> Result<&mut NodeSelectorRequirement> {
@@ -382,6 +427,7 @@ fn mount_annotations(spec: &PodSpec) -> BTreeMap<String, String> {
         .filter(|volume| volume.empty_dir.is_some())
         .flat_map(|volume| {
             let share = match mounting_containers(spec, &volume.name) {
+                _ if volume.name == SLOT_VOLUME => "shared",
                 1 => "container",
                 _ => "pod",
             };

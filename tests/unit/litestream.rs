@@ -21,7 +21,7 @@ async fn registered_databases_sync_restore_and_unregister() -> Result<()> {
     let second = replication.sync(&path).await?;
     assert!(second > first);
     let restored = directory.path().join("restored.sqlite");
-    let files = storage::collect_ltx_files(&path, 0, first).await?;
+    let files = storage::collect_ltx_files(&replica, 0, first).await?;
     replication.restore(&files, &restored, first).await?;
     assert_eq!(
         rusqlite::Connection::open(restored)?

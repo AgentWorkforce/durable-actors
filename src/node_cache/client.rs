@@ -1,12 +1,15 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::{TryStreamExt, stream::BoxStream};
 use reqwest::header::AUTHORIZATION;
-use tokio::io::AsyncWriteExt;
 
-use crate::{control_plane::HostAuthorization, payload::Payload};
+use super::slots::{SlotCheckout, SlotFile, SlotPark};
+use crate::{control_plane::HostAuthorization, storage::SnapshotRef};
 
 // With no cache pod on the node the Service drops packets instead of refusing them, so only a
 // short connect timeout keeps installs from stalling.
@@ -15,6 +18,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Activation reads code, the database and the snapshot at once, and a read that finds no idle
 /// connection pays for a new one inside gVisor.
 const WARM_CONNECTIONS: usize = 4;
+/// The spare's private directory on the node SSD; the node cache moves `db` in and out of it.
+const SLOT_MOUNT: &str = "/slot";
 
 /// Built and connected while a spare waits: building the client alone costs ~15 ms in gVisor, so
 /// assignment only attaches the host token.
@@ -98,34 +103,72 @@ impl NodeCacheClient {
             .await
     }
 
-    /// The actor database saved at the snapshot with this digest, once the cache has answered
-    /// but before its body has arrived.
-    pub(crate) async fn database(&self, digest: &str) -> Result<Option<DatabaseDownload>> {
-        Ok(self
-            .read(&format!("sqlite/{digest}"))
-            .await?
-            .map(DatabaseDownload))
+    /// Where this host keeps its database when it has a slot: the directory the local runtime
+    /// names, or a GKE spare's `/slot` volume.
+    pub(crate) fn slot_database(&self) -> Option<PathBuf> {
+        let slot = std::env::var_os("DURABLE_ACTORS_SQLITE_SLOT_DIR")
+            .map_or_else(|| PathBuf::from(SLOT_MOUNT), PathBuf::from);
+        slot.is_dir().then(|| slot.join("db"))
     }
 
-    pub(crate) async fn store_database(&self, digest: &str, path: &Path) -> Result<()> {
-        self.write(&format!("sqlite/{digest}"), file_body(path).await?)
-            .await
-    }
-
-    pub(crate) async fn snapshot(&self, digest: &str) -> Result<Option<Payload>> {
-        let Some(mut chunks) = self.read(&format!("snapshot/{digest}")).await? else {
-            return Ok(None);
-        };
-        let mut download = crate::payload::Download::new();
-        while let Some(chunk) = chunks.try_next().await? {
-            download = download.append(chunk).await?;
+    /// Whether this node holds the actor's database closed at the snapshot with this digest.
+    pub(crate) async fn is_parked(&self, digest: &str) -> Result<bool> {
+        let response = self
+            .connection
+            .http
+            .get(
+                self.connection
+                    .url
+                    .join(&format!("sqlite/parked/{digest}"))?,
+            )
+            .header(AUTHORIZATION, self.authorization.header()?)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
         }
-        Ok(Some(download.finish().await?))
+        response.error_for_status()?;
+        Ok(true)
     }
 
-    pub(crate) async fn store_snapshot(&self, digest: &str, bytes: Payload) -> Result<()> {
-        let body = reqwest::Body::wrap_stream(bytes.chunks());
-        self.write(&format!("snapshot/{digest}"), body).await
+    /// Moves the actor's database closed at `snapshot` into this host's slot, or leaves the slot
+    /// an empty directory when the node has no such database.
+    pub(crate) async fn check_out_slot(
+        &self,
+        snapshot: Option<&SnapshotRef>,
+    ) -> Result<Option<SlotFile>> {
+        let request = SlotCheckout {
+            snapshot: snapshot.cloned(),
+        };
+        self.slot_call("checkout", &request).await
+    }
+
+    /// Hands the closed database in this host's slot to the node, recorded at `snapshot`, whose
+    /// SQLite transaction is `txid`.
+    pub(crate) async fn park_slot(&self, snapshot: &SnapshotRef, txid: u64) -> Result<SlotFile> {
+        let request = SlotPark {
+            snapshot: snapshot.clone(),
+            txid,
+        };
+        self.slot_call("park", &request).await
+    }
+
+    async fn slot_call<T: serde::de::DeserializeOwned>(
+        &self,
+        action: &str,
+        body: &impl serde::Serialize,
+    ) -> Result<T> {
+        Ok(self
+            .connection
+            .http
+            .post(self.connection.url.join(&format!("slot/{action}"))?)
+            .header(AUTHORIZATION, self.authorization.header()?)
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     async fn read(&self, entry: &str) -> Result<Option<BoxStream<'static, Result<Bytes>>>> {
@@ -161,18 +204,4 @@ async fn file_body(path: &Path) -> Result<reqwest::Body> {
     Ok(reqwest::Body::wrap_stream(
         tokio_util::io::ReaderStream::with_capacity(file, super::FILE_CHUNK_BYTES),
     ))
-}
-
-pub(crate) struct DatabaseDownload(BoxStream<'static, Result<Bytes>>);
-
-impl DatabaseDownload {
-    pub(crate) async fn receive(mut self) -> Result<tempfile::NamedTempFile> {
-        let output = tempfile::NamedTempFile::new()?;
-        let mut file = tokio::fs::File::from_std(output.reopen()?);
-        while let Some(chunk) = self.0.try_next().await? {
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        Ok(output)
-    }
 }

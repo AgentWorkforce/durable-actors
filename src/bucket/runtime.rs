@@ -93,6 +93,8 @@ impl OwnershipHint {
 pub struct LoadedActor {
     pub placement: ObjectPlacement,
     pub state: Option<VerifiedSnapshot>,
+    /// The head's reference, also when `state` was not loaded.
+    pub head: Option<SnapshotRef>,
     pub(crate) checkpoint: Option<super::recovery::PrefetchedCheckpoint>,
 }
 
@@ -319,19 +321,25 @@ impl RuntimeStorage {
 
     async fn load_actor(&self, record: Ownership) -> Result<LoadedActor> {
         let snapshot = self.latest(&record, None).await?;
-        Ok(self.remember(record, snapshot))
+        Ok(self.remember(record, snapshot, None))
     }
 
-    fn remember(&self, record: Ownership, snapshot: Option<VerifiedSnapshot>) -> LoadedActor {
+    fn remember(
+        &self,
+        record: Ownership,
+        snapshot: Option<VerifiedSnapshot>,
+        head: Option<SnapshotRef>,
+    ) -> LoadedActor {
         let mut placement = record.placement();
-        apply_snapshot(&mut placement, snapshot.as_ref().map(|s| &s.reference));
-        if let Some(snapshot) = &snapshot {
+        let head = snapshot.as_ref().map(|s| s.reference.clone()).or(head);
+        apply_snapshot(&mut placement, head.as_ref());
+        if let Some(head) = &head {
             self.uploaded
                 .lock()
                 .unwrap()
                 .entry(record.lease.session_id.clone())
                 .or_default()
-                .latest = Some(snapshot.reference.clone());
+                .latest = Some(head.clone());
         }
         self.owned
             .lock()
@@ -340,6 +348,7 @@ impl RuntimeStorage {
         LoadedActor {
             placement,
             state: snapshot,
+            head,
             checkpoint: None,
         }
     }

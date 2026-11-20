@@ -3,20 +3,27 @@ use super::{
     PreparedActivation, PreparedInvocation, sqlite::SqliteDatabase,
 };
 use crate::host::HostEndpoint;
-use crate::node_cache::NodeCacheClient;
+use crate::node_cache::{NodeCacheClient, SlotFile};
 use crate::payload::{JsonText, Payload};
 use crate::{
     actor::{
         ActorExecutionResult, ActorInvocation, ActorInvocationFailure, DatabaseCall,
         DatabaseResult, RowSink,
     },
-    litestream::{Replicator, storage::SqliteCapture},
+    litestream::{
+        Replicator,
+        storage::{CaptureDirectory, SqliteCapture},
+    },
     request_tracking::RequestStage,
     state_log::{SqliteSnapshot, StateSnapshot},
     storage::{SnapshotRef, VerifiedSnapshot, WritePlan},
 };
 use anyhow::{Context, Result, ensure};
-use std::{sync::Arc, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 use tracing::{info, warn};
 
 pub(super) struct DatabaseSession {
@@ -25,6 +32,8 @@ pub(super) struct DatabaseSession {
     state: Arc<dyn crate::state_transport::SnapshotWriter>,
     replication: Arc<dyn Replicator>,
     node_cache: Option<NodeCacheClient>,
+    /// The node slot this host's first database opens in; any later one uses temporary storage.
+    slot: Option<PathBuf>,
     cached_state: Option<ResidentDatabase>,
     prepared_activation: Option<ActorActivation>,
     activation: Option<ActorActivation>,
@@ -43,6 +52,7 @@ impl DatabaseSession {
             storage,
             state,
             replication,
+            slot: node_cache.as_ref().and_then(NodeCacheClient::slot_database),
             node_cache,
             cached_state: None,
             prepared_activation: None,
@@ -86,7 +96,16 @@ impl DatabaseSession {
         }
         timings.mark(RequestStage::PendingCommitResolved);
         let result = if replay {
-            cached.replay(&invocation.request_id)
+            match self
+                .replay(&mut cached, &invocation.request_id, owner_epoch)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.cached_state = Some(cached);
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -218,18 +237,16 @@ impl DatabaseSession {
         let mut activation = self.storage.acquire_actor().await?;
         if self.cached_state.is_none() {
             let cached = if activation.state_version == 0 {
-                ResidentDatabase::open(
-                    activation.owner_epoch,
-                    SqliteCapture::new(self.replication.clone(), self.storage.full_snapshots())
-                        .await?,
-                )
-                .await?
-            } else {
-                let snapshot = activation
-                    .state
-                    .take()
-                    .context("activation has no recovered state")?;
+                ResidentDatabase::open(activation.owner_epoch, self.new_capture().await?).await?
+            } else if let Some(snapshot) = activation.state.take() {
                 self.load_cached(activation.owner_epoch, activation.state_version, snapshot)
+                    .await?
+            } else {
+                let head = activation
+                    .head
+                    .clone()
+                    .context("activation has no recovered state")?;
+                self.load_parked(activation.owner_epoch, activation.state_version, head)
                     .await?
             };
             self.cached_state = Some(cached);
@@ -301,34 +318,34 @@ impl DatabaseSession {
         Ok(version)
     }
 
-    pub(super) async fn save_to_node_cache(&self) -> Result<Option<u64>> {
-        let (Some(cache), Some(cached)) = (&self.node_cache, &self.cached_state) else {
+    /// Closes the database and hands its file to the node with the snapshot and transaction it was
+    /// committed at, so the actor's next host on this node reopens it instead of rebuilding it.
+    /// Nothing is parked outside a slot or with a commit still pending.
+    pub(super) async fn park(&mut self) -> Result<Option<SlotFile>> {
+        let (Some(cache), Some(cached)) = (self.node_cache.clone(), &self.cached_state) else {
             return Ok(None);
         };
-        let Some(snapshot) = cached.published_snapshot() else {
+        if !cached.sqlite.in_slot() || cached.published_snapshot().is_none() {
             return Ok(None);
-        };
-        let database = async {
-            let Some(database) = cached
-                .sqlite
-                .export(crate::node_cache::MAX_DATABASE_BYTES)
-                .await?
-            else {
-                return Ok(None);
-            };
-            cache
-                .store_database(&snapshot.digest, database.path())
-                .await?;
-            Ok(Some(database.as_file().metadata()?.len()))
-        };
-        let (stored, database) = tokio::join!(
-            cache.store_snapshot(&snapshot.digest, snapshot.bytes.clone()),
-            database
-        );
-        if let Err(error) = stored {
-            warn!(error = %format!("{error:#}"), "node cache snapshot save failed");
         }
-        database
+        let ResidentDatabase {
+            database,
+            sqlite,
+            snapshot,
+            synced,
+            ..
+        } = self.cached_state.take().context("no database to park")?;
+        let snapshot = snapshot.context("parked database has no snapshot")?;
+        drop(database);
+        // SQLite's commit hook misses some writes, such as VACUUM, so the file can hold frames the
+        // history never got. Parking it would put later commits on a layout the history lacks.
+        let position = self.replication.sync(&sqlite.path()).await?;
+        ensure!(
+            position == synced,
+            "database has changes its history lacks; leaving it to kubelet"
+        );
+        sqlite.close().await?;
+        cache.park_slot(&snapshot, synced).await.map(Some)
     }
 
     pub(super) fn reset(&mut self) {
@@ -351,11 +368,7 @@ impl DatabaseSession {
         let (state_version, loaded) = self.storage.load_actor_state(owner_epoch).await?;
         if state_version == 0 {
             ensure!(loaded.is_none(), "uninitialized actor has state");
-            return ResidentDatabase::open(
-                owner_epoch,
-                SqliteCapture::new(self.replication.clone(), self.storage.full_snapshots()).await?,
-            )
-            .await;
+            return ResidentDatabase::open(owner_epoch, self.new_capture().await?).await;
         }
         timings.mark(RequestStage::StateDownloaded);
         let snapshot = loaded.context("actor state head has no snapshot")?;
@@ -367,10 +380,49 @@ impl DatabaseSession {
     }
 
     async fn load_cached(
-        &self,
+        &mut self,
         owner_epoch: u64,
         state_version: u64,
         loaded: VerifiedSnapshot,
+    ) -> Result<ResidentDatabase> {
+        let slot = self.claim_slot(Some(&loaded.reference)).await;
+        self.restore(owner_epoch, state_version, loaded, slot).await
+    }
+
+    /// Reopens the database this node parked at `head` without reading the head's snapshot, whose
+    /// pages the file already holds. The snapshot is read only if the file is gone, or for a retry
+    /// of the head's request.
+    async fn load_parked(
+        &mut self,
+        owner_epoch: u64,
+        state_version: u64,
+        head: SnapshotRef,
+    ) -> Result<ResidentDatabase> {
+        let started = Instant::now();
+        let (slot, parked) = self.claim_slot(Some(&head)).await;
+        let parent = self.storage.resume_parent(&head)?;
+        if let (Some(path), Some(file)) = (&slot, &parked)
+            && let Some(capture) = self.reopen(path, file, file.txid, parent.is_some()).await
+        {
+            info!(event = "actor_sqlite_restored", host_id = %self.endpoint.id, state_version,
+                source = "slot", duration_ms = elapsed_ms(started));
+            let mut cached = Self::resident(owner_epoch, state_version, capture, parent).await?;
+            cached.snapshot = Some(head.clone());
+            cached.unread_head = Some(head);
+            return Ok(cached);
+        }
+        let (state_version, loaded) = self.storage.load_actor_state(owner_epoch).await?;
+        let loaded = loaded.context("actor state head has no snapshot")?;
+        self.restore(owner_epoch, state_version, loaded, (slot, None))
+            .await
+    }
+
+    async fn restore(
+        &mut self,
+        owner_epoch: u64,
+        state_version: u64,
+        loaded: VerifiedSnapshot,
+        slot: (Option<PathBuf>, Option<SlotFile>),
     ) -> Result<ResidentDatabase> {
         ensure!(
             loaded.snapshot.state_version == state_version,
@@ -380,25 +432,32 @@ impl DatabaseSession {
             loaded.snapshot.owner_epoch <= owner_epoch,
             "actor snapshot belongs to a newer owner epoch"
         );
-        let started = std::time::Instant::now();
-        let parent = self.storage.resume_parent(&loaded)?;
-        let (capture, source) = self.open_sqlite(&loaded, parent.is_some()).await?;
-        tracing::info!(event = "actor_sqlite_restored", host_id = %self.endpoint.id, state_version,
-            source, duration_ms = started.elapsed().as_secs_f64() * 1000.0);
+        let started = Instant::now();
+        let parent = self.storage.resume_parent(&loaded.reference)?;
+        let (capture, source) = self.open_sqlite(&loaded, parent.is_some(), slot).await?;
+        info!(event = "actor_sqlite_restored", host_id = %self.endpoint.id, state_version,
+            source, duration_ms = elapsed_ms(started));
+        let mut cached = Self::resident(owner_epoch, state_version, capture, parent).await?;
+        let VerifiedSnapshot {
+            reference,
+            snapshot,
+            ..
+        } = loaded;
+        cached.snapshot = Some(reference);
+        cached.set_completion(snapshot.request_id, snapshot.completion);
+        Ok(cached)
+    }
+
+    async fn resident(
+        owner_epoch: u64,
+        state_version: u64,
+        capture: SqliteCapture,
+        parent: Option<SnapshotRef>,
+    ) -> Result<ResidentDatabase> {
         let mut cached = ResidentDatabase::open(owner_epoch, capture).await?;
         cached.sqlite_head = parent.filter(|_| cached.synced > 0);
         cached.state_version = state_version;
         cached.published = Some(cached.synced);
-        let VerifiedSnapshot {
-            reference,
-            snapshot,
-            bytes,
-        } = loaded;
-        cached.snapshot = Some(PublishedSnapshot {
-            digest: reference.digest,
-            bytes,
-        });
-        cached.set_completion(snapshot.request_id, snapshot.completion);
         Ok(cached)
     }
 
@@ -406,27 +465,18 @@ impl DatabaseSession {
         &self,
         loaded: &VerifiedSnapshot,
         resume: bool,
+        (slot, parked): (Option<PathBuf>, Option<SlotFile>),
     ) -> Result<(SqliteCapture, &'static str)> {
         let full_snapshots = self.storage.full_snapshots();
-        if let Some(database) = self.storage.take_saved_database(&loaded.reference.digest) {
-            match SqliteCapture::adopt(
-                self.replication.clone(),
-                database,
-                loaded.snapshot.sqlite.txid,
-                full_snapshots,
-                resume,
-            )
-            .await
-            {
-                Ok(capture) => return Ok((capture, "node_cache")),
-                Err(error) => tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "cached database could not be opened, restoring from history"
-                ),
-            }
+        let txid = loaded.snapshot.sqlite.txid;
+        if let (Some(path), Some(file)) = (&slot, &parked)
+            && let Some(capture) = self.reopen(path, file, txid, resume).await
+        {
+            return Ok((capture, "slot"));
         }
         let sqlite = self.storage.read_sqlite(loaded).await?;
         let capture = SqliteCapture::restore(
+            emptied(slot.as_deref()).await?,
             self.replication.clone(),
             &sqlite.files,
             sqlite.txid,
@@ -435,6 +485,88 @@ impl DatabaseSession {
         )
         .await?;
         Ok((capture, "history"))
+    }
+
+    async fn reopen(
+        &self,
+        slot: &Path,
+        file: &SlotFile,
+        txid: u64,
+        resume: bool,
+    ) -> Option<SqliteCapture> {
+        let directory = CaptureDirectory::slot(slot.to_owned()).ok()?;
+        let full_snapshots = self.storage.full_snapshots();
+        match SqliteCapture::reopen(
+            directory,
+            self.replication.clone(),
+            txid,
+            full_snapshots,
+            resume,
+        )
+        .await
+        {
+            Ok(capture) => {
+                info!(event = "actor_sqlite_reopened", host_id = %self.endpoint.id,
+                    bytes = file.bytes, device = file.device, inode = file.inode, txid);
+                Some(capture)
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "parked database could not be opened, restoring from history");
+                None
+            }
+        }
+    }
+
+    /// A reopened database skipped its head's snapshot, so the head's stored result is read only
+    /// when the head's own request is retried.
+    async fn replay(
+        &self,
+        cached: &mut ResidentDatabase,
+        request_id: &str,
+        owner_epoch: u64,
+    ) -> Result<Option<JsonText>> {
+        if cached
+            .unread_head
+            .as_ref()
+            .is_some_and(|head| head.request_id == request_id)
+        {
+            let (_, loaded) = self.storage.load_actor_state(owner_epoch).await?;
+            let loaded = loaded
+                .filter(|loaded| Some(&loaded.reference) == cached.unread_head.as_ref())
+                .context("the retried request's snapshot is no longer the head")?;
+            cached.unread_head = None;
+            cached.set_completion(loaded.snapshot.request_id, loaded.snapshot.completion);
+        }
+        Ok(cached.replay(request_id))
+    }
+
+    async fn new_capture(&mut self) -> Result<SqliteCapture> {
+        let (slot, _) = self.claim_slot(None).await;
+        SqliteCapture::new(
+            emptied(slot.as_deref()).await?,
+            self.replication.clone(),
+            self.storage.full_snapshots(),
+        )
+        .await
+    }
+
+    /// Checks out this host's slot, once: it holds the actor's parked database when the node has
+    /// one closed at `snapshot`, and is empty otherwise. Without a slot, databases stay in
+    /// temporary storage.
+    async fn claim_slot(
+        &mut self,
+        snapshot: Option<&SnapshotRef>,
+    ) -> (Option<PathBuf>, Option<SlotFile>) {
+        let (Some(cache), Some(path)) = (&self.node_cache, self.slot.take()) else {
+            return (None, None);
+        };
+        match cache.check_out_slot(snapshot).await {
+            Ok(parked) => (Some(path), parked),
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "node slot checkout failed, using temporary storage");
+                (None, None)
+            }
+        }
     }
 
     async fn publish_result(
@@ -653,10 +785,8 @@ impl DatabaseSession {
             &pending.snapshot,
             &pending.bytes,
         )?;
-        cached.snapshot = Some(PublishedSnapshot {
-            digest: head.digest.clone(),
-            bytes: pending.bytes,
-        });
+        cached.snapshot = Some(head.clone());
+        cached.unread_head = None;
         cached.sqlite_head = Some(head);
         cached.state_version = pending.snapshot.state_version;
         cached.published = Some(pending.txid);
@@ -670,7 +800,9 @@ struct ResidentDatabase {
     database: SqliteDatabase,
     sqlite: SqliteCapture,
     sqlite_head: Option<SnapshotRef>,
-    snapshot: Option<PublishedSnapshot>,
+    snapshot: Option<SnapshotRef>,
+    /// The head of a reopened database, whose stored result has not been read.
+    unread_head: Option<SnapshotRef>,
     owner_epoch: u64,
     state_version: u64,
     published: Option<u64>,
@@ -679,11 +811,6 @@ struct ResidentDatabase {
     last_result: Option<JsonText>,
     next_write: Option<WritePlan>,
     pending: Option<PendingStateCommit>,
-}
-
-struct PublishedSnapshot {
-    digest: String,
-    bytes: Payload,
 }
 
 struct PendingStateCommit {
@@ -702,6 +829,7 @@ impl ResidentDatabase {
             sqlite,
             sqlite_head: None,
             snapshot: None,
+            unread_head: None,
             owner_epoch,
             state_version: 0,
             published: None,
@@ -712,7 +840,7 @@ impl ResidentDatabase {
         })
     }
 
-    fn published_snapshot(&self) -> Option<&PublishedSnapshot> {
+    fn published_snapshot(&self) -> Option<&SnapshotRef> {
         if self.pending.is_some() || self.published != Some(self.synced) {
             return None;
         }
@@ -788,6 +916,19 @@ impl StateWriteTimings {
     fn elapsed_ms(&self) -> f64 {
         elapsed_ms(self.started_at)
     }
+}
+
+/// The slot emptied of a database that failed to open, or new temporary storage.
+async fn emptied(slot: Option<&Path>) -> Result<CaptureDirectory> {
+    let Some(path) = slot else {
+        return CaptureDirectory::temporary();
+    };
+    tokio::fs::create_dir_all(path).await?;
+    let mut entries = tokio::fs::read_dir(path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        tokio::fs::remove_file(entry.path()).await?;
+    }
+    CaptureDirectory::slot(path.to_owned())
 }
 
 fn elapsed_ms(started_at: Instant) -> f64 {

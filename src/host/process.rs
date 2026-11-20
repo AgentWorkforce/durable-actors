@@ -29,7 +29,7 @@ use super::{
 
 const HOST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_ACTOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const NODE_CACHE_SAVE_BUDGET: Duration = Duration::from_secs(30);
+const PARK_BUDGET: Duration = Duration::from_secs(10);
 /// How long the executor waits for its host to attach. Falling back from Rapid can
 /// spend two operation timeouts before Standard starts: the failed open, then
 /// deleting the replicas that did open.
@@ -204,7 +204,7 @@ pub(super) async fn serve_assigned_host(
             .finish(shutdown_deadline - Duration::from_secs(2))
             .await;
         if result.is_ok() {
-            database.save_to_node_cache(NODE_CACHE_SAVE_BUDGET).await;
+            database.park(PARK_BUDGET).await;
         }
         lifecycle.stop().await;
         result
