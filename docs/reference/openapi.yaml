@@ -839,29 +839,6 @@ paths:
                         text/plain:
                             schema: { type: string }
                 "503": { description: Actor host is stopping. No response body. }
-webhooks:
-    socketMessage:
-        post:
-            operationId: receiveSocketMessageEvent
-            tags: [WebSockets]
-            summary: Receive handled socket messages
-            description: Set DURABLE_ACTORS_SOCKET_EVENT_URL to enable. When DURABLE_ACTORS_SECRET is configured, callbacks send it as a bearer API key; otherwise the authorization header is omitted. Delivery is best effort, without retries.
-            requestBody:
-                required: true
-                content:
-                    application/json:
-                        schema: { $ref: "#/components/schemas/SocketMessageEvent" }
-                        examples:
-                            message:
-                                value:
-                                    eventId: 04c842c9-4532-467a-9831-f58f183b110e
-                                    actorName: ChatRoom
-                                    actorId: lobby
-                                    triggerId: null
-                                    connectionId: connection-1
-                                    message: { type: text, data: '{"type":"post","text":"Hello"}' }
-            responses:
-                "2XX": { description: Accepted; no response body required. }
 components:
     securitySchemes:
         ApiKey:
@@ -1682,28 +1659,6 @@ components:
                 queueWaitMs: { type: [number, "null"], minimum: 0 }
                 hostState: { type: string, enum: [cold, warm], description: "Whether routing required host startup. Defaults to warm for historical traces without this field." }
                 outcome: { type: string, enum: [completed, failed, rejected, rerouted, interrupted] }
-        SocketMessageEvent:
-            type: object
-            required: [eventId, actorName, actorId, triggerId, connectionId, message]
-            properties:
-                eventId: { type: string, format: uuid }
-                actorName: { type: string }
-                actorId: { type: string }
-                triggerId: { type: [string, "null"] }
-                connectionId: { type: string }
-                message:
-                    oneOf:
-                        - type: object
-                          required: [type, data]
-                          properties:
-                              type: { type: string, const: text }
-                              data: { type: string, description: JSON-encoded message. }
-                        - type: object
-                          required: [type, data]
-                          properties:
-                              type: { type: string, const: binary }
-                              data: { type: string, contentEncoding: base64 }
-                          description: Unsupported by TypeScript actors.
         Error:
             type: object
             required: [error]

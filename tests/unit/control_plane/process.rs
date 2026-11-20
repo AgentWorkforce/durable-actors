@@ -487,24 +487,6 @@ fn compute_region_accepts_multiple_zones_and_rejects_empty_or_mismatched_sets() 
     Ok(())
 }
 
-#[test]
-fn configures_socket_events_without_a_separate_key() -> Result<()> {
-    let mut complete = HashMap::from([(
-        "DURABLE_ACTORS_SOCKET_EVENT_URL",
-        "https://api.example.com/events",
-    )]);
-    let sink =
-        socket_event_sink_config(&mut |name| complete.get(name).map(|value| (*value).into()))?
-            .context("socket event sink was not configured")?;
-    assert_eq!(sink.url, "https://api.example.com/events");
-    complete.remove("DURABLE_ACTORS_SOCKET_EVENT_URL");
-    assert!(
-        socket_event_sink_config(&mut |name| complete.get(name).map(|value| (*value).into()))?
-            .is_none()
-    );
-    Ok(())
-}
-
 async fn echo_websocket(upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(async |mut socket| {
         if let Some(Ok(message)) = socket.recv().await {

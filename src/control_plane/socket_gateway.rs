@@ -293,7 +293,7 @@ impl SocketDispatcher for GatewaySocketDispatcher {
     }
     fn notify(&self, ticket: &SocketTicket, event: &crate::actor::ActorSocketEvent) {
         self.service
-            .deliver_socket_message_event(&ticket.actor, None, event);
+            .log_committed_socket_message(&ticket.actor, event);
     }
 }
 

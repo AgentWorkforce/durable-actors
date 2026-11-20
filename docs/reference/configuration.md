@@ -95,16 +95,15 @@ ON CONFLICT (organization_id) DO UPDATE SET
 
 Every deployment must have a valid `organization_id`; local development uses `local`. Upgrading to this schema copies each project override to its organization, keeping the highest value per setting, and drops `durable_actors_project_limits`. Startup fails without changes, listing the affected projects, while any deployment lacks a valid organization or any project override lacks a deployment. Redeploy those projects with `organizationId` before upgrading; a redeploy replaces their hosts, so none keep credentials without an organization.
 
-## Authentication and callbacks
+## Authentication
 
-| Variable                                | Default                        | Description                                                                                                                                    |
-| --------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DURABLE_ACTORS_JWT_KEY_ID`             | `primary`                      | Signing key identifier.                                                                                                                        |
-| `DURABLE_ACTORS_JWT_ISSUER`             | `durable-actors-control-plane` | Token issuer. Changing it invalidates tokens that running hosts and sessions hold.                                                             |
-| `DURABLE_ACTORS_AUTHORITY_JWT_AUDIENCE` | `durable-actors-authority`     | Server authentication audience.                                                                                                                |
-| `DURABLE_ACTORS_INVOKE_JWT_AUDIENCE`    | `durable-actors-invoke`        | Actor-call audience.                                                                                                                           |
-| `DURABLE_ACTORS_JWT_MAX_TTL_SECONDS`    | `86400`                        | Positive maximum credential lifetime in seconds.                                                                                               |
-| `DURABLE_ACTORS_SOCKET_EVENT_URL`       | Disabled                       | Incoming-message callback URL. Callbacks send the shared secret when configured and omit authorization otherwise; see [OpenAPI](openapi.yaml). |
+| Variable                                | Default                        | Description                                                                        |
+| --------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------- |
+| `DURABLE_ACTORS_JWT_KEY_ID`             | `primary`                      | Signing key identifier.                                                            |
+| `DURABLE_ACTORS_JWT_ISSUER`             | `durable-actors-control-plane` | Token issuer. Changing it invalidates tokens that running hosts and sessions hold. |
+| `DURABLE_ACTORS_AUTHORITY_JWT_AUDIENCE` | `durable-actors-authority`     | Server authentication audience.                                                    |
+| `DURABLE_ACTORS_INVOKE_JWT_AUDIENCE`    | `durable-actors-invoke`        | Actor-call audience.                                                               |
+| `DURABLE_ACTORS_JWT_MAX_TTL_SECONDS`    | `86400`                        | Positive maximum credential lifetime in seconds.                                   |
 
 ## Kubernetes hosting
 

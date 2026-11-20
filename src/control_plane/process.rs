@@ -44,7 +44,6 @@ pub struct ControlPlaneProcessConfig {
     pub invoke_api_key: Option<String>,
     pub storage: ControlPlaneStorageConfig,
     pub sandbox_provider: SandboxProviderConfig,
-    pub socket_event_sink: Option<SocketEventSinkConfig>,
     /// Where the control plane exports platform events (WebSocket connections and deployments);
     /// unset turns them off.
     pub platform_telemetry: Option<super::PlatformTelemetryConfig>,
@@ -120,10 +119,6 @@ pub struct SandboxProviderConfig {
 pub(crate) enum SandboxBackend {
     Gke(GkeConfig),
     Modal(ModalConfig),
-}
-
-pub struct SocketEventSinkConfig {
-    pub url: String,
 }
 
 impl ControlPlaneProcessConfig {
@@ -299,13 +294,6 @@ async fn control_plane_routes(
         provisioner = provisioner.with_actor_admission(admission.clone());
         lifecycle = lifecycle.with_observer(admission);
     }
-    let socket_events = config
-        .socket_event_sink
-        .map(|sink| {
-            super::event_sink::HttpSocketMessageEventSink::new(sink.url, config.api_key.clone())
-        })
-        .transpose()?
-        .map(|sink| Arc::new(sink) as Arc<dyn super::event_sink::SocketMessageEventSink>);
     let mut service = ControlPlaneService::new(
         placements.clone(),
         auth,
@@ -314,8 +302,7 @@ async fn control_plane_routes(
         Arc::new(provisioner),
     )
     .with_runtime_access(runtime_access)
-    .with_alarm_store(Arc::new(super::alarms::PostgresAlarmStore::new(database)))
-    .with_socket_event_sink(socket_events);
+    .with_alarm_store(Arc::new(super::alarms::PostgresAlarmStore::new(database)));
     if let Some(redis) = redis {
         service.routes = Arc::new(super::routes::RedisRoutes::new(
             redis,
@@ -618,7 +605,6 @@ impl ControlPlaneProcessConfig {
                 .is_some_and(|region| sandbox_provider.pool.regions.contains(region)),
             "default region has no configured sandbox placement"
         );
-        let socket_event_sink = socket_event_sink_config(&mut get)?;
         let alarm_poll_interval = alarm_poll_interval(&mut get)?;
         Ok(Self {
             bind,
@@ -638,7 +624,6 @@ impl ControlPlaneProcessConfig {
             invoke_api_key,
             storage,
             sandbox_provider,
-            socket_event_sink,
             platform_telemetry: platform_telemetry_config(&mut get)?,
             usage_topic: get("DURABLE_ACTORS_USAGE_TOPIC"),
             events_topic: get("DURABLE_ACTORS_EVENTS_TOPIC"),
@@ -822,18 +807,6 @@ fn platform_telemetry_config(
         endpoint: validated_http_url(&endpoint, "DURABLE_ACTORS_PLATFORM_TELEMETRY_ENDPOINT")?,
         token_file: token_file.into(),
     }))
-}
-
-fn socket_event_sink_config(
-    get: &mut impl FnMut(&str) -> Option<String>,
-) -> Result<Option<SocketEventSinkConfig>> {
-    get("DURABLE_ACTORS_SOCKET_EVENT_URL")
-        .map(|url| {
-            Ok(SocketEventSinkConfig {
-                url: validated_http_url(&url, "DURABLE_ACTORS_SOCKET_EVENT_URL")?,
-            })
-        })
-        .transpose()
 }
 
 fn sandbox_provider_config(

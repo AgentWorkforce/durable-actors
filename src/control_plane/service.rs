@@ -52,7 +52,6 @@ pub struct ControlPlaneService {
     pub(super) registry: Arc<dyn AdminRegistry>,
     provisioner: Arc<dyn HostProvisioner>,
     alarms: Arc<dyn super::alarms::AlarmStore>,
-    socket_events: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
     deployments: Arc<dyn PlatformEvents<DeploymentEvent>>,
     local_builds: Option<Arc<super::local_build::LocalBuilds>>,
     hosts: reqwest::Client,
@@ -94,7 +93,6 @@ impl ControlPlaneService {
             registry,
             provisioner,
             alarms: Arc::new(super::alarms::MemoryAlarmStore::default()),
-            socket_events: None,
             deployments: Arc::new(NoPlatformEvents),
             local_builds: None,
             hosts: reqwest::Client::builder()
@@ -147,14 +145,6 @@ impl ControlPlaneService {
         stop: tokio_util::sync::CancellationToken,
     ) {
         super::alarms::start(self.clone(), self.alarms.clone(), poll_interval, stop);
-    }
-
-    pub(crate) fn with_socket_event_sink(
-        mut self,
-        sink: Option<Arc<dyn super::event_sink::SocketMessageEventSink>>,
-    ) -> Self {
-        self.socket_events = sink;
-        self
     }
 
     pub fn into_internal_service(self) -> ActorControlPlaneServiceServer<Self> {
@@ -329,12 +319,7 @@ impl ControlPlaneService {
         Ok(())
     }
 
-    pub(super) fn deliver_socket_message_event(
-        &self,
-        actor: &ActorKey,
-        trigger_id: Option<String>,
-        event: &ActorSocketEvent,
-    ) {
+    pub(super) fn log_committed_socket_message(&self, actor: &ActorKey, event: &ActorSocketEvent) {
         let ActorSocketEvent::Message {
             connection_id,
             message,
@@ -342,19 +327,6 @@ impl ControlPlaneService {
         else {
             return;
         };
-        if let Some(sink) = self.socket_events.clone() {
-            let event = super::event_sink::SocketMessageEvent::new(
-                actor,
-                trigger_id,
-                connection_id,
-                message,
-            );
-            tokio::spawn(async move {
-                if let Err(error) = sink.deliver(event).await {
-                    warn!(error = %format!("{error:#}"), "actor socket message trigger delivery failed");
-                }
-            });
-        }
         info!(
             event = "actor_socket_message_committed",
             actor_name = %actor.actor_name,

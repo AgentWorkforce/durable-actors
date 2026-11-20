@@ -39,16 +39,14 @@ test("actor discovery documents an explicit project for every operation", async 
 test("OpenAPI examples satisfy their request and response schemas", async () => {
     const spec = await SwaggerParser.dereference(specPath)
     const ajv = new Ajv({ strict: false, validateFormats: false })
-    for (const paths of [spec.paths, spec.webhooks]) {
-        for (const path of Object.values(paths)) {
-            for (const method of ["get", "post", "put", "delete"]) {
-                const operation = path[method]
-                if (!operation) continue
-                for (const body of [operation.requestBody, ...Object.values(operation.responses)]) {
-                    for (const media of Object.values(body?.content ?? {})) {
-                        for (const example of Object.values(media.examples ?? {})) {
-                            assert.ok(ajv.validate(media.schema, example.value), `${operation.operationId}: ${ajv.errorsText()}`)
-                        }
+    for (const path of Object.values(spec.paths)) {
+        for (const method of ["get", "post", "put", "delete"]) {
+            const operation = path[method]
+            if (!operation) continue
+            for (const body of [operation.requestBody, ...Object.values(operation.responses)]) {
+                for (const media of Object.values(body?.content ?? {})) {
+                    for (const example of Object.values(media.examples ?? {})) {
+                        assert.ok(ajv.validate(media.schema, example.value), `${operation.operationId}: ${ajv.errorsText()}`)
                     }
                 }
             }

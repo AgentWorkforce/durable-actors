@@ -13,18 +13,6 @@ mod lifecycle;
 #[path = "spare_tiers.rs"]
 mod spare_tiers;
 
-struct FakeSocketEventSink {
-    delivered: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
-}
-
-#[async_trait]
-impl super::super::event_sink::SocketMessageEventSink for FakeSocketEventSink {
-    async fn deliver(&self, event: super::super::event_sink::SocketMessageEvent) -> Result<()> {
-        self.delivered.send(serde_json::to_value(event)?)?;
-        Ok(())
-    }
-}
-
 fn test_lease(host: &HostId) -> HostLease {
     HostLease {
         id: host.clone(),
@@ -390,56 +378,6 @@ async fn deploying_replaces_running_hosts_even_when_configuration_is_unchanged()
     assert!(service.delete_deployment(&admin, "default").await?);
     assert_eq!(admin.current_deployment("default").await?, None);
     assert!(!service.delete_deployment(&admin, "default").await?);
-    Ok(())
-}
-
-#[tokio::test]
-async fn accepted_socket_messages_are_delivered_to_the_configured_event_sink() -> Result<()> {
-    let issuer = test_issuer()?;
-    let auth = ActorJwtVerifier::for_scope(
-        issuer.verifier_keys_json()?,
-        "issuer",
-        "invocation",
-        ActorTokenPurpose::Invocation,
-        Duration::from_secs(60),
-    )?;
-    let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
-    let service = ControlPlaneService::new(
-        Arc::new(LocalObjectPlacementStore::default()),
-        auth,
-        Arc::new(LocalAdminRegistry::default()),
-        issuer,
-        Arc::new(UnavailableProvisioner),
-    )
-    .with_socket_event_sink(Some(Arc::new(FakeSocketEventSink {
-        delivered: delivered_tx,
-    })));
-    let actor = ActorKey {
-        project_id: "default".into(),
-        actor_name: "ChatRoom".into(),
-        actor_id: "room-1".into(),
-    };
-
-    service.deliver_socket_message_event(
-        &actor,
-        Some("trigger-1".into()),
-        &ActorSocketEvent::Message {
-            connection_id: "socket-1".into(),
-            message: crate::actor::ActorSocketMessage::Text {
-                data: "hello".into(),
-            },
-        },
-    );
-
-    let delivered = tokio::time::timeout(Duration::from_secs(1), delivered_rx.recv())
-        .await?
-        .context("socket event delivery task stopped")?;
-    assert_eq!(delivered["actorName"], "ChatRoom");
-    assert_eq!(delivered["actorId"], "room-1");
-    assert_eq!(delivered["triggerId"], "trigger-1");
-    assert_eq!(delivered["connectionId"], "socket-1");
-    assert_eq!(delivered["message"]["type"], "text");
-    assert_eq!(delivered["message"]["data"], "hello");
     Ok(())
 }
 
