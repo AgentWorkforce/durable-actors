@@ -1,4 +1,5 @@
 const count = new Intl.NumberFormat("en-US")
+const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 })
 const decimal = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 })
 const fine = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 2 })
 const percent = new Intl.NumberFormat("en-US", { style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1 })
@@ -18,14 +19,14 @@ export const formatTick = (ms: number, spanMs: number) => (spanMs < 86_400_000 ?
 export const formatTimeSpan = timeSpan(dateTime, clock)
 export const formatPreciseTimeSpan = timeSpan(preciseDateTime, preciseClock)
 export const formatLogClock = (ms: number) => logClock.format(ms)
-export const formatCount = (value: number) => count.format(value)
+export const formatCount = (value: number) => compact.format(value)
 export const formatDecimal = (value: number) => decimal.format(value)
 export const formatPercent = (ratio: number) => percent.format(ratio)
 export const formatMs = (ms: number) => formatMsParts(ms).join("\u00a0")
 export const formatMegabytes = (bytes: number) => decimal.format(bytes / 1_000_000)
 export const formatCpu = (cores: number) => fine.format(cores)
 export const formatMebibytes = (bytes: number) => decimal.format(bytes / 1_048_576)
-export const formatPlural = (value: number, noun: string) => `${count.format(value)} ${value === 1 ? noun : `${noun}s`}`
+export const formatPlural = (value: number, noun: string) => `${formatCount(value)} ${value === 1 ? noun : `${noun}s`}`
 
 // The cutoffs sit just below 1 ms and 1 s so rounding never prints "1,000 µs" or "1,000 ms".
 export function formatMsParts(ms: number): [value: string, unit: string] {
