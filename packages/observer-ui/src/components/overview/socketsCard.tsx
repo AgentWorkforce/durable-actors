@@ -9,8 +9,7 @@ import { Skeleton } from "../ui/skeleton.js"
 import { TrendCard } from "../ui/trendCard.js"
 
 export function SocketsCard() {
-    const { actorTypes, sessions, isError, isSocketsError } = useData()
-    const now = Date.now()
+    const { actorTypes, sessions, isError, isSocketsError, nowMs: now } = useData()
     const failed = isError || isSocketsError
     const metrics = actorTypes && sessions && getMetrics(actorTypes, sessions, now)
     const loading = !metrics && !failed

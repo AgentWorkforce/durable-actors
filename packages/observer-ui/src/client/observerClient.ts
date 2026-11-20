@@ -1,7 +1,8 @@
+import type { RequestFilter } from "../lib/views/requests.js"
 import type { ActorInventory } from "../types/Actors.js"
 import type { EventHistory, RecordedEvent } from "../types/Events.js"
 import type { ActorLogPage, LogFilter, LogHistogram } from "../types/Logs.js"
-import type { RequestHistoryQuery, RequestTrace, RequestTracePage } from "../types/Requests.js"
+import type { RequestHistogram, RequestHistoryQuery, RequestTrace, RequestTracePage } from "../types/Requests.js"
 import type { ResidencyHistory } from "../types/Residency.js"
 import type { ResourceUsage } from "../types/Resources.js"
 import type { SocketSession } from "../types/Sockets.js"
@@ -19,6 +20,7 @@ type totalActorInstancesPayload = Map<string, ActorInventory>
 export interface ObserverClient {
     listActorTypes(): Promise<ActorInventory>
     listRequests(query: RequestHistoryQuery): Promise<RequestTracePage>
+    getRequestHistogram(filter: RequestFilter, bounds: TimeBounds, bucketMs: number): Promise<RequestHistogram>
     listResidency(actorName: string, bounds: TimeBounds, actorId?: string): Promise<ResidencyHistory>
     getResources(actorName: string, actorId: string, bounds: TimeBounds, bucketMs: number): Promise<ResourceUsage>
     listEventHistory(types: RecordedEvent["type"][], bounds: TimeBounds, actorName?: string, actorId?: string): Promise<EventHistory>
@@ -42,6 +44,13 @@ export class HttpObserverClient implements ObserverClient {
         if (actorId) query.set("actorId", actorId)
 
         return await this.get<RequestTracePage>(`requests?${query}`)
+    }
+
+    async getRequestHistogram({ actorName, actorId }: RequestFilter, { fromMs, toMs }: TimeBounds, bucketMs: number): Promise<RequestHistogram> {
+        const query = new URLSearchParams({ fromMs: String(fromMs), toMs: String(toMs), bucketMs: String(bucketMs) })
+        if (actorName) query.set("actorName", actorName)
+        if (actorId) query.set("actorId", actorId)
+        return await this.get<RequestHistogram>(`requests/histogram?${query}`)
     }
 
     async listResidency(actorName: string, { fromMs, toMs }: TimeBounds, actorId?: string): Promise<ResidencyHistory> {

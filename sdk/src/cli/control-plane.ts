@@ -75,6 +75,16 @@ class ControlPlaneClient {
         )
     }
 
+    getRequestHistogram(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
+        return this.requestJson(
+            "GET",
+            `${this.projectPath()}/observe/requests/histogram?${query}`,
+            undefined,
+            30_000,
+            signal
+        )
+    }
+
     getMetrics(query: URLSearchParams, signal?: AbortSignal): Promise<unknown> {
         return this.requestJson(
             "GET",

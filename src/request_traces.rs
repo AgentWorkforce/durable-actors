@@ -152,6 +152,16 @@ impl TraceStore {
         self.queries.logs(project_id, query).await
     }
 
+    pub(crate) async fn request_histogram(
+        &self,
+        project_id: &str,
+        query: &history::RequestHistogramQuery,
+    ) -> Result<history::RequestHistogram> {
+        validate_component("project ID", project_id, 64).context(InvalidTraceQuery)?;
+        query.validate().context(InvalidTraceQuery)?;
+        self.queries.request_histogram(project_id, query).await
+    }
+
     pub(crate) async fn log_histogram(
         &self,
         project_id: &str,

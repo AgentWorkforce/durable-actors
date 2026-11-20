@@ -58,6 +58,7 @@ class Observer {
                     | "getResources"
                     | "listLogs"
                     | "getLogHistogram"
+                    | "getRequestHistogram"
                 >
             >,
         private readonly openBrowser: (url: string) => Promise<unknown>,
@@ -155,6 +156,7 @@ class Observer {
             "/api/observe/state": this.client.getState,
             "/api/observe/state/history": this.client.listStateHistory,
             "/api/observe/requests": this.client.listRequests,
+            "/api/observe/requests/histogram": this.client.getRequestHistogram,
             "/api/observe/metrics": this.client.getMetrics,
             "/api/observe/queue-waits": this.client.listQueueWaits,
             "/api/observe/resources": this.client.getResources,

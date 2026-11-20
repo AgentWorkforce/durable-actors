@@ -221,7 +221,7 @@ async fn residency_runs_from_sql_match_the_rust_reference() -> Result<()> {
 async fn read_collector_rows(store: &ClickHouseTracePersistence, project: &str) -> Result<()> {
     use crate::actor::LogLevel;
     use crate::request_traces::{
-        history::HistoryQuery,
+        history::{HistoryQuery, RequestCounts, RequestHistogramQuery},
         logs::{LogHistogramQuery, LogQuery},
         metrics::{QueueWaitQuery, TimeRange},
         persistence::TraceQueries,
@@ -301,6 +301,38 @@ async fn read_collector_rows(store: &ClickHouseTracePersistence, project: &str) 
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis(),
     )?;
+    let requests = store
+        .request_histogram(
+            project,
+            &RequestHistogramQuery {
+                actor_name: Some("Room".into()),
+                actor_id: Some("lobby".into()),
+                from_ms: now - 3_600_000,
+                to_ms: now + 60_000,
+                bucket_ms: 60_000,
+            },
+        )
+        .await?;
+    let total = requests
+        .buckets
+        .iter()
+        .fold(RequestCounts::default(), |mut total, bucket| {
+            total.ok += bucket.ok;
+            total.queue_wait_ms += bucket.queue_wait_ms;
+            total.queue_waits += bucket.queue_waits;
+            total.run_ms += bucket.run_ms;
+            total
+        });
+    assert_eq!(
+        total,
+        RequestCounts {
+            ok: 1,
+            queue_wait_ms: 2.5,
+            queue_waits: 1,
+            run_ms: 10.0,
+            ..Default::default()
+        }
+    );
     let histogram = store
         .log_histogram(
             project,

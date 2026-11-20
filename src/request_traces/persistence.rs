@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use super::{
     TracePage,
     events::EventQuery,
-    history::HistoryQuery,
+    history::{HistoryQuery, RequestHistogram, RequestHistogramQuery},
     logs::{LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
     otlp::PlatformLog,
@@ -22,6 +22,11 @@ pub(crate) mod sqlite;
 #[async_trait]
 pub(crate) trait TraceQueries: Send + Sync {
     async fn history(&self, project_id: &str, query: &HistoryQuery) -> Result<TracePage>;
+    async fn request_histogram(
+        &self,
+        project_id: &str,
+        query: &RequestHistogramQuery,
+    ) -> Result<RequestHistogram>;
     async fn logs(&self, project_id: &str, query: &LogQuery) -> Result<LogPage>;
     async fn log_histogram(
         &self,
@@ -71,6 +76,14 @@ impl TraceQueries for NoTraceQueries {
             records: Vec::new(),
             next_cursor: None,
         })
+    }
+
+    async fn request_histogram(
+        &self,
+        _: &str,
+        query: &RequestHistogramQuery,
+    ) -> Result<RequestHistogram> {
+        Ok(RequestHistogram::empty(query))
     }
 
     async fn logs(&self, _: &str, _: &LogQuery) -> Result<LogPage> {

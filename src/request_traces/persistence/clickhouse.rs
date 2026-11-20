@@ -10,7 +10,7 @@ use super::TraceQueries;
 use crate::request_traces::{
     TracePage,
     events::EventQuery,
-    history::HistoryQuery,
+    history::{HistoryQuery, RequestHistogram, RequestHistogramQuery},
     logs::{LogHistogram, LogHistogramQuery, LogPage, LogQuery},
     metrics::{OverviewMetrics, QueueWaitQuery, QueueWaitRow, TimeRange},
     otlp::PlatformLog,
@@ -70,6 +70,14 @@ impl ClickHouseTracePersistence {
 impl TraceQueries for ClickHouseTracePersistence {
     async fn history(&self, project: &str, query: &HistoryQuery) -> Result<TracePage> {
         self.read_history(project, query).await
+    }
+
+    async fn request_histogram(
+        &self,
+        project: &str,
+        query: &RequestHistogramQuery,
+    ) -> Result<RequestHistogram> {
+        self.read_request_histogram(project, query).await
     }
 
     async fn logs(&self, project: &str, query: &LogQuery) -> Result<LogPage> {

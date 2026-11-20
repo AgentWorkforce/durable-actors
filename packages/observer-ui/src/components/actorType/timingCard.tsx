@@ -1,39 +1,40 @@
 import { formatMs, formatMsParts } from "../../format.js"
-import { type TimingPick, timingStats } from "../../lib/requestStats.js"
-import { bucketCount, bucketLabel, windowTicks } from "../../lib/timeRange.js"
-import type { RequestTrace } from "../../types/Requests.js"
+import { type CountsAverage, histogramTotals } from "../../lib/requestStats.js"
+import { bucketCount, windowTicks } from "../../lib/timeRange.js"
+import { bucketEndLabel } from "../../lib/views/histogram.js"
+import type { RequestHistogram } from "../../types/Requests.js"
 import type { TimeWindow } from "../../types/TimeRange.js"
 import { Skeleton } from "../ui/skeleton.js"
 import { TrendCard } from "../ui/trendCard.js"
 
 export type TimingCardProps = {
     label: string
-    pick: TimingPick
+    pick: CountsAverage
     color: string
     chartLabel: string
-    requests: RequestTrace[] | null
+    histogram: RequestHistogram | undefined
     failed: boolean
     timeWindow: TimeWindow
 }
 
-export function TimingCard({ label, pick, color, chartLabel, requests, failed, timeWindow }: TimingCardProps) {
-    const stats = requests && timingStats(requests, timeWindow, pick)
-    const loading = !stats && !failed
-    const [average, unit] = formatMsParts(stats?.average ?? 0)
-    const value = stats ? average : loading ? <Skeleton className="h-11 w-20" /> : "—"
-    const series = stats?.series ?? Array<number>(bucketCount(timeWindow)).fill(0)
+export function TimingCard({ label, pick, color, chartLabel, histogram, failed, timeWindow }: TimingCardProps) {
+    const series = histogram?.buckets.map(counts => pick(counts) ?? 0)
+    const loading = !series && !failed
+    const [average, unit] = formatMsParts((histogram && pick(histogramTotals(histogram))) ?? 0)
+    const value = series ? average : loading ? <Skeleton className="h-11 w-20" /> : "—"
+    const shown = series ?? Array<number>(bucketCount(timeWindow)).fill(0)
     return (
         <TrendCard
             label={label}
             value={value}
             unit={unit}
             busy={loading}
-            failed={!stats && failed}
-            series={series}
+            failed={!series && failed}
+            series={shown}
             axis={windowTicks(timeWindow, 2)}
             color={color}
             chartLabel={chartLabel}
-            describePoint={index => ({ at: bucketLabel(timeWindow, index), value: formatMs(series[index] ?? 0) })}
+            describePoint={index => ({ at: histogram ? bucketEndLabel(histogram, index) : "", value: formatMs(shown[index] ?? 0) })}
         />
     )
 }

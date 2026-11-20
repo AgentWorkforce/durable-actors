@@ -190,6 +190,18 @@ impl RequestOutcome {
             Self::Interrupted => "interrupted",
         }
     }
+
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        [
+            Self::Completed,
+            Self::Failed,
+            Self::Rejected,
+            Self::Rerouted,
+            Self::Interrupted,
+        ]
+        .into_iter()
+        .find(|outcome| outcome.as_str() == text)
+    }
 }
 
 #[cfg(test)]

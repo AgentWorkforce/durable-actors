@@ -6,7 +6,7 @@ use super::{InvalidTraceQuery, TRACE_CAPACITY, history::HistoryQuery};
 use crate::actor::LogLevel;
 
 const MAX_SEARCH_CHARS: usize = 256;
-const MAX_HISTOGRAM_BUCKETS: u64 = 1_000;
+pub(super) const MAX_HISTOGRAM_BUCKETS: u64 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

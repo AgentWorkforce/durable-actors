@@ -6,8 +6,9 @@ use super::{
 };
 use crate::platform_events::sockets::SocketClose;
 use crate::request_traces::{
-    RequestTrace, TraceEvent, TraceRecord,
+    RequestOutcome, RequestTrace, TraceEvent, TraceRecord,
     events::EVENT_LIMIT,
+    history::{RequestHistogram, RequestHistogramQuery},
     logs::{ActorLog, LogHistogram, LogHistogramQuery},
     metrics::ClassMetrics,
     sockets::SocketRecord,
@@ -113,6 +114,40 @@ impl ClickHouseTracePersistence {
         let mut histogram = LogHistogram::empty(query);
         for row in rows {
             histogram.add(row.bucket, &row.level, row.lines);
+        }
+        Ok(histogram)
+    }
+
+    pub(super) async fn read_request_histogram(
+        &self,
+        project: &str,
+        query: &RequestHistogramQuery,
+    ) -> Result<RequestHistogram> {
+        let rows = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.query(include_str!("requests_histogram.sql"), project)
+                .param("actor_name", query.actor_name.as_deref().unwrap_or(""))
+                .param("actor_id", query.actor_id.as_deref().unwrap_or(""))
+                .param("from", millis(query.from_ms))
+                .param("to", millis(query.to_ms))
+                .param("bucket", millis(query.bucket_ms))
+                .fetch_all::<RequestBucketRow>(),
+        )
+        .await??;
+        let mut histogram = RequestHistogram::empty(query);
+        for row in rows {
+            if let (Some(counts), Some(outcome)) = (
+                histogram.bucket(row.bucket),
+                RequestOutcome::parse(&row.outcome),
+            ) {
+                counts.add_outcome(
+                    outcome,
+                    row.requests,
+                    row.queue_wait_ms,
+                    row.queue_waits,
+                    row.run_ms,
+                );
+            }
         }
         Ok(histogram)
     }
@@ -315,6 +350,16 @@ struct LogBucketRow {
     bucket: u64,
     level: String,
     lines: u64,
+}
+
+#[derive(Row, Deserialize)]
+struct RequestBucketRow {
+    bucket: u64,
+    outcome: String,
+    requests: u64,
+    queue_wait_ms: f64,
+    queue_waits: u64,
+    run_ms: f64,
 }
 
 #[derive(Row, Deserialize)]

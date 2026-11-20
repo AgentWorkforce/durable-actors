@@ -26,7 +26,8 @@ export function useLiveView<T>(key: Key, read: () => Promise<T>, apply: ApplyEve
                 reading.current--
             }
         },
-        config
+        // A paused view keeps what it read; a live one is kept current by the stream and re-reads when it reopens.
+        { revalidateOnFocus: false, revalidateOnReconnect: false, ...config }
     )
     const { mutate } = view
     useEffect(() => {

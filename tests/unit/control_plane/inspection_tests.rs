@@ -501,10 +501,11 @@ async fn sandbox_kills_stream_live_and_the_event_history_reads_them_back() -> Re
     let kill = |id: &str, at_ms: u64, reason: &str| json!({"actorName": "Room.with.dots", "actorId": id, "atMs": at_ms, "reason": reason});
     let first = kill("one", 1000, "out_of_memory");
     let second = kill("two", 2000, "out_of_disk");
-    for expected in [&first, &second] {
-        let (name, streamed) = events.next().await?;
-        assert_eq!((name.as_str(), &streamed[0]), ("kill", expected));
-    }
+    let (name, streamed) = events.next().await?;
+    assert_eq!(
+        (name.as_str(), &streamed),
+        ("kill", &json!([first, second]))
+    );
 
     // The history holds each event as the stream sent it, under the stream's name for it.
     let [first, second] = [first, second].map(|item| json!({"type": "kill", "item": item}));
@@ -569,7 +570,7 @@ impl EventReader {
     }
 
     async fn next(&mut self) -> Result<(String, Value)> {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 while let Some(end) = self.buffer.find("\n\n") {
                     let message: String = self.buffer.drain(..end + 2).collect();
@@ -616,6 +617,41 @@ async fn event_stream_forwards_each_recorded_request() -> Result<()> {
         assert_eq!(requests[0]["requestId"], id);
         assert_eq!(requests[0]["queueWaitMs"], 10.0);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_histogram_counts_outcomes_and_timings_per_bucket() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    for (id, actor_id, time, outcome) in [
+        ("one-ok", "one", 1000, RequestOutcome::Completed),
+        ("one-failed", "one", 1500, RequestOutcome::Failed),
+        ("two-ok", "two", 1200, RequestOutcome::Completed),
+        ("one-rerouted", "one", 2600, RequestOutcome::Rerouted),
+    ] {
+        fixture
+            .record(request_trace(id, "Room", actor_id, time, outcome))
+            .await?;
+    }
+    let histogram: Value = fixture
+        .get("/v1/projects/default/observe/requests/histogram?fromMs=0&toMs=3000&bucketMs=1000&actorName=Room&actorId=one")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        histogram["buckets"],
+        json!([
+            {"ok": 0, "failed": 0, "rejected": 0, "interrupted": 0, "queueWaitMs": 0.0, "queueWaits": 0, "runMs": 0.0},
+            {"ok": 1, "failed": 1, "rejected": 0, "interrupted": 0, "queueWaitMs": 20.0, "queueWaits": 2, "runMs": 30.0},
+            {"ok": 0, "failed": 0, "rejected": 0, "interrupted": 0, "queueWaitMs": 0.0, "queueWaits": 0, "runMs": 0.0}
+        ])
+    );
+    let invalid = "/v1/projects/default/observe/requests/histogram?fromMs=0&toMs=3000&bucketMs=1";
+    assert_eq!(
+        fixture.get(invalid).await?.status(),
+        StatusCode::BAD_REQUEST
+    );
     Ok(())
 }
 

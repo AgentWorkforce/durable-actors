@@ -417,8 +417,8 @@ paths:
             description: |
                 SSE of the project's live channels, as the collector publishes them. Read each view
                 from its endpoint first, then apply these events; they never include history.
-                Each message names one event type, and its data is a JSON array of that type's
-                records in arrival order:
+                Each channel is gathered over 2-second windows. Each message names one event type,
+                and its data is a JSON array of that type's records in arrival order:
 
                 - request (signal requests): RequestTrace records, deduplicated by eventId.
                 - log (signal logs): ActorLog records matching the log filters, deduplicated by logId.
@@ -440,6 +440,8 @@ paths:
                 - usage (signal platform): actorName, actorId, atMs, cpuCores and memoryBytes of the
                   instance's runtime container, measured from outside its sandbox about every 5
                   seconds.
+
+                A window sends only the latest instance and usage event of each instance.
             parameters:
                 - name: signals
                   in: query
@@ -779,6 +781,38 @@ paths:
                     content:
                         application/json:
                             schema: { $ref: "#/components/schemas/ActorLogHistogram" }
+                "400": { $ref: "#/components/responses/InvalidRequest" }
+                "401": { $ref: "#/components/responses/Unauthenticated" }
+                "500": { $ref: "#/components/responses/Internal" }
+    /v1/projects/{project_id}/observe/requests/histogram:
+        parameters:
+            - { $ref: "#/components/parameters/ProjectId" }
+        get:
+            operationId: getRequestHistogram
+            tags: [Observability]
+            summary: Count requests over time
+            description: |
+                Requests per outcome in equal time buckets, with summed timings for averages.
+                Rerouted attempts are left out: each request counts once, under its final outcome.
+                Bucket i starts at fromMs + i * bucketMs.
+            parameters:
+                - name: actorName
+                  in: query
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,48}$" }
+                - name: actorId
+                  in: query
+                  schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
+                - { name: fromMs, in: query, required: true, schema: { type: integer, minimum: 0 } }
+                - { name: toMs, in: query, required: true, description: Exclusive; must be after fromMs., schema: { type: integer, minimum: 1 } }
+                - { name: bucketMs, in: query, required: true, description: At most 1000 buckets per range., schema: { type: integer, minimum: 1 } }
+            responses:
+                "200":
+                    description: One entry per bucket, empty buckets included.
+                    headers:
+                        Cache-Control: { $ref: "#/components/headers/NoStore" }
+                    content:
+                        application/json:
+                            schema: { $ref: "#/components/schemas/RequestHistogram" }
                 "400": { $ref: "#/components/responses/InvalidRequest" }
                 "401": { $ref: "#/components/responses/Unauthenticated" }
                 "500": { $ref: "#/components/responses/Internal" }
@@ -1568,6 +1602,26 @@ components:
                             info: { type: integer, minimum: 0 }
                             warn: { type: integer, minimum: 0 }
                             error: { type: integer, minimum: 0 }
+        RequestHistogram:
+            type: object
+            required: [fromMs, bucketMs, buckets]
+            properties:
+                fromMs: { type: integer, minimum: 0 }
+                bucketMs: { type: integer, minimum: 1 }
+                buckets:
+                    type: array
+                    items: { $ref: "#/components/schemas/RequestCounts" }
+        RequestCounts:
+            type: object
+            required: [ok, failed, rejected, interrupted, queueWaitMs, queueWaits, runMs]
+            properties:
+                ok: { type: integer, minimum: 0, description: Requests that completed. }
+                failed: { type: integer, minimum: 0 }
+                rejected: { type: integer, minimum: 0 }
+                interrupted: { type: integer, minimum: 0 }
+                queueWaitMs: { type: number, minimum: 0, description: Summed queue waits of the requests that waited. }
+                queueWaits: { type: integer, minimum: 0, description: How many requests waited in the queue. }
+                runMs: { type: number, minimum: 0, description: Summed time excluding the queue wait. }
         StateAttribution:
             type: [object, "null"]
             required: [operation, connectionId, committedAtMs, interleaved]

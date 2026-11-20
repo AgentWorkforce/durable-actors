@@ -1,3 +1,5 @@
+import type { Histogram } from "./Histogram.js"
+
 export type RequestOutcome = "completed" | "failed" | "rejected" | "rerouted" | "interrupted"
 
 export interface RequestTrace {
@@ -32,3 +34,18 @@ export type RequestHistoryQuery = {
     actorName?: string
     actorId?: string
 }
+
+/** Requests by outcome with summed timings; rerouted attempts count under their final outcome. */
+export interface RequestCounts {
+    ok: number
+    failed: number
+    rejected: number
+    interrupted: number
+    /** Summed queue waits of the requests that waited, and how many did. */
+    queueWaitMs: number
+    queueWaits: number
+    /** Summed time excluding the queue wait. */
+    runMs: number
+}
+
+export type RequestHistogram = Histogram<RequestCounts>

@@ -64,6 +64,10 @@ pub(super) fn local_router(inspector: ActorInspector) -> Router {
             "/v1/projects/{project_id}/observe/websockets",
             get(websocket_history),
         )
+        .route(
+            "/v1/projects/{project_id}/observe/requests/histogram",
+            get(request_histogram),
+        )
         .route("/v1/projects/{project_id}/observe/logs", get(log_history))
         .route(
             "/v1/projects/{project_id}/observe/logs/histogram",
@@ -347,6 +351,21 @@ async fn log_histogram(
         .inspector
         .traces
         .log_histogram(&path.0.project_id, &query)
+        .await
+        .map_err(trace_query_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(histogram)).into_response())
+}
+
+async fn request_histogram(
+    State(state): State<InspectionApi>,
+    path: Path<ProjectPath>,
+    query: Result<Query<crate::request_traces::history::RequestHistogramQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(ApiError::bad_request)?;
+    let histogram = state
+        .inspector
+        .traces
+        .request_histogram(&path.0.project_id, &query)
         .await
         .map_err(trace_query_error)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(histogram)).into_response())

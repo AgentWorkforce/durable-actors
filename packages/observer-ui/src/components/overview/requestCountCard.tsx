@@ -1,34 +1,32 @@
 import { useData } from "../../client/DatatContext.js"
 import { useTimeWindow } from "../../client/TimeRangeContext.js"
 import { formatCount, formatPlural } from "../../format.js"
-import { requestCounts } from "../../lib/requestStats.js"
-import { bucketCount, bucketLabel, describeWindow, windowTicks } from "../../lib/timeRange.js"
-import type { RequestCountMetrics } from "../../types/Overview.js"
-import type { RequestTrace } from "../../types/Requests.js"
-import type { TimeWindow } from "../../types/TimeRange.js"
+import { requestTotal } from "../../lib/requestStats.js"
+import { bucketCount, describeWindow, windowTicks } from "../../lib/timeRange.js"
+import { bucketEndLabel } from "../../lib/views/histogram.js"
 import { Skeleton } from "../ui/skeleton.js"
 import { TrendCard } from "../ui/trendCard.js"
 
 export function RequestCountCard() {
-    const { requests, isRequestsError } = useData()
+    const { requestHistogram, isRequestsError } = useData()
     const timeWindow = useTimeWindow()
-    const metrics = requests && getMetrics(requests, timeWindow)
-    const loading = !metrics && !isRequestsError
-    const value = <TotalValue total={metrics?.total} loading={loading} />
+    const series = requestHistogram?.buckets.map(requestTotal)
+    const total = series?.reduce((sum, count) => sum + count, 0)
+    const loading = !series && !isRequestsError
     const window = describeWindow(timeWindow)
-    const series = metrics?.series ?? Array<number>(bucketCount(timeWindow)).fill(0)
+    const shown = series ?? Array<number>(bucketCount(timeWindow)).fill(0)
     return (
         <TrendCard
             label="Total Requests"
-            value={value}
+            value={<TotalValue total={total} loading={loading} />}
             unit="requests"
             busy={loading}
-            failed={!metrics && isRequestsError}
-            series={series}
+            failed={!series && isRequestsError}
+            series={shown}
             axis={windowTicks(timeWindow, 2)}
             color="var(--chart-1)"
-            chartLabel={metrics ? `Requests, ${window}, ${formatCount(metrics.total)} in total` : `Requests, ${window}`}
-            describePoint={index => ({ at: bucketLabel(timeWindow, index), value: formatPlural(series[index] ?? 0, "request") })}
+            chartLabel={total !== undefined ? `Requests, ${window}, ${formatCount(total)} in total` : `Requests, ${window}`}
+            describePoint={index => ({ at: requestHistogram ? bucketEndLabel(requestHistogram, index) : "", value: formatPlural(shown[index] ?? 0, "request") })}
         />
     )
 }
@@ -37,12 +35,4 @@ function TotalValue({ total, loading }: { total: number | undefined; loading: bo
     if (total !== undefined) return <>{formatCount(total)}</>
     if (loading) return <Skeleton className="h-11 w-28" />
     return <>—</>
-}
-
-function getMetrics(requests: RequestTrace[], timeWindow: TimeWindow): RequestCountMetrics {
-    const series = requestCounts(requests, timeWindow)
-    return {
-        total: series.reduce((sum, count) => sum + count, 0),
-        series
-    }
 }

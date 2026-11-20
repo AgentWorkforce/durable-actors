@@ -6,9 +6,10 @@ import { useTimeWindow } from "../../client/TimeRangeContext.js"
 import { formatAgo, formatClock, formatDuration } from "../../format.js"
 import { useInstanceRequests } from "../../hooks/useActorRequests.js"
 import { useEventHistory } from "../../hooks/useEventHistory.js"
+import { useRequestHistogram } from "../../hooks/useRequests.js"
 import { useResidency } from "../../hooks/useResidency.js"
 import { useResources } from "../../hooks/useResources.js"
-import { queueTime, serviceTime } from "../../lib/requestStats.js"
+import { averageQueueWait, averageRunTime } from "../../lib/requestStats.js"
 import { describeWindow } from "../../lib/timeRange.js"
 import type { ActorInstance } from "../../types/Actors.js"
 import type { ResidencyPeriod } from "../../types/Residency.js"
@@ -29,9 +30,10 @@ import { CpuCard, MemoryCard, StorageCard } from "./resourceCards.js"
 
 export function InstancePage() {
     const { actorName = "", actorId = "" } = useParams()
-    const { actorTypes, isError, sessions, isSocketsError } = useData()
+    const { baseUrl, events, actorTypes, isError, sessions, isSocketsError } = useData()
     const timeWindow = useTimeWindow()
     const { requests: ownRequests, isError: isRequestsError } = useInstanceRequests(actorName, actorId)
+    const { histogram, isError: isHistogramError } = useRequestHistogram(baseUrl, timeWindow, { actorName, actorId }, events)
     const { residency, isError: isResidencyError } = useResidency(actorName, timeWindow, actorId)
     const { resources, isError: isResourcesError } = useResources(actorName, actorId, timeWindow)
     const { history: killHistory } = useEventHistory(["kill"], timeWindow, actorName, actorId)
@@ -55,23 +57,23 @@ export function InstancePage() {
             ) : (
                 <div className="flex flex-col gap-4">
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                        <RequestRateTrend requests={ownRequests} failed={isRequestsError} timeWindow={timeWindow} color="var(--foreground)" />
+                        <RequestRateTrend histogram={histogram} failed={isHistogramError} timeWindow={timeWindow} color="var(--foreground)" />
                         <TimingCard
                             label="Avg Queue Wait"
-                            pick={queueTime}
+                            pick={averageQueueWait}
                             color="var(--chart-1)"
                             chartLabel={`Average queue wait, ${describeWindow(timeWindow)}`}
-                            requests={ownRequests}
-                            failed={isRequestsError}
+                            histogram={histogram}
+                            failed={isHistogramError}
                             timeWindow={timeWindow}
                         />
                         <TimingCard
                             label="Avg Request Time"
-                            pick={serviceTime}
+                            pick={averageRunTime}
                             color="var(--foreground)"
                             chartLabel={`Average request time excluding the queue, ${describeWindow(timeWindow)}`}
-                            requests={ownRequests}
-                            failed={isRequestsError}
+                            histogram={histogram}
+                            failed={isHistogramError}
                             timeWindow={timeWindow}
                         />
                         <CpuCard resources={resources} failed={isResourcesError} timeWindow={timeWindow} />

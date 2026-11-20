@@ -1,23 +1,19 @@
-import { requestsKey } from "../client/cacheKeys.js"
+import { requestHistogramKey } from "../client/cacheKeys.js"
 import type { EventBus } from "../client/events.js"
 import { HttpObserverClient } from "../client/observerClient.js"
-import { currentBounds, windowKey } from "../lib/timeRange.js"
-import { applyRequestEvents } from "../lib/views/requests.js"
+import { emptyRequestCounts } from "../lib/requestStats.js"
+import { type RequestFilter, applyRequestCounts } from "../lib/views/requests.js"
 import type { TimeWindow } from "../types/TimeRange.js"
 
-import { useLiveView } from "./useLiveView.js"
+import { useLiveHistogram } from "./useLiveHistogram.js"
 
-export function useRequests(baseUrl: string, timeWindow: TimeWindow, events: EventBus | null) {
-    const { data, error, isLoading } = useLiveView(
-        [...requestsKey(baseUrl), ...windowKey(timeWindow)],
-        () => new HttpObserverClient(baseUrl).collectRequests(currentBounds(timeWindow)),
-        applyRequestEvents(timeWindow.toMs - timeWindow.fromMs),
-        timeWindow.live ? events : null
+/** Request counts per window step, from one store query rather than every request in the window. */
+export function useRequestHistogram(baseUrl: string, timeWindow: TimeWindow, filter: RequestFilter, events: EventBus | null) {
+    const client = new HttpObserverClient(baseUrl)
+    return useLiveHistogram(
+        { key: requestHistogramKey(baseUrl, filter), read: (bounds, bucketMs) => client.getRequestHistogram(filter, bounds, bucketMs), apply: applyRequestCounts(filter), empty: emptyRequestCounts },
+        timeWindow,
+        timeWindow.stepMs,
+        events
     )
-    return {
-        requests: data ?? null,
-        isLoading,
-        isError: !data && Boolean(error),
-        error
-    }
 }

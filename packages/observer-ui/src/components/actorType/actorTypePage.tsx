@@ -4,9 +4,10 @@ import { useData } from "../../client/DatatContext.js"
 import { useTimeWindow } from "../../client/TimeRangeContext.js"
 import { formatPlural } from "../../format.js"
 import { useActorTypeRequests } from "../../hooks/useActorRequests.js"
+import { useRequestHistogram } from "../../hooks/useRequests.js"
 import { useResidency } from "../../hooks/useResidency.js"
 import { summarizeActorType } from "../../lib/actorTypes.js"
-import { queueTime, serviceTime } from "../../lib/requestStats.js"
+import { averageQueueWait, averageRunTime } from "../../lib/requestStats.js"
 import { describeWindow } from "../../lib/timeRange.js"
 import type { ActorType } from "../../types/Actors.js"
 import { TimeRangeControl } from "../timeRange/timeRangeControl.js"
@@ -21,9 +22,10 @@ import { TimingCard } from "./timingCard.js"
 
 export function ActorTypePage() {
     const { actorName = "" } = useParams()
-    const { actorTypes, isError } = useData()
+    const { baseUrl, events, actorTypes, isError } = useData()
     const timeWindow = useTimeWindow()
-    const { requests: typeRequests, isError: isRequestsError } = useActorTypeRequests(actorName)
+    const { requests: typeRequests } = useActorTypeRequests(actorName)
+    const { histogram, isError: isRequestsError } = useRequestHistogram(baseUrl, timeWindow, { actorName }, events)
     const { residency, isError: isResidencyError } = useResidency(actorName, timeWindow)
     const actor = actorTypes?.actors.find(type => type.actorName === actorName) ?? null
 
@@ -38,19 +40,19 @@ export function ActorTypePage() {
                         <LiveDormantCard summary={actor && summarizeActorType(actor)} failed={isError} />
                         <TimingCard
                             label="Avg Queue Time"
-                            pick={queueTime}
+                            pick={averageQueueWait}
                             color="var(--chart-1)"
                             chartLabel={`Average queue time, ${describeWindow(timeWindow)}`}
-                            requests={typeRequests}
+                            histogram={histogram}
                             failed={isRequestsError}
                             timeWindow={timeWindow}
                         />
                         <TimingCard
                             label="Avg Request Latency"
-                            pick={serviceTime}
+                            pick={averageRunTime}
                             color="var(--chart-2)"
                             chartLabel={`Average request latency, ${describeWindow(timeWindow)}`}
-                            requests={typeRequests}
+                            histogram={histogram}
                             failed={isRequestsError}
                             timeWindow={timeWindow}
                         />
