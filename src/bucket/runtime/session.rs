@@ -19,12 +19,12 @@ impl RuntimeStorage {
             record.lease.id == *host && record.lease.session_id == session,
             "actor ownership changed"
         );
-        let checkpoint = self.upload_checkpoint(&record)?;
-        self.snapshots.finish(&record.stream()?, deadline).await?;
-        Ok(checkpoint)
+        let snapshot = self.uploaded_head(&record)?;
+        let progress = self.snapshots.finish(&record.stream()?, deadline).await?;
+        Ok(SessionCheckpoint { snapshot, progress })
     }
 
-    fn upload_checkpoint(&self, record: &Ownership) -> Result<SessionCheckpoint> {
+    fn uploaded_head(&self, record: &Ownership) -> Result<Option<SnapshotRef>> {
         let mut snapshot = record.base.clone();
         if let Some(uploaded) = self.uploaded.lock().unwrap().get(&record.lease.session_id) {
             ensure!(
@@ -33,6 +33,6 @@ impl RuntimeStorage {
             );
             advance(&mut snapshot, uploaded.latest.clone())?;
         }
-        Ok(SessionCheckpoint { snapshot })
+        Ok(snapshot)
     }
 }

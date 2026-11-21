@@ -21,7 +21,7 @@ mod batch;
 async fn hot_writes_reuse_streams_and_a_fresh_reader_discovers_acknowledged_state() -> Result<()> {
     let f = Fixture::new()?;
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     for version in 1..=3 {
         store
             .put(&f.stream.object(version), state(version, 1)?)
@@ -48,7 +48,7 @@ async fn single_zone_writes_recover_after_an_interrupted_flush() -> Result<()> {
     let mut f = Fixture::new()?;
     f.zones.truncate(1);
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     assert_eq!(
         f.store()?.latest(&f.stream.prefix).await?,
@@ -112,7 +112,7 @@ async fn actor_assignment_opens_both_connections_before_activation_and_reuses_th
     })
     .await?;
     assert!(f.archive.list("").await?.is_empty());
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     assert!(
         f.zones
@@ -135,7 +135,7 @@ async fn nearest_placement_writes_to_the_first_zone_to_open_and_discards_the_res
     store.prepare(&crate::storage_paths::actor_from_snapshot(
         &f.stream.object(1),
     )?)?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     for version in 1..=2 {
         store
             .put(&f.stream.object(version), state(version, 1)?)
@@ -156,7 +156,7 @@ async fn nearest_placement_skips_an_unavailable_zone() -> Result<()> {
     f.placement = crate::bucket::RapidPlacement::Nearest;
     f.zones[0].offline.store(true, Ordering::SeqCst);
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     assert!(written(&f.zones[1]));
     Ok(())
@@ -168,7 +168,7 @@ async fn nearest_placement_rotates_within_the_chosen_zone() -> Result<()> {
     f.placement = crate::bucket::RapidPlacement::Nearest;
     f.zones[0].open_delay_ms.store(20, Ordering::SeqCst);
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     f.zones[0].discarded().await?;
     f.zones[0].open_delay_ms.store(0, Ordering::SeqCst);
@@ -210,7 +210,7 @@ async fn logs_stay_recoverable_when_placement_changes() -> Result<()> {
         let mut f = Fixture::new()?;
         f.placement = writer;
         let store = f.store()?;
-        store.start(&f.stream).await?;
+        store.start(&f.stream, None).await?;
         store.put(&f.stream.object(1), state(1, 1)?).await?;
         drop(store);
         f.placement = reader;
@@ -231,7 +231,7 @@ async fn manifests_must_name_distinct_configured_zones() -> Result<()> {
     for tamper in tampers {
         let f = Fixture::new()?;
         let store = f.store()?;
-        store.start(&f.stream).await?;
+        store.start(&f.stream, None).await?;
         store.put(&f.stream.object(1), state(1, 1)?).await?;
         let prefix = crate::bucket::rapid::object_name(&f.stream.prefix)?;
         let key = f
@@ -281,7 +281,7 @@ async fn foreign_prepared_connections_are_rejected() -> Result<()> {
     let mut actor = crate::storage_paths::actor_from_snapshot(&f.stream.object(1))?;
     actor.actor_id = "different".into();
     store.prepare(&actor)?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     assert!(store.put(&f.stream.object(1), state(1, 1)?).await.is_err());
     assert!(f.zones.iter().all(|z| {
         z.objects
@@ -343,7 +343,7 @@ async fn failed_manifest_publication_never_acknowledges_an_undiscoverable_log() 
         Arc::new(crate::litestream::compaction::RustCompactor),
         CancellationToken::new(),
     )?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     assert!(store.put(&f.stream.object(1), state(1, 1)?).await.is_err());
     assert!(f.zones.iter().all(|zone| {
         zone.objects
@@ -567,7 +567,7 @@ async fn control_plane_archives_and_seals_an_abandoned_activation() -> Result<()
 async fn idle_sessions_replace_their_rapid_segment_daily() -> Result<()> {
     let f = Fixture::new()?;
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     tokio::time::timeout(Duration::from_secs(2), async {
         while manifests(&f).await.is_empty() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -597,7 +597,7 @@ async fn idle_sessions_replace_their_rapid_segment_daily() -> Result<()> {
 async fn large_segments_reuse_streams_and_preserve_batched_history() -> Result<()> {
     let f = Fixture::new()?;
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     let snapshots = large_snapshots()?;
     for (version, bytes) in &snapshots {
         store.put(&f.stream.object(*version), bytes.clone()).await?;
@@ -676,7 +676,7 @@ fn lifecycle_rules_keep_logs_for_a_week() -> Result<()> {
 async fn large_records_and_subsequent_small_writes_stay_on_rapid() -> Result<()> {
     let f = Fixture::new()?;
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     let mut snapshot = StateSnapshot::decode(&state(2, 1)?)?;
     snapshot.completion.as_mut().unwrap().result =
@@ -764,7 +764,7 @@ async fn failed_coverage_publication_never_deletes_a_durable_rapid_copy() -> Res
         Arc::new(crate::litestream::compaction::RustCompactor),
         CancellationToken::new(),
     )?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     assert!(
         store
@@ -791,7 +791,7 @@ async fn failed_coverage_publication_never_deletes_a_durable_rapid_copy() -> Res
 async fn recovery_with_one_zone_unavailable_copies_missing_commits_to_standard() -> Result<()> {
     let f = Fixture::new()?;
     let old = f.store()?;
-    old.start(&f.stream).await?;
+    old.start(&f.stream, None).await?;
     let snapshots = large_snapshots()?;
     for (version, bytes) in &snapshots {
         old.put(&f.stream.object(*version), bytes.clone()).await?;
@@ -815,7 +815,7 @@ async fn shutdown_replicates_history_before_deleting_rapid_replicas() -> Result<
         let mut f = Fixture::new()?;
         f.zones.truncate(zone_count);
         let store = f.store()?;
-        store.start(&f.stream).await?;
+        store.start(&f.stream, None).await?;
         for v in 1..=3 {
             store.put(&f.stream.object(v), state(v, 1)?).await?;
         }
@@ -845,7 +845,7 @@ async fn shutdown_replicates_history_before_deleting_rapid_replicas() -> Result<
 async fn recovery_ignores_incomplete_tail_but_rejects_corrupt_complete_records() -> Result<()> {
     let f = Fixture::new()?;
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     let mut snapshot = StateSnapshot::decode(&state(2, 1)?)?;
     snapshot.completion.as_mut().unwrap().result =
@@ -886,7 +886,7 @@ async fn unavailable_rapid_at_activation_uses_standard_without_losing_state() ->
     let f = Fixture::new()?;
     f.zones[0].offline.store(true, Ordering::SeqCst);
     let store = f.store()?;
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     store.put(&f.stream.object(1), state(1, 1)?).await?;
     store
         .finish(
@@ -910,7 +910,7 @@ async fn writes_require_an_activated_epoch_and_consecutive_versions() -> Result<
     let f = Fixture::new()?;
     let store = f.store()?;
     assert!(store.put(&f.stream.object(1), state(1, 1)?).await.is_err());
-    store.start(&f.stream).await?;
+    store.start(&f.stream, None).await?;
     assert!(store.put(&f.stream.object(2), state(2, 1)?).await.is_err());
     assert!(store.put(&f.stream.object(1), state(1, 2)?).await.is_err());
     store.put(&f.stream.object(1), state(1, 1)?).await?;
@@ -931,7 +931,7 @@ struct Fixture {
 async fn manifests_cannot_redirect_a_reader_to_another_actors_log() -> Result<()> {
     let f = Fixture::new()?;
     let first = f.store()?;
-    first.start(&f.stream).await?;
+    first.start(&f.stream, None).await?;
     first.put(&f.stream.object(1), state(1, 1)?).await?;
     let actor = ActorKey {
         project_id: "log-tests".into(),
@@ -944,7 +944,7 @@ async fn manifests_cannot_redirect_a_reader_to_another_actors_log() -> Result<()
         ..f.stream.clone()
     };
     let other = f.store()?;
-    other.start(&other_stream).await?;
+    other.start(&other_stream, None).await?;
     other.put(&object, state(1, 1)?).await?;
     let manifests = |stream: &StateStream| crate::bucket::rapid::object_name(&stream.prefix);
     let left = f.archive.list(&manifests(&f.stream)?).await?.pop().unwrap();

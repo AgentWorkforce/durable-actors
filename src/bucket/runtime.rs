@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use super::{Bucket, replace};
+use super::{Bucket, recovery::CheckpointProgress, replace};
 
 mod abandoned;
 mod activation;
@@ -58,6 +58,8 @@ struct Ownership {
     epoch: u64,
     region: String,
     base: Option<SnapshotRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_progress: Option<CheckpointProgress>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -107,6 +109,7 @@ struct UploadedSnapshots {
 
 pub(crate) struct SessionCheckpoint {
     snapshot: Option<SnapshotRef>,
+    progress: Option<CheckpointProgress>,
 }
 
 impl Ownership {

@@ -1058,7 +1058,15 @@ impl crate::bucket::SnapshotStore for PausedSnapshots {
     async fn put(&self, object: &str, bytes: Payload) -> Result<()> {
         self.inner.put(object, bytes).await
     }
-    async fn start(&self, _: &StateStream) -> Result<()> {
+    async fn start(
+        &self,
+        stream: &StateStream,
+        resume: Option<(&SnapshotRef, CheckpointProgress)>,
+    ) -> Result<()> {
+        assert_eq!(
+            resume.map(|(head, p)| (head.state_version, p.log_bytes)),
+            (stream.base_version > 0).then_some((stream.base_version, 1234))
+        );
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -1097,6 +1105,10 @@ async fn sealed_activation() -> Result<(Fixture, Arc<PausedSnapshots>, Ownership
             &first.session_id,
             Some(SessionCheckpoint {
                 snapshot: Some(SnapshotRef::new(object, &snapshot, &bytes)?),
+                progress: Some(CheckpointProgress {
+                    log_bytes: 1234,
+                    ..Default::default()
+                }),
             }),
         )
         .await?;

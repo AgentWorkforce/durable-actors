@@ -77,6 +77,9 @@ impl RuntimeStorage {
             let ownership_read_ms = read_started.elapsed().as_secs_f64() * 1_000.0;
             let previous = current.as_ref().map(|(_, record)| record);
             self.validate_activation(actor, request, region, previous)?;
+            let progress = previous
+                .filter(|r| r.sealed)
+                .and_then(|r| r.checkpoint_progress);
             let mut record = self.activation_record(actor, request, region, previous)?;
             let (recovery, replaced, ownership_cas_ms) =
                 if previous.is_none_or(|record| record.sealed) {
@@ -113,6 +116,7 @@ impl RuntimeStorage {
                 Err(error) => {
                     let checkpoint = SessionCheckpoint {
                         snapshot: record.base.clone(),
+                        progress,
                     };
                     if let Err(release) = self
                         .release_with_checkpoint(
@@ -129,7 +133,9 @@ impl RuntimeStorage {
                 }
             };
             let stream_started = Instant::now();
-            self.snapshots.start(&record.stream()?).await?;
+            self.snapshots
+                .start(&record.stream()?, record.base.as_ref().zip(progress))
+                .await?;
             let stream_open_ms = stream_started.elapsed().as_secs_f64() * 1_000.0;
             tracing::info!(
                 event = "actor_activation_storage",
@@ -224,6 +230,7 @@ impl RuntimeStorage {
             record.lease.expires_at_ms = 0;
             if let Some(checkpoint) = &checkpoint {
                 record.base = checkpoint.snapshot.clone();
+                record.checkpoint_progress = checkpoint.progress;
                 record.sealed = true;
             }
             if self
@@ -280,6 +287,7 @@ impl RuntimeStorage {
                 .map_or(Some(1), |record| record.epoch.checked_add(1))
                 .context("owner epoch overflow")?,
             region: region.into(),
+            checkpoint_progress: None,
             base: current.and_then(|record| record.base.clone()),
             lease: self.new_lease(request)?,
             mutation: String::new(),

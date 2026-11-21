@@ -1,5 +1,8 @@
-use super::{Bucket, SnapshotStore, replace};
-use crate::{payload::Payload, storage::StateStream};
+use super::{Bucket, SnapshotStore, recovery::CheckpointProgress, replace};
+use crate::{
+    payload::Payload,
+    storage::{SnapshotRef, StateStream},
+};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -208,10 +211,14 @@ impl SnapshotStore for RapidSnapshots {
             .put(self.storage.clone(), object, bytes)
             .await
     }
-    async fn start(&self, stream: &StateStream) -> Result<()> {
+    async fn start(
+        &self,
+        stream: &StateStream,
+        resume: Option<(&SnapshotRef, CheckpointProgress)>,
+    ) -> Result<()> {
         let mut session = self.session.lock().await;
         ensure!(session.is_none(), "log stream is already activated");
-        *session = Some(Session::open(self.storage.clone(), stream.clone())?);
+        *session = Some(Session::open(self.storage.clone(), stream.clone(), resume)?);
         Ok(())
     }
     async fn recover(&self, prefix: &str) -> Result<Option<(String, Payload)>> {
@@ -235,13 +242,17 @@ impl SnapshotStore for RapidSnapshots {
         }
         Ok(latest)
     }
-    async fn finish(&self, stream: &StateStream, deadline: tokio::time::Instant) -> Result<()> {
+    async fn finish(
+        &self,
+        stream: &StateStream,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<CheckpointProgress>> {
         let mut session = self.session.lock().await;
         let active = session.as_mut().context("log stream is not activated")?;
         ensure!(active.stream == *stream, "cannot finish another log stream");
-        active.finish(self.storage.clone(), deadline).await?;
+        let progress = active.finish(self.storage.clone(), deadline).await?;
         *session = None;
-        Ok(())
+        Ok(Some(progress))
     }
 }
 

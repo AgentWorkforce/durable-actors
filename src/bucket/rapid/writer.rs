@@ -14,7 +14,7 @@ pub(super) struct Session {
     archive: Option<Archiver>,
     retired: Option<Archiver>,
     retirement_error: Option<String>,
-    latest: Option<(String, Payload)>,
+    latest: Option<(SnapshotRef, Option<Payload>)>,
     version: u64,
     /// The version the current segment opened after; equal to `version` while it holds no frames.
     installed_at: u64,
@@ -25,7 +25,11 @@ pub(super) struct Session {
 }
 
 impl Session {
-    pub fn open(storage: Arc<LogStorage>, stream: StateStream) -> Result<Self> {
+    pub fn open(
+        storage: Arc<LogStorage>,
+        stream: StateStream,
+        resume: Option<(&SnapshotRef, CheckpointProgress)>,
+    ) -> Result<Self> {
         let version = stream.base_version;
         let preparing = prepare(
             storage,
@@ -41,21 +45,24 @@ impl Session {
             archive: None,
             retired: None,
             retirement_error: None,
-            latest: None,
+            latest: resume.map(|(head, _)| (head.clone(), None)),
             version,
             installed_at: version,
             standard: false,
             healthy: true,
             rotated: Instant::now(),
-            checkpoint: checkpoint::Progress::default(),
+            checkpoint: checkpoint::Progress::resume(
+                resume.map(|(_, p)| p).unwrap_or_default(),
+                version,
+            ),
         })
     }
 
     pub fn cached(&self, object: &str) -> Option<Payload> {
         self.latest
             .as_ref()
-            .filter(|(key, _)| key == object)
-            .map(|(_, bytes)| bytes.clone())
+            .filter(|(head, _)| head.object == object)
+            .and_then(|(_, bytes)| bytes.clone())
     }
 
     pub async fn put(
@@ -106,11 +113,12 @@ impl Session {
                 .append(frame, reference.state_version);
         }
         self.version = reference.state_version;
-        self.checkpoint.logged(self.version, bytes.len() as u64);
-        self.latest = Some((object.into(), bytes));
+        let size = bytes.len();
+        self.checkpoint.logged(self.version, size as u64);
+        self.latest = Some((reference, Some(bytes)));
         self.healthy = true;
         self.checkpoint
-            .schedule(storage, self.latest.as_ref(), self.version)
+            .schedule(storage, self.latest.as_ref())
             .await;
         tracing::info!(
             event = "rapid_log_snapshot",
@@ -120,7 +128,7 @@ impl Session {
                 .segment
                 .as_ref()
                 .map_or(0, |s| s.manifest.replicas.len()),
-            bytes = self.latest.as_ref().unwrap().1.len(),
+            bytes = size,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0
         );
         Ok(())
@@ -133,17 +141,20 @@ impl Session {
         restored: &crate::bucket::recovery::ResolvedSqlite,
     ) -> Result<()> {
         let object = &snapshot.reference.object;
-        if self.latest.is_some()
+        if self
+            .latest
+            .as_ref()
+            .is_some_and(|(_, bytes)| bytes.is_some())
             || snapshot.reference.state_version != self.stream.base_version
             || crate::storage_paths::actor_from_snapshot(object)?
                 != crate::storage_paths::actor_from_snapshot(&self.stream.object(self.version))?
         {
             return Ok(());
         }
-        self.latest = Some((object.clone(), snapshot.bytes.clone()));
-        self.checkpoint.restored(restored, self.version);
+        self.latest = Some((snapshot.reference.clone(), Some(snapshot.bytes.clone())));
+        self.checkpoint.restored(restored.progress, self.version);
         self.checkpoint
-            .schedule(storage, self.latest.as_ref(), self.version)
+            .schedule(storage, self.latest.as_ref())
             .await;
         Ok(())
     }
@@ -216,7 +227,11 @@ impl Session {
         self.healthy = false;
     }
 
-    pub async fn finish(&mut self, storage: Arc<LogStorage>, deadline: Instant) -> Result<()> {
+    pub async fn finish(
+        &mut self,
+        storage: Arc<LogStorage>,
+        deadline: Instant,
+    ) -> Result<CheckpointProgress> {
         ensure!(self.healthy, "uncertain write cannot be sealed");
         self.healthy = false;
         let started = Instant::now();
@@ -228,14 +243,10 @@ impl Session {
             state_version = self.version,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0
         );
-        if let Some((object, bytes)) = &self.latest {
-            self.checkpoint
-                .finish(storage, object, bytes.clone(), self.version, deadline)
-                .await;
-        }
+        let progress = self.checkpoint.finish(deadline).await;
         self.segment = None;
         self.healthy = true;
-        Ok(())
+        Ok(progress)
     }
 
     async fn finish_archive(&mut self, storage: Arc<LogStorage>) -> Result<()> {
@@ -264,8 +275,8 @@ impl Session {
             "previous archive retirement failed: {:?}",
             self.retirement_error
         );
-        if let Some((object, bytes)) = &self.latest {
-            bounded(storage.snapshots.put(object, bytes.clone())).await?;
+        if let Some((head, Some(bytes))) = &self.latest {
+            bounded(storage.snapshots.put(&head.object, bytes.clone())).await?;
         }
         Ok(())
     }
@@ -298,7 +309,7 @@ pub(super) fn start_rotation(
                 if session.healthy {
                     session
                         .checkpoint
-                        .schedule(storage.clone(), session.latest.as_ref(), session.version)
+                        .schedule(storage.clone(), session.latest.as_ref())
                         .await;
                 }
             }

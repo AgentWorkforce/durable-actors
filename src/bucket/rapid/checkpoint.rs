@@ -30,7 +30,7 @@ impl LogStorage {
             event = "sqlite_history_restored",
             object,
             checkpoint = resolved.checkpoint,
-            checkpoint_version = resolved.checkpoint_version,
+            checkpoint_version = resolved.progress.version,
             parents = resolved.parents,
             archive_epochs = history
                 .epochs
@@ -52,9 +52,22 @@ impl LogStorage {
     }
 
     /// Returns the LTX bytes of the full copy that now ends the history at `object`, if any.
-    pub async fn checkpoint(&self, object: &str, bytes: Payload) -> Result<Option<u64>> {
+    pub async fn checkpoint(
+        &self,
+        head: &SnapshotRef,
+        bytes: Option<Payload>,
+    ) -> Result<Option<u64>> {
         let started = std::time::Instant::now();
-        let snapshot = VerifiedSnapshot::named(object.into(), bytes)?;
+        let object = head.object.as_str();
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => self
+                .snapshots
+                .get(object)
+                .await?
+                .context("sealed checkpoint head missing")?,
+        };
+        let snapshot = VerifiedSnapshot::matching(head.clone(), bytes)?;
         let state_version = snapshot.reference.state_version;
         if snapshot.snapshot.sqlite.parent.is_none() {
             tracing::info!(
@@ -251,11 +264,21 @@ pub(super) struct Progress {
 }
 
 impl Progress {
-    pub fn restored(&mut self, restored: &ResolvedSqlite, version: u64) {
-        self.completed = self.completed.max(restored.checkpoint_version);
-        self.base_bytes = restored.base_bytes;
-        if version > self.completed {
-            self.logged.push_back((version, restored.log_bytes));
+    pub fn resume(progress: CheckpointProgress, version: u64) -> Self {
+        let mut state = Self {
+            completed: progress.version,
+            base_bytes: progress.base_bytes,
+            ..Self::default()
+        };
+        if version > state.completed {
+            state.logged(version, progress.log_bytes);
+        }
+        state
+    }
+
+    pub fn restored(&mut self, progress: CheckpointProgress, version: u64) {
+        if self.task.is_none() {
+            *self = Self::resume(progress, version);
         }
     }
 
@@ -266,31 +289,23 @@ impl Progress {
     pub async fn schedule(
         &mut self,
         storage: Arc<LogStorage>,
-        latest: Option<&(String, Payload)>,
-        version: u64,
+        latest: Option<&(SnapshotRef, Option<Payload>)>,
     ) {
         self.collect().await;
+        let Some((head, bytes)) = latest else { return };
         if self.task.is_some()
-            || !self.due(version)
+            || !self.due(head.state_version)
             || self
                 .retry_at
                 .is_some_and(|retry| tokio::time::Instant::now() < retry)
         {
             return;
         }
-        if let Some((object, bytes)) = latest {
-            self.start(
-                storage,
-                object.clone(),
-                bytes.clone(),
-                version,
-                "background",
-            );
-        }
+        self.start(storage, head.clone(), bytes.clone());
     }
 
     fn due(&self, version: u64) -> bool {
-        let logged: u64 = self.logged.iter().map(|(_, bytes)| bytes).sum();
+        let logged = self.log_bytes();
         let max_ltx_files_reached = version.saturating_sub(self.completed) >= MAX_LOG_VERSIONS;
         let max_log_bytes_reached = version > self.completed
             && logged >= self.base_bytes.clamp(MIN_LOG_BYTES, MAX_LOG_BYTES);
@@ -316,58 +331,34 @@ impl Progress {
         }
     }
 
-    pub async fn finish(
-        &mut self,
-        storage: Arc<LogStorage>,
-        object: &str,
-        bytes: Payload,
-        version: u64,
-        deadline: tokio::time::Instant,
-    ) {
-        self.collect().await;
-        if self.completed >= version {
-            return;
-        }
-        if self
-            .task
-            .as_ref()
-            .is_some_and(|(running, _)| *running != version)
-        {
-            let (superseded, task) = self.task.take().unwrap();
-            tracing::info!(
-                event = "sqlite_checkpoint_cancelled",
-                state_version = superseded,
-                reason = "superseded_on_shutdown"
-            );
-            task.abort();
-            let _ = task.await;
-        }
-        if self.task.is_none() {
-            self.start(storage, object.into(), bytes, version, "shutdown");
-        }
-        let (version, task) = self.task.take().unwrap();
-        match tokio::time::timeout_at(deadline, task).await {
-            Ok(Ok(Ok(base_bytes))) => self.completed(version, base_bytes),
-            result => {
-                tracing::warn!(event = "sqlite_checkpoint_deferred", object, state_version = version,
-                error = ?result, "checkpoint incomplete; archived history remains recoverable")
+    pub async fn finish(&mut self, deadline: tokio::time::Instant) -> CheckpointProgress {
+        if let Some((version, task)) = self.task.take() {
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(Ok(base_bytes))) => self.completed(version, base_bytes),
+                result => {
+                    tracing::warn!(event = "sqlite_checkpoint_deferred", state_version = version,
+                    error = ?result, "checkpoint incomplete; archived history remains recoverable")
+                }
             }
+        }
+        CheckpointProgress {
+            version: self.completed,
+            base_bytes: self.base_bytes,
+            log_bytes: self.log_bytes(),
         }
     }
 
-    fn start(
-        &mut self,
-        storage: Arc<LogStorage>,
-        object: String,
-        bytes: Payload,
-        version: u64,
-        trigger: &'static str,
-    ) {
+    fn log_bytes(&self) -> u64 {
+        self.logged.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    fn start(&mut self, storage: Arc<LogStorage>, head: SnapshotRef, bytes: Option<Payload>) {
+        let version = head.state_version;
         tracing::info!(
             event = "sqlite_checkpoint_started",
-            object,
+            object = %head.object,
             state_version = version,
-            trigger
+            trigger = "background"
         );
         self.task = Some((
             version,
@@ -375,13 +366,13 @@ impl Progress {
                 let started = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     Duration::from_secs(120),
-                    storage.checkpoint(&object, bytes),
+                    storage.checkpoint(&head, bytes),
                 )
                 .await
                 .context("checkpoint timed out")
                 .and_then(|result| result);
                 if let Err(error) = &result {
-                    tracing::warn!(event = "sqlite_checkpoint_failed", object, state_version = version,
+                    tracing::warn!(event = "sqlite_checkpoint_failed", object = %head.object, state_version = version,
                         error = %format!("{error:#}"), duration_ms = started.elapsed().as_secs_f64() * 1000.0);
                 }
                 result

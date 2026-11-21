@@ -344,11 +344,15 @@ impl crate::bucket::SnapshotStore for DelayedFinish {
     async fn put(&self, key: &str, bytes: crate::payload::Payload) -> Result<()> {
         self.snapshots.put(key, bytes).await
     }
-    async fn finish(&self, _: &crate::storage::StateStream, _: tokio::time::Instant) -> Result<()> {
+    async fn finish(
+        &self,
+        _: &crate::storage::StateStream,
+        _: tokio::time::Instant,
+    ) -> Result<Option<crate::bucket::recovery::CheckpointProgress>> {
         self.entered.notify_one();
         self.resume.notified().await;
         ensure!(!self.fail, "archive failure");
-        Ok(())
+        Ok(None)
     }
 }
 

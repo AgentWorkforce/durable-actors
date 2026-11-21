@@ -27,11 +27,16 @@ pub(crate) trait SnapshotHistory: Send {
 
 pub(crate) struct ResolvedSqlite {
     pub sqlite: SqliteSnapshot,
-    pub checkpoint_version: u64,
     pub checkpoint: bool,
     pub parents: usize,
-    /// LTX bytes of the full copy the history starts from, and of the deltas after it.
+    pub progress: CheckpointProgress,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct CheckpointProgress {
+    pub version: u64,
     pub base_bytes: u64,
+    /// Restores count LTX payloads. Live writes count the encoded records.
     pub log_bytes: u64,
 }
 
@@ -92,11 +97,13 @@ pub(crate) async fn resolve(
     let base_bytes = segments.last().map_or(0, size);
     let log_bytes = segments.iter().map(size).sum::<u64>() - base_bytes;
     Ok(ResolvedSqlite {
-        checkpoint_version: reference.state_version,
         checkpoint,
         parents,
-        base_bytes,
-        log_bytes,
+        progress: CheckpointProgress {
+            version: reference.state_version,
+            base_bytes,
+            log_bytes,
+        },
         sqlite: SqliteSnapshot {
             txid,
             parent: None,

@@ -167,7 +167,11 @@ pub(crate) trait SnapshotStore: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn latest(&self, prefix: &str) -> Result<Option<(String, Payload)>>;
     async fn put(&self, object: &str, bytes: Payload) -> Result<()>;
-    async fn start(&self, _stream: &crate::storage::StateStream) -> Result<()> {
+    async fn start(
+        &self,
+        _stream: &crate::storage::StateStream,
+        _resume: Option<(&crate::storage::SnapshotRef, recovery::CheckpointProgress)>,
+    ) -> Result<()> {
         Ok(())
     }
     async fn recover(&self, prefix: &str) -> Result<Option<(String, Payload)>> {
@@ -181,8 +185,8 @@ pub(crate) trait SnapshotStore: Send + Sync {
         &self,
         _stream: &crate::storage::StateStream,
         _deadline: tokio::time::Instant,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<Option<recovery::CheckpointProgress>> {
+        Ok(None)
     }
 }
 
