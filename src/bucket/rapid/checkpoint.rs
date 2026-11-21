@@ -8,9 +8,6 @@ const CHECKPOINT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 // Below this a checkpoint saves less than its own upload costs.
 const MIN_LOG_BYTES: u64 = 1024 * 1024; // 1 MB
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024; // 32 MB
-// Bounds the history a restore replays when commits are tiny. Tests write tiny commits, so they
-// exercise this bound.
-const MAX_LOG_VERSIONS: u64 = if cfg!(test) { 32 } else { 256 };
 
 impl LogStorage {
     pub async fn restore(
@@ -255,12 +252,12 @@ impl SnapshotHistory for LogHistory<'_> {
     }
 }
 
-/// Writes a checkpoint once the deltas since the last one outweigh the full copy it would write.
+/// Schedules full checkpoints from the bytes logged since the last completed checkpoint.
 #[derive(Default)]
 pub(super) struct Progress {
     completed: u64,
     base_bytes: u64,
-    /// LTX bytes of each version logged after `completed`.
+    log_bytes: u64,
     logged: std::collections::VecDeque<(u64, u64)>,
     task: Option<(u64, AbortOnDropHandle<Result<Option<u64>>>)>,
     retry_at: Option<tokio::time::Instant>,
@@ -286,6 +283,7 @@ impl Progress {
     }
 
     pub fn logged(&mut self, version: u64, bytes: u64) {
+        self.log_bytes += bytes;
         self.logged.push_back((version, bytes));
     }
 
@@ -308,13 +306,8 @@ impl Progress {
     }
 
     fn due(&self, version: u64) -> bool {
-        let logged = self.log_bytes();
-        let max_ltx_files_reached = version.saturating_sub(self.completed) >= MAX_LOG_VERSIONS;
-        let max_log_bytes_reached = version > self.completed
-            && logged >= self.base_bytes.clamp(MIN_LOG_BYTES, MAX_LOG_BYTES);
-
-        // Trigger compaction if we have max # of ltx files, or total bytes exceeds MAX_LOG_BYTES.
-        max_ltx_files_reached || max_log_bytes_reached
+        version > self.completed
+            && self.log_bytes >= self.base_bytes.clamp(MIN_LOG_BYTES, MAX_LOG_BYTES)
     }
 
     fn completed(&mut self, version: u64, base_bytes: Option<u64>) {
@@ -332,6 +325,7 @@ impl Progress {
         {
             self.logged.pop_front();
         }
+        self.log_bytes = self.logged.iter().map(|(_, bytes)| bytes).sum();
     }
 
     pub async fn finish(&mut self, deadline: tokio::time::Instant) -> CheckpointProgress {
@@ -347,12 +341,8 @@ impl Progress {
         CheckpointProgress {
             version: self.completed,
             base_bytes: self.base_bytes,
-            log_bytes: self.log_bytes(),
+            log_bytes: self.log_bytes,
         }
-    }
-
-    fn log_bytes(&self) -> u64 {
-        self.logged.iter().map(|(_, bytes)| bytes).sum()
     }
 
     fn start(&mut self, storage: Arc<LogStorage>, head: SnapshotRef, bytes: Option<Payload>) {

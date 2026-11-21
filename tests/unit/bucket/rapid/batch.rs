@@ -137,7 +137,7 @@ async fn batches(f: &Fixture, count: usize) -> Result<Vec<String>> {
 async fn live_checkpoint_inputs_are_read_as_one_bounded_range() -> Result<()> {
     let f = Fixture::new()?;
     let (writer, _) = controlled(&f, 16 * 1024 * 1024, 60_000)?;
-    let (replication, history) = write_history(&f, &writer, 31).await?;
+    let (replication, history) = write_history(&f, &writer, 31, None).await?;
     let sqlite = writer
         .restore_prefetched(
             VerifiedSnapshot::named(f.stream.object(31), history[30].clone())?,
@@ -169,7 +169,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
     let f = Fixture::new()?;
     let (writer, gate) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
     gate.stalled_checkpoint.store(true, Ordering::SeqCst);
-    let (replication, history) = write_history(&f, &writer, 35).await?;
+    let (replication, history) = write_history(&f, &writer, 35, Some(32)).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let (progress, released) = tokio::join!(
         writer.finish(&f.stream, deadline),
@@ -286,7 +286,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
         )
         .await?;
     assert_eq!(tail.files.len(), 3);
-    assert_eq!(archive.read_batches.load(Ordering::SeqCst), 1);
+    assert_eq!(archive.read_batches.load(Ordering::SeqCst), 2);
     assert_eq!(
         archive.range_bytes.load(Ordering::SeqCst),
         (history[31].len() + history[32].len() + 2 * frame::HEADER) as u64
@@ -306,17 +306,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
         restored_fields(replication.as_ref(), &older.files, older.txid).await?,
         serde_json::json!({"count":31})
     );
-    let batch_count = f
-        .archive
-        .list("")
-        .await?
-        .iter()
-        .filter(|key| key.ends_with(".batch"))
-        .count();
-    assert_eq!(
-        archive.read_batches.load(Ordering::SeqCst),
-        batch_count as u64
-    );
+    assert_eq!(archive.read_batches.load(Ordering::SeqCst), 1);
     assert_eq!(
         reader.get(&f.stream.object(35)).await?,
         Some(history[34].clone())
@@ -354,7 +344,7 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
 async fn full_checkpoint_upload_allows_slow_transfers_and_bounds_stalls() -> Result<()> {
     let f = Fixture::new()?;
     let (writer, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
-    let (_, history) = write_history(&f, &writer, 2).await?;
+    let (_, history) = write_history(&f, &writer, 2, None).await?;
     let head = f.stream.snapshot(&history[1])?;
     writer
         .finish(
@@ -399,7 +389,7 @@ async fn failed_checkpoint_publication_keeps_committed_state_recoverable() -> Re
         let (writer, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
         archive.fail_checkpoint.store(!stalled, Ordering::SeqCst);
         archive.stalled_checkpoint.store(stalled, Ordering::SeqCst);
-        let (replication, history) = write_history(&f, &writer, 32).await?;
+        let (replication, history) = write_history(&f, &writer, 32, Some(32)).await?;
         let progress = writer
             .finish(
                 &f.stream,
@@ -439,9 +429,9 @@ async fn failed_checkpoint_publication_keeps_committed_state_recoverable() -> Re
 }
 
 #[tokio::test]
-async fn parked_wakes_retain_both_background_checkpoint_thresholds() -> Result<()> {
+async fn parked_wakes_checkpoint_only_when_accumulated_bytes_reach_the_threshold() -> Result<()> {
     let source = Fixture::new()?;
-    let (_, history) = write_history(&source, &source.store()?, 35).await?;
+    let (_, history) = write_history(&source, &source.store()?, 259, None).await?;
     let f = Fixture::new()?;
     let actor = crate::storage_paths::actor_from_snapshot(&f.stream.object(1))?;
     let mut progress = None;
@@ -453,8 +443,8 @@ async fn parked_wakes_retain_both_background_checkpoint_thresholds() -> Result<(
         let version = snapshot.state_version;
         snapshot.owner_epoch = version;
         snapshot.sqlite.parent = parent;
-        if version >= 34 {
-            // Two individually sub-threshold records cross the 1 MiB byte floor on the last wake.
+        if matches!(version, 257 | 258) {
+            // Two individually sub-threshold records cross the 1 MiB byte floor on the second wake.
             snapshot.completion.as_mut().unwrap().result =
                 serde_json::json!("x".repeat(600 * 1024)).into();
         }
@@ -480,14 +470,14 @@ async fn parked_wakes_retain_both_background_checkpoint_thresholds() -> Result<(
                 tokio::time::Instant::now() + Duration::from_secs(5),
             )
             .await?;
-        if matches!(version, 32 | 35) {
+        if version == 258 {
             completed = version;
             log_bytes = 0;
         }
         let saved = progress.unwrap();
         assert_eq!(saved.version, completed);
         assert_eq!(saved.log_bytes, log_bytes);
-        assert_eq!(saved.base_bytes > 0, version >= 32);
+        assert_eq!(saved.base_bytes > 0, version >= 258);
     }
     Ok(())
 }
@@ -506,7 +496,7 @@ async fn assert_resumed_checkpoint_retry(parked: bool) -> Result<()> {
     let f = Fixture::new()?;
     let (writer, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
     archive.fail_checkpoint.store(true, Ordering::SeqCst);
-    let (_replication, history) = write_history(&f, &writer, 33).await?;
+    let (_replication, history) = write_history(&f, &writer, 33, Some(32)).await?;
     let progress = writer
         .finish(
             &f.stream,
@@ -565,6 +555,7 @@ async fn write_history(
     f: &Fixture,
     writer: &RapidSnapshots,
     count: u64,
+    large_write_at: Option<u64>,
 ) -> Result<(Arc<crate::litestream::Litestream>, Vec<Payload>)> {
     use crate::litestream::{
         Litestream, Replicator,
@@ -581,6 +572,9 @@ async fn write_history(
     let mut parent = None;
     let mut history = Vec::new();
     for version in 1..=count {
+        if Some(version) == large_write_at {
+            db.execute_batch("CREATE TABLE large_write AS SELECT randomblob(1048576) AS data")?;
+        }
         db.execute("INSERT INTO entries VALUES (?)", [version as i64])?;
         db.execute("UPDATE __terse_fields SET value=?", [version.to_string()])?;
         let txid = replication.sync(&capture.path()).await?;
