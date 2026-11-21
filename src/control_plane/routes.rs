@@ -17,7 +17,7 @@ const LIVENESS: Duration = Duration::from_secs(3 * HEARTBEAT_INTERVAL.as_secs())
 // Outlives any lease the host renewed while draining, so discovery never trusts that lease.
 const SHUTDOWN_RETENTION: Duration = Duration::from_millis(2 * MAX_HOST_LEASE_DURATION_MS);
 // Only bounds the store: the ownership CAS rejects a sealed record that changed since.
-const SEALED_OWNER_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const SEALED_OWNER_RETENTION: Duration = Duration::from_secs(72 * 60 * 60);
 
 #[async_trait]
 pub(super) trait RouteStore: Send + Sync {

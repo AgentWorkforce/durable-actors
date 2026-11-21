@@ -2,7 +2,12 @@ use super::*;
 
 #[tokio::test]
 async fn memory_routes_follow_host_lifecycle() {
-    routes_follow_host_lifecycle(&MemoryRoutes::default()).await;
+    let routes = MemoryRoutes::default();
+    assert_eq!(
+        routes.sealed.policy().time_to_live(),
+        Some(Duration::from_secs(72 * 60 * 60))
+    );
+    routes_follow_host_lifecycle(&routes).await;
 }
 
 #[tokio::test]
