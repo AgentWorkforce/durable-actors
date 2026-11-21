@@ -1,5 +1,10 @@
 use anyhow::Result;
-use axum::{Router, body::Body, http::Request, routing::get};
+use axum::{
+    Router,
+    body::Body,
+    http::Request,
+    routing::{get, post},
+};
 use tower::ServiceExt;
 
 use super::logged;
@@ -69,5 +74,21 @@ async fn logs_api_requests_but_not_health_probes() -> Result<()> {
     assert_eq!(failed["fault"], "server");
     assert_eq!(failed["error_code"], "unavailable");
     assert_eq!(failed["error.message"], "registry is down");
+    Ok(())
+}
+
+#[tokio::test]
+async fn logs_the_request_body_bytes_the_handler_read() -> Result<()> {
+    let logs = LogCapture::start();
+    let router = logged(Router::new().route(
+        "/v1/projects/{project_id}/actors/{actor_name}/{actor_id}/invoke",
+        post(|body: String| async move { body.len().to_string() }),
+    ));
+    let request = Request::post("/v1/projects/project-a/actors/Counter/one/invoke")
+        .body(Body::from(r#"{"method":"increment","args":[]}"#))?;
+    router.oneshot(request).await?;
+    let lines = logs.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["network.bytes_read"], 32);
     Ok(())
 }

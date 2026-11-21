@@ -1,12 +1,20 @@
-use std::time::Instant;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use axum::{
     Router,
+    body::Body,
     extract::{FromRequestParts, MatchedPath, RawPathParams, Request},
     http::{HeaderMap, Method, header, request::Parts},
     middleware::{self, Next},
     response::Response,
 };
+use http_body_util::BodyExt;
 
 use super::{
     mcp::ORGANIZATION_HEADER,
@@ -23,9 +31,22 @@ async fn log_request(request: Request, next: Next) -> Response {
     }
     let (mut parts, body) = request.into_parts();
     let log = HttpRequest::start(&mut parts).await;
+    let (body, bytes_read) = counted(body);
     let response = next.run(Request::from_parts(parts, body)).await;
-    log.finish(&response);
+    log.finish(&response, bytes_read.load(Ordering::Relaxed));
     response
+}
+
+fn counted(body: Body) -> (Body, Arc<AtomicU64>) {
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let counter = bytes_read.clone();
+    let body = body.map_frame(move |frame| {
+        if let Some(data) = frame.data_ref() {
+            counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        frame
+    });
+    (Body::new(body), bytes_read)
 }
 
 struct HttpRequest {
@@ -66,7 +87,7 @@ impl HttpRequest {
         }
     }
 
-    fn finish(self, response: &Response) {
+    fn finish(self, response: &Response, bytes_read: u64) {
         let elapsed = self.started.elapsed();
         let status = response.status();
         let failure = response.extensions().get::<Failure>();
@@ -83,6 +104,7 @@ impl HttpRequest {
             http.url_details.path = self.path,
             http.status_code = status.as_u16(),
             http.useragent = self.user_agent,
+            network.bytes_read = bytes_read,
             duration = nanos(elapsed),
             duration_ms = millis(elapsed),
             outcome = fault.outcome(),

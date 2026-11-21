@@ -1094,6 +1094,7 @@ dependencies = [
  "hickory-resolver",
  "http",
  "http-body",
+ "http-body-util",
  "jsonwebtoken 10.4.0",
  "k8s-openapi",
  "kube",
