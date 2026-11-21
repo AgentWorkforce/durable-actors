@@ -475,7 +475,7 @@ async fn local_routes(
         .nest("/node-cache", node_cache);
     let public = public
         .clone()
-        .merge(super::mcp::local_router(public, admin));
+        .merge(super::mcp::local_router(public, admin, platform_events));
     let telemetry = super::local_telemetry::LocalTelemetrySink::new(
         ActorJwtVerifier::for_scope(
             telemetry_keys,

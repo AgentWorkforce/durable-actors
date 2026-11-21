@@ -6,7 +6,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use super::*;
 use crate::{
     actor::ActorKey,
-    platform_events::sandboxes::{KillReason, SandboxKill},
+    platform_events::{
+        NoPlatformEvents,
+        feedback::Feedback,
+        sandboxes::{KillReason, SandboxKill},
+    },
 };
 
 #[tokio::test]
@@ -37,6 +41,35 @@ async fn a_recorded_kill_is_published_as_observers_see_it_under_a_stable_id() ->
     assert_eq!(repeated, first);
     assert_ne!(another["eventId"], first["eventId"]);
     assert_eq!(recorded.0.lock().unwrap().len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn feedback_is_published_with_its_organization() -> Result<()> {
+    let (sender, mut published) = mpsc::unbounded_channel();
+    let events = PublishedEvents::new(Arc::new(NoPlatformEvents), Arc::new(Sent(sender)));
+
+    events.record(Feedback {
+        organization_id: "org".into(),
+        project_id: "project".into(),
+        message: "Deploys are slow".into(),
+        at_ms: 1_700_000_000_000,
+    });
+
+    let event = published.recv().await.context("published event")?;
+    assert_eq!(
+        event,
+        json!({
+            "eventId": event["eventId"],
+            "projectId": "project",
+            "type": "feedback",
+            "item": {
+                "organizationId": "org",
+                "atMs": 1_700_000_000_000_u64,
+                "message": "Deploys are slow",
+            },
+        })
+    );
     Ok(())
 }
 

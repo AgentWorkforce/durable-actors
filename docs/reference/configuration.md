@@ -126,7 +126,7 @@ Use the [self-hosting guide](../self-hosting.md) and [Helm chart](../../charts/d
 | `DURABLE_ACTORS_CLICKHOUSE_USER` | ClickHouse application user. |
 | `DURABLE_ACTORS_CLICKHOUSE_PASSWORD` | ClickHouse application password. Supply through a secret. |
 | `DURABLE_ACTORS_USAGE_TOPIC` | Optional Pub/Sub topic, `projects/<gcp-project>/topics/<topic>`, for actor activation usage. Unset disables publishing. The control plane uses Application Default Credentials with publisher access to this topic. |
-| `DURABLE_ACTORS_EVENTS_TOPIC` | Optional Pub/Sub topic, `projects/<gcp-project>/topics/<topic>`, for [platform events](#published-events) such as sandbox kills. Unset disables publishing. The pool manager uses Application Default Credentials with publisher access to this topic. |
+| `DURABLE_ACTORS_EVENTS_TOPIC` | Optional Pub/Sub topic, `projects/<gcp-project>/topics/<topic>`, for [platform events](#published-events): sandbox kills and MCP feedback. Unset disables publishing. The pool manager and control plane use Application Default Credentials with publisher access to this topic. |
 | `DURABLE_ACTORS_POSTGRES_MAX_CONNECTIONS` | PostgreSQL pool size per process, default `8`, range 1–1,000. The chart sets it from `postgres.maxConnections`. Invocation routing and alarm polling share the pool. Budget the database's connection limit for this pool size times the controller replica count, plus other database clients. |
 | `DURABLE_ACTORS_REDIS_URL` | Redis that carries socket messages between processes; required with more than one. `redis://host:6379`, or `rediss://:password@host:6378` for TLS. If the connection drops, the process closes its sockets with `1012` and browsers reconnect. Unset, a single process keeps everything in memory. The chart reads it from the key named by `redis.urlSecretKey`. |
 | `DURABLE_ACTORS_REDIS_CA_CERT` | PEM CA for a `rediss://` server with a private CA, such as Memorystore. The chart reads it from the key named by `redis.caSecretKey`. |
@@ -216,9 +216,14 @@ Setting `DURABLE_ACTORS_EVENTS_TOPIC` publishes platform events to Pub/Sub for s
 }
 ```
 
-`eventId` is the SHA-256 of the recorded event, the same each time one event is reported; the Pub/Sub attributes `projectId`, `eventId` and `type` repeat the message's. Only `kill` is published today, with a `reason` of `out_of_memory`, `out_of_disk`, `evicted` or `killed`. Subscribers must ignore the types and fields they do not know.
+`eventId` is the SHA-256 of the recorded event, the same each time one event is reported; the Pub/Sub attributes `projectId`, `eventId` and `type` repeat the message's. Two types are published:
 
-The pool manager reports kills, and only for Kubernetes sandboxes. When it restarts it publishes the kills it still sees again under their original `eventId`, so subscribers must skip the IDs they have handled. Publishing is best effort: a failed publication, a pool manager that exits, or a kill whose actor takes over two seconds to read can lose an event.
+- `kill`, with a `reason` of `out_of_memory`, `out_of_disk`, `evicted` or `killed`.
+- `feedback`, what a developer sends with the MCP `send_feedback` tool: `{ "organizationId": "org-1", "atMs": 1700000000000, "message": "Deploys are slow" }`.
+
+Subscribers must ignore the types and fields they do not know.
+
+The pool manager reports kills, and only for Kubernetes sandboxes. When it restarts it publishes the kills it still sees again under their original `eventId`, so subscribers must skip the IDs they have handled. The control plane that serves the MCP request publishes its feedback. Publishing is best effort: a failed publication, a process that exits, or a kill whose actor takes over two seconds to read can lose an event.
 
 ## Modal data plane
 

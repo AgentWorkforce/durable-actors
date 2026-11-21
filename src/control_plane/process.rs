@@ -266,6 +266,12 @@ async fn control_plane_routes(
     if let Some(events) = &platform_events {
         lifecycle = lifecycle.with_events(events.clone());
     }
+    let feedback: Arc<dyn PlatformEvents<crate::platform_events::feedback::Feedback>> =
+        match &platform_events {
+            Some(events) => events.clone(),
+            None => Arc::new(NoPlatformEvents),
+        };
+    let feedback = super::event_topic::published(feedback, config.events_topic.as_deref()).await?;
     let socket_gateway = super::socket_gateway::SocketGateway::start(
         socket_bus,
         config.gateway_accept_connections,
@@ -334,7 +340,7 @@ async fn control_plane_routes(
     let public_api = super::request_log::logged(
         public_api
             .clone()
-            .merge(super::mcp::router(public_api, admin)),
+            .merge(super::mcp::router(public_api, admin, feedback)),
     );
     let internal_api = service.into_internal_service();
     Ok(tonic::service::Routes::from(public_api).add_service(internal_api))

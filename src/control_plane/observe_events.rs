@@ -23,7 +23,7 @@ use crate::{
     host_leases::WaitingOperation,
     placement::ActorResidency,
     platform_events::{
-        deployments, lifecycle,
+        deployments, feedback, lifecycle,
         sandboxes::{self, KillReason},
         sockets,
     },
@@ -89,6 +89,7 @@ pub(super) enum ObserveEvent {
     Deployment(Deployment),
     Kill(ActorKill),
     Usage(ActorUsage),
+    Feedback(SubmittedFeedback),
 }
 
 /// An instance as its latest lifecycle report leaves it.
@@ -176,6 +177,14 @@ pub(super) struct ActorUsage {
     pub memory_bytes: Option<u64>,
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SubmittedFeedback {
+    pub organization_id: String,
+    pub at_ms: u64,
+    pub message: String,
+}
+
 impl ObserveEvent {
     pub(super) fn name(&self) -> &'static str {
         match self {
@@ -188,6 +197,7 @@ impl ObserveEvent {
             Self::Deployment(_) => "deployment",
             Self::Kill(_) => "kill",
             Self::Usage(_) => "usage",
+            Self::Feedback(_) => "feedback",
         }
     }
 }
@@ -329,6 +339,7 @@ pub(super) fn platform_event(log: &PlatformLog) -> Option<ObserveEvent> {
         }
         sandboxes::KILLED => kill(log),
         sandboxes::USAGE => usage(log),
+        feedback::SUBMITTED => submitted_feedback(log),
         _ => None,
     }
 }
@@ -408,6 +419,14 @@ fn usage(log: &PlatformLog) -> Option<ObserveEvent> {
         at_ms: log.at_ms,
         cpu_cores: sample.cpu_cores,
         memory_bytes: sample.memory_bytes,
+    }))
+}
+
+fn submitted_feedback(log: &PlatformLog) -> Option<ObserveEvent> {
+    Some(ObserveEvent::Feedback(SubmittedFeedback {
+        organization_id: log.string(otlp::ORGANIZATION_ID)?,
+        at_ms: log.at_ms,
+        message: log.body.clone()?,
     }))
 }
 

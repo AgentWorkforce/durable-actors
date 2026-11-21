@@ -76,5 +76,6 @@ For a control plane serving multiple organizations, an authenticated proxy sends
 | `get_actor_resources` | An instance's CPU, memory, and SQLite database size over time |
 | `list_websocket_sessions` | WebSocket sessions, each open, closed, or lost |
 | `invoke_actor` | Call an actor method. Runs real code and can change state. |
+| `send_feedback` | Send the user's feedback to the Terse team, published on the [events topic](configuration.md#published-events) |
 
 Pass a `projectId` from `list_projects` to the other tools. List tools return pages: pass `nextCursor` back as `cursor` for the next one.
