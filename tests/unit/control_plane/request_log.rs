@@ -35,6 +35,12 @@ async fn logs_api_requests_but_not_health_probes() -> Result<()> {
     assert_eq!(lines.len(), 2, "{lines:?}");
 
     let completed = &lines[0];
+    assert!(
+        completed["message"].as_str().is_some_and(|message| message
+            .starts_with("GET /v1/projects/project-a/actors/Counter/one/state 200 ")
+            && message.ends_with("ms")),
+        "{completed}"
+    );
     assert_eq!(completed["event"], "http_request");
     assert_eq!(completed["level"], "INFO");
     assert_eq!(completed["http.method"], "GET");

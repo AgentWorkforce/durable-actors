@@ -94,7 +94,11 @@ impl HttpRequest {
             project_id = self.project_id,
             actor_name = self.actor_name,
             actor_id = self.actor_id,
-            "http request completed"
+            "{} {} {} {:.1}ms",
+            self.method,
+            self.path,
+            status.as_u16(),
+            millis(elapsed)
         );
     }
 }
