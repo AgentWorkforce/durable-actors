@@ -351,6 +351,48 @@ async fn checkpoints_compact_sqlite_history_for_cold_recovery() -> Result<()> {
 }
 
 #[tokio::test]
+async fn full_checkpoint_upload_allows_slow_transfers_and_bounds_stalls() -> Result<()> {
+    let f = Fixture::new()?;
+    let (writer, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
+    let (_, history) = write_history(&f, &writer, 2).await?;
+    let head = f.stream.snapshot(&history[1])?;
+    writer
+        .finish(
+            &f.stream,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await?;
+
+    for (attempt, delay_secs) in [(1, 31), (2, 20)] {
+        archive.stalled_checkpoint.store(true, Ordering::SeqCst);
+        let upload = writer.storage.checkpoint(&head, Some(history[1].clone()));
+        tokio::pin!(upload);
+        tokio::select! {
+            result = &mut upload => panic!("checkpoint finished before upload started: {result:?}"),
+            _ = async {
+                while archive.checkpoint_attempts.load(Ordering::SeqCst) < attempt {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(delay_secs)).await;
+        let result = futures_util::poll!(&mut upload);
+        tokio::time::resume();
+        if delay_secs == 31 {
+            let std::task::Poll::Ready(result) = result else {
+                panic!("stalled upload exceeded its deadline");
+            };
+            assert!(result.unwrap_err().is::<tokio::time::error::Elapsed>());
+        } else {
+            assert!(result.is_pending(), "slow upload expired: {result:?}");
+            archive.stalled_checkpoint.store(false, Ordering::SeqCst);
+            assert!(upload.await?.is_some());
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
 async fn failed_checkpoint_publication_keeps_committed_state_recoverable() -> Result<()> {
     for stalled in [false, true] {
         let f = Fixture::new()?;

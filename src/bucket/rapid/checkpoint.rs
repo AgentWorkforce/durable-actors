@@ -3,6 +3,8 @@ use crate::bucket::recovery::{Checkpoint, ResolvedSqlite, SnapshotHistory, resol
 use crate::state_log::SqliteSnapshot;
 use crate::storage::VerifiedSnapshot;
 
+const CHECKPOINT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
 // Below this a checkpoint saves less than its own upload costs.
 const MIN_LOG_BYTES: u64 = 1024 * 1024; // 1 MB
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024; // 32 MB
@@ -122,8 +124,9 @@ impl LogStorage {
         let size = bytes.len();
         let checkpoint_bytes = sqlite_bytes(&checkpoint_files);
         let upload_started = std::time::Instant::now();
-        bounded(self.snapshots.put(&key, bytes))
+        tokio::time::timeout(CHECKPOINT_UPLOAD_TIMEOUT, self.snapshots.put(&key, bytes))
             .await
+            .context("upload SQLite checkpoint timed out")?
             .context("upload SQLite checkpoint")?;
         tracing::info!(
             event = "sqlite_checkpoint",
