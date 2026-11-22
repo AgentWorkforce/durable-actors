@@ -1,4 +1,3 @@
-import { access } from "node:fs/promises"
 import type { Socket } from "node:net"
 import { isAbsolute } from "node:path"
 import { z } from "zod"
@@ -10,9 +9,9 @@ async function runGenericHost(): Promise<never> {
     const settings = parseHostSettings(process.env)
     const socket = await connectSocket(settings.socketPath)
     const assignment = readAssignment(socket)
+    await prepareForAssignment()
     socket.write(`${JSON.stringify({ type: "warm", protocol: 34 })}\n`)
     const { entrypoint, environment } = await assignment
-    await access(entrypoint)
     Object.assign(process.env, environment)
     const session = new ActorSession({ ...settings, actorEntrypoint: entrypoint }, undefined, socket)
     await session.start()
@@ -47,6 +46,12 @@ function readAssignment(socket: Socket): Promise<z.infer<typeof assignmentSchema
         }
         socket.on("data", read).once("error", fail).once("close", closed)
     })
+}
+
+// zod compiles a schema's parser on its first use, and every actor bundle imports the SDK's entry module.
+async function prepareForAssignment(): Promise<void> {
+    assignmentSchema.parse({ type: "load", entrypoint: "/", environment: {} })
+    await import("durable-actors")
 }
 
 const assignmentSchema = z.object({

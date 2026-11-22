@@ -23,7 +23,7 @@ export async function buildHostRuntime(output) {
         platform: "node",
         format: "esm",
         target: "es2022",
-        external: ["bun:*"],
+        external: ["bun:*", "durable-actors"],
         keepNames: true,
         metafile: true,
         legalComments: "linked"
