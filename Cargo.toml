@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 axum = { version = "0.8", features = ["ws", "http2"] }
 bytes = "1"
+crc32c = "0.6"
 http-body = "1"
 http-body-util = "0.1"
 prost = "0.14"
@@ -83,7 +84,6 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-crc32c = "0.6"
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "logs", "testing"] }
 http = "1"
 tokio = { version = "1", features = ["test-util"] }

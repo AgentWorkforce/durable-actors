@@ -100,7 +100,7 @@ impl Segment {
             .context("log offset overflow")?;
         // An interrupted flush may have persisted bytes; this pair must never be reused.
         self.healthy = false;
-        let flushed = bounded(async {
+        let flushed = bounded_transfer(frame.len() as u64, async {
             Ok(futures_util::future::join_all(
                 self.writers.iter_mut().map(|writer| {
                     writer.append_and_flush(frame.header.clone(), frame.state.clone())

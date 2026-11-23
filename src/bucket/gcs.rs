@@ -5,10 +5,15 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, CredentialsProvider, EntityTag,
 };
-use google_cloud_storage::client::{Storage, StorageControl};
+use google_cloud_storage::{
+    client::{Storage, StorageControl},
+    model_ext::ReadRange,
+    read_object::ReadObjectResponse,
+};
 
 use super::{Bucket, BucketObject};
 
@@ -284,9 +289,7 @@ impl GcsBucket {
     async fn read(&self, key: &str, range: Option<(u64, u64)>) -> Result<Option<BucketObject>> {
         let mut request = self.clients.storage.read_object(&self.bucket, key);
         if let Some((start, length)) = range {
-            request = request.set_read_range(google_cloud_storage::model_ext::ReadRange::segment(
-                start, length,
-            ));
+            request = request.set_read_range(ReadRange::segment(start, length));
         }
         let mut response = match request.send().await {
             Ok(response) => response,
@@ -300,14 +303,138 @@ impl GcsBucket {
             }
             Err(error) => return Err(error.into()),
         };
-        let length = range.map_or(response.object().size as u64, |(_, length)| length);
+        let (start, length) = range.unwrap_or((0, response.object().size as u64));
         let _transfer = self.clients.transfer(length).await?;
         let generation = response.object().generation;
-        let mut download = crate::payload::Download::new();
-        while let Some(chunk) = response.next().await {
-            download = download.append(chunk?).await?;
-        }
-        let bytes = download.finish().await?;
+        let bytes = if length >= PARALLEL_DOWNLOAD_BYTES {
+            // Ranged reads skip the client's whole-object CRC32C check, so it runs on the result.
+            let crc32c = range
+                .is_none()
+                .then(|| response.object().checksums.and_then(|c| c.crc32c))
+                .flatten();
+            self.download_parts(key, generation, (start, length), crc32c, response)
+                .await?
+        } else {
+            let mut download = crate::payload::Download::new();
+            while let Some(chunk) = response.next().await {
+                download = download.append(chunk?).await?;
+            }
+            download.finish().await?
+        };
         Ok(Some(BucketObject { generation, bytes }))
     }
+
+    /// Streams the first part from the response already open and the rest as concurrent ranges
+    /// of the same generation, each written at its offset in one temporary file.
+    async fn download_parts(
+        &self,
+        key: &str,
+        generation: i64,
+        (start, length): (u64, u64),
+        crc32c: Option<u32>,
+        first: ReadObjectResponse,
+    ) -> Result<crate::payload::Payload> {
+        let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+            let file = tempfile::tempfile()?;
+            file.set_len(length)?;
+            Ok(file)
+        })
+        .await??;
+        let file = Arc::new(file);
+        let parts = download_parts(length);
+        let (offset, size) = parts[0];
+        let mut downloads = vec![write_part(file.clone(), offset, size, first).boxed()];
+        for &(offset, size) in &parts[1..] {
+            let file = file.clone();
+            downloads.push(
+                async move {
+                    let response = self
+                        .clients
+                        .storage
+                        .read_object(&self.bucket, key)
+                        .set_generation(generation)
+                        .set_read_range(ReadRange::segment(start + offset, size))
+                        .send()
+                        .await?;
+                    write_part(file, offset, size, response).await
+                }
+                .boxed(),
+            );
+        }
+        futures_util::future::try_join_all(downloads).await?;
+        if let Some(expected) = crc32c {
+            verify_crc32c(file.clone(), length, expected).await?;
+        }
+        Ok(crate::payload::Payload::from_file(
+            file,
+            usize::try_from(length)?,
+        ))
+    }
+}
+
+/// Objects at least this large download as parallel byte ranges; one stream from Standard GCS
+/// reaches about 100 MiB/s.
+const PARALLEL_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const DOWNLOAD_PARTS: u64 = 8;
+
+/// Contiguous `(offset, size)` ranges that cover `length` bytes.
+fn download_parts(length: u64) -> Vec<(u64, u64)> {
+    let size = length.div_ceil(DOWNLOAD_PARTS).max(1);
+    (0..length)
+        .step_by(size as usize)
+        .map(|offset| (offset, size.min(length - offset)))
+        .collect()
+}
+
+async fn write_part(
+    file: Arc<std::fs::File>,
+    offset: u64,
+    size: u64,
+    mut response: ReadObjectResponse,
+) -> Result<()> {
+    let mut written = 0u64;
+    let mut buffer = Vec::with_capacity(crate::payload::IO_BUFFER_BYTES);
+    while written + (buffer.len() as u64) < size {
+        let Some(chunk) = response.next().await else {
+            break;
+        };
+        let chunk = chunk?;
+        let wanted = (size - written - buffer.len() as u64).min(chunk.len() as u64) as usize;
+        buffer.extend_from_slice(&chunk[..wanted]);
+        if buffer.len() >= crate::payload::IO_BUFFER_BYTES {
+            written += flush_part(&file, offset + written, &mut buffer).await?;
+        }
+    }
+    written += flush_part(&file, offset + written, &mut buffer).await?;
+    anyhow::ensure!(written == size, "incomplete object part");
+    Ok(())
+}
+
+async fn verify_crc32c(file: Arc<std::fs::File>, length: u64, expected: u32) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        let mut buffer = vec![0; crate::payload::IO_BUFFER_BYTES];
+        let (mut crc, mut offset) = (0u32, 0u64);
+        while offset < length {
+            let size = (length - offset).min(buffer.len() as u64) as usize;
+            let chunk = &mut buffer[..size];
+            file.read_exact_at(chunk, offset)?;
+            crc = crc32c::crc32c_append(crc, chunk);
+            offset += chunk.len() as u64;
+        }
+        anyhow::ensure!(crc == expected, "parallel download failed its CRC32C check");
+        Ok(())
+    })
+    .await?
+}
+
+async fn flush_part(file: &Arc<std::fs::File>, at: u64, buffer: &mut Vec<u8>) -> Result<u64> {
+    let (file, bytes) = (file.clone(), std::mem::take(buffer));
+    let length = bytes.len() as u64;
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&bytes, at)
+    })
+    .await??;
+    Ok(length)
 }

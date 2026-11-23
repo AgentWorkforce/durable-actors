@@ -91,7 +91,11 @@ impl Archiver {
 
     pub async fn finish(self) -> Result<()> {
         self.close();
-        bounded(async { self.task.await.context("archive worker failed")? }).await
+        let pending = self.pending.lock().unwrap().end;
+        bounded_transfer(pending, async {
+            self.task.await.context("archive worker failed")?
+        })
+        .await
     }
 }
 
@@ -265,7 +269,11 @@ impl LogStorage {
         );
         let began = Instant::now();
         ensure!(
-            bounded(replace(self.archive.as_ref(), &key, None, bytes.clone())).await?,
+            bounded_transfer(
+                bytes.len() as u64,
+                replace(self.archive.as_ref(), &key, None, bytes.clone())
+            )
+            .await?,
             "conflicting archive batch"
         );
         self.index_batch(manifest, key, &bytes).await?;
@@ -286,7 +294,12 @@ impl LogStorage {
         length: u64,
     ) -> Result<Payload> {
         for replica in &manifest.replicas {
-            match bounded(self.zone(replica)?.read_range(replica, start, length)).await {
+            match bounded_transfer(
+                length,
+                self.zone(replica)?.read_range(replica, start, length),
+            )
+            .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(error) => tracing::warn!(%error, "Rapid archive source unavailable"),
             }

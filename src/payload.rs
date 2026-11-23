@@ -26,7 +26,6 @@ pub(crate) const BUFFER_BYTES: usize = 64 * 1024;
 /// Results larger than this are passed on as they arrive, rather than held whole.
 pub(crate) const ARRIVING_BYTES: usize = 1024 * 1024;
 pub(crate) const IO_BUFFER_BYTES: usize = 256 * 1024;
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Bytes kept in memory, or in a temporary file that is read through bounded buffers so its
 /// size never becomes resident memory. Clones and slices share the file.
@@ -44,6 +43,15 @@ pub struct FileRange {
 }
 
 impl Payload {
+    /// The first `len` bytes of a temporary file, read through bounded buffers.
+    pub(crate) fn from_file(file: Arc<File>, len: usize) -> Self {
+        Self::File(FileRange {
+            file,
+            start: 0,
+            len,
+        })
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Memory(bytes) => bytes.len(),
@@ -281,8 +289,7 @@ impl Write for Spool {
         let length = self
             .length
             .checked_add(bytes.len() as u64)
-            .filter(|length| *length <= MAX_FILE_BYTES)
-            .ok_or_else(|| io::Error::other("temporary storage object exceeds 2 GiB"))?;
+            .ok_or_else(|| io::Error::other("temporary storage object overflow"))?;
         if self.file.is_none() && length > BUFFER_BYTES as u64 {
             let mut file = tempfile::tempfile()?;
             file.write_all(&self.memory)?;

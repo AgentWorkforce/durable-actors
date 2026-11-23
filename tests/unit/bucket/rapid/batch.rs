@@ -9,6 +9,7 @@ struct ArchiveBucket {
     batches: AtomicU64,
     read_requests: AtomicU64,
     read_batches: AtomicU64,
+    version_reads: AtomicU64,
     range_bytes: AtomicU64,
     index_failure: AtomicU64,
     fail_checkpoint: AtomicBool,
@@ -40,6 +41,9 @@ impl Bucket for ArchiveBucket {
         self.read_requests.fetch_add(1, Ordering::SeqCst);
         if key.ends_with(".batch") {
             self.read_batches.fetch_add(1, Ordering::SeqCst);
+        }
+        if key.ends_with(".json") {
+            self.version_reads.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.get(key).await
     }
@@ -93,6 +97,7 @@ fn controlled(
         batches: AtomicU64::new(0),
         read_requests: AtomicU64::new(0),
         read_batches: AtomicU64::new(0),
+        version_reads: AtomicU64::new(0),
         range_bytes: AtomicU64::new(0),
         index_failure: AtomicU64::new(0),
         fail_checkpoint: AtomicBool::new(false),
@@ -429,7 +434,7 @@ async fn failed_checkpoint_publication_keeps_committed_state_recoverable() -> Re
 }
 
 #[tokio::test]
-async fn parked_wakes_checkpoint_only_when_accumulated_bytes_reach_the_threshold() -> Result<()> {
+async fn parked_wakes_checkpoint_at_the_version_cap_or_the_byte_threshold() -> Result<()> {
     let source = Fixture::new()?;
     let (_, history) = write_history(&source, &source.store()?, 259, None).await?;
     let f = Fixture::new()?;
@@ -470,14 +475,15 @@ async fn parked_wakes_checkpoint_only_when_accumulated_bytes_reach_the_threshold
                 tokio::time::Instant::now() + Duration::from_secs(5),
             )
             .await?;
-        if version == 258 {
+        // 256 tiny commits reach the version cap; then 257 and 258 together cross 1 MiB.
+        if matches!(version, 256 | 258) {
             completed = version;
             log_bytes = 0;
         }
         let saved = progress.unwrap();
         assert_eq!(saved.version, completed);
         assert_eq!(saved.log_bytes, log_bytes);
-        assert_eq!(saved.base_bytes > 0, version >= 258);
+        assert_eq!(saved.base_bytes > 0, version >= 256);
     }
     Ok(())
 }
@@ -1013,6 +1019,58 @@ async fn large_records_archive_after_retry_and_remain_indexed() -> Result<()> {
     );
     assert_eq!(reader.get(&f.stream.object(2)).await?, Some(state(2, 1)?));
     Ok(())
+}
+
+#[tokio::test]
+async fn restores_prefetch_archived_batches_without_reading_unlisted_versions() -> Result<()> {
+    let f = Fixture::new()?;
+    let (writer, _) = controlled(&f, 1, 10_000)?;
+    let (replication, history) = write_history(&f, &writer, 20, None).await?;
+    writer
+        .finish(
+            &f.stream,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await?;
+    f.cleaned().await?;
+    let head = history.last().unwrap().clone();
+    let snapshot = VerifiedSnapshot::matching(f.stream.snapshot(&head)?, head)?;
+
+    let (reader, archive) = controlled(&f, 1, 10_000)?;
+    let restored = reader.storage.restore(snapshot, None).await?;
+
+    assert_eq!(restored.parents, 19);
+    assert_eq!(archive.version_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(archive.read_batches.load(Ordering::SeqCst), 19);
+    assert_eq!(
+        crate::litestream::storage::restored_fields(
+            replication.as_ref(),
+            &restored.sqlite.files,
+            restored.sqlite.txid
+        )
+        .await?,
+        serde_json::json!({"count": 20})
+    );
+    Ok(())
+}
+
+#[test]
+fn checkpoints_allow_more_versions_as_the_database_grows() {
+    use super::super::checkpoint::max_log_versions;
+    assert_eq!(max_log_versions(0), 256);
+    assert_eq!(max_log_versions(128 << 20), 256);
+    assert_eq!(max_log_versions(1 << 30), 2048);
+    assert_eq!(max_log_versions(4 << 30), 4096);
+}
+
+#[test]
+fn bounded_transfers_get_time_in_proportion_to_their_size() {
+    let base = Duration::from_secs(10);
+    assert_eq!(super::super::transfer_timeout(base, 0), base);
+    assert_eq!(
+        super::super::transfer_timeout(base, 64 * 1024 * 1024),
+        Duration::from_secs(12)
+    );
 }
 
 #[tokio::test]

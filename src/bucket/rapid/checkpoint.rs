@@ -8,6 +8,17 @@ const CHECKPOINT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 // Below this a checkpoint saves less than its own upload costs.
 const MIN_LOG_BYTES: u64 = 1024 * 1024; // 1 MB
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024; // 32 MB
+// Each version costs a restore about 0.2 ms however small it is, so tiny commits also need a
+// bound. Larger databases restore slowly anyway and checkpoint expensively, so they allow more.
+const MIN_LOG_VERSIONS: u64 = 256;
+const MAX_LOG_VERSIONS: u64 = 4096;
+const BASE_BYTES_PER_LOG_VERSION: u64 = 512 * 1024;
+const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Versions logged after a checkpoint before the next is due: 256 up to 128 MiB, 4096 from 2 GiB.
+pub(super) fn max_log_versions(base_bytes: u64) -> u64 {
+    (base_bytes / BASE_BYTES_PER_LOG_VERSION).clamp(MIN_LOG_VERSIONS, MAX_LOG_VERSIONS)
+}
 
 impl LogStorage {
     pub async fn restore(
@@ -121,7 +132,8 @@ impl LogStorage {
         let size = bytes.len();
         let checkpoint_bytes = sqlite_bytes(&checkpoint_files);
         let upload_started = std::time::Instant::now();
-        tokio::time::timeout(CHECKPOINT_UPLOAD_TIMEOUT, self.snapshots.put(&key, bytes))
+        let timeout = super::transfer_timeout(CHECKPOINT_UPLOAD_TIMEOUT, size as u64);
+        tokio::time::timeout(timeout, self.snapshots.put(&key, bytes))
             .await
             .context("upload SQLite checkpoint timed out")?
             .context("upload SQLite checkpoint")?;
@@ -157,30 +169,61 @@ struct EpochHistory {
     indexes: Vec<String>,
     indexed: BTreeMap<String, Payload>,
     checkpoints: std::collections::BTreeSet<String>,
+    /// Versions stored as their own objects; any other version is only in the log.
+    heads: std::collections::BTreeSet<String>,
+}
+
+impl EpochHistory {
+    /// The newest checkpointed version at or below `version`, where the walk will stop.
+    fn floor(&self, version: u64) -> u64 {
+        self.checkpoints
+            .iter()
+            .filter_map(|key| key.strip_suffix(".checkpoint"))
+            .filter_map(super::super::snapshots::version)
+            .filter(|v| *v <= version)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl LogHistory<'_> {
+    /// Lists one owner epoch's history and prefetches the batches the walk from `version` needs.
+    async fn load_epoch(&mut self, prefix: &str, version: u64) -> Result<EpochHistory> {
+        let prefix_key = format!("{prefix}/");
+        let (keys, indexes) = tokio::try_join!(
+            self.storage.snapshots.list(&prefix_key),
+            self.storage.index_keys(&prefix_key)
+        )?;
+        let (checkpoints, heads) = keys
+            .into_iter()
+            .filter(|key| key.ends_with(".checkpoint") || key.ends_with(".json"))
+            .partition(|key| key.ends_with(".checkpoint"));
+        let mut epoch = EpochHistory {
+            records: None,
+            indexes,
+            indexed: BTreeMap::new(),
+            checkpoints,
+            heads,
+        };
+        let prefetched = self
+            .storage
+            .prefetch_indexed(prefix, epoch.floor(version), version, &epoch.indexes)
+            .await;
+        self.reads += prefetched.batches;
+        epoch.indexed = prefetched.records;
+        Ok(epoch)
+    }
 }
 
 #[async_trait]
 impl SnapshotHistory for LogHistory<'_> {
     async fn read(&mut self, object: &str) -> Result<Payload> {
         let (prefix, _) = object.rsplit_once('/').context("invalid snapshot name")?;
+        let version =
+            super::super::snapshots::version(object).context("invalid snapshot version")?;
         if !self.epochs.contains_key(prefix) {
-            let prefix_key = format!("{prefix}/");
-            let (keys, indexes) = tokio::try_join!(
-                self.storage.snapshots.list(&prefix_key),
-                self.storage.index_keys(&prefix_key)
-            )?;
-            self.epochs.insert(
-                prefix.into(),
-                EpochHistory {
-                    records: None,
-                    indexes,
-                    indexed: BTreeMap::new(),
-                    checkpoints: keys
-                        .into_iter()
-                        .filter(|key| key.ends_with(".checkpoint"))
-                        .collect(),
-                },
-            );
+            let epoch = self.load_epoch(prefix, version).await?;
+            self.epochs.insert(prefix.into(), epoch);
         }
         let epoch = self.epochs.get_mut(prefix).unwrap();
         if let Some(bytes) = epoch
@@ -193,34 +236,28 @@ impl SnapshotHistory for LogHistory<'_> {
         if let Some(bytes) = epoch.indexed.remove(object) {
             return Ok(bytes);
         }
-        let version =
-            super::super::snapshots::version(object).context("invalid snapshot version")?;
-        let first = epoch
-            .checkpoints
-            .iter()
-            .filter_map(|key| key.strip_suffix(".checkpoint"))
-            .filter_map(super::super::snapshots::version)
-            .filter(|v| *v <= version)
-            .max()
-            .unwrap_or(0);
+        let first = epoch.floor(version);
         if let Some(records) = self.storage.live_records(object, first).await? {
             self.reads += 1;
-            epoch.indexed = records;
+            epoch.indexed.extend(records);
             return epoch
                 .indexed
                 .remove(object)
                 .context("live SQLite dependency missing");
         }
-        self.reads += 1;
-        if let Some(bytes) = self.storage.snapshots.get(object).await? {
-            return Ok(bytes);
+        if epoch.heads.contains(object) {
+            self.reads += 1;
+            if let Some(bytes) = self.storage.snapshots.get(object).await? {
+                return Ok(bytes);
+            }
         }
         if let Some(records) = self
             .storage
             .indexed_records(object, first, &epoch.indexes)
             .await
         {
-            epoch.indexed = records;
+            self.reads += 1;
+            epoch.indexed.extend(records);
             return epoch
                 .indexed
                 .remove(object)
@@ -229,11 +266,17 @@ impl SnapshotHistory for LogHistory<'_> {
         if epoch.records.is_none() {
             epoch.records = Some(self.storage.records(&format!("{prefix}/"), false).await?);
         }
-        epoch
+        if let Some(bytes) = epoch
             .records
             .as_ref()
             .and_then(|records| records.get(object))
-            .cloned()
+        {
+            return Ok(bytes.clone());
+        }
+        self.storage
+            .snapshots
+            .get(object)
+            .await?
             .context("SQLite dependency missing")
     }
 
@@ -307,7 +350,8 @@ impl Progress {
 
     fn due(&self, version: u64) -> bool {
         version > self.completed
-            && self.log_bytes >= self.base_bytes.clamp(MIN_LOG_BYTES, MAX_LOG_BYTES)
+            && (self.log_bytes >= self.base_bytes.clamp(MIN_LOG_BYTES, MAX_LOG_BYTES)
+                || version - self.completed >= max_log_versions(self.base_bytes))
     }
 
     fn completed(&mut self, version: u64, base_bytes: Option<u64>) {
@@ -353,17 +397,15 @@ impl Progress {
             state_version = version,
             trigger = "background"
         );
+        let timeout = super::transfer_timeout(CHECKPOINT_TIMEOUT, self.base_bytes + self.log_bytes);
         self.task = Some((
             version,
             AbortOnDropHandle::new(tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                let result = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    storage.checkpoint(&head, bytes),
-                )
-                .await
-                .context("checkpoint timed out")
-                .and_then(|result| result);
+                let result = tokio::time::timeout(timeout, storage.checkpoint(&head, bytes))
+                    .await
+                    .context("checkpoint timed out")
+                    .and_then(|result| result);
                 if let Err(error) = &result {
                     tracing::warn!(event = "sqlite_checkpoint_failed", object = %head.object, state_version = version,
                         error = %format!("{error:#}"), duration_ms = started.elapsed().as_secs_f64() * 1000.0);

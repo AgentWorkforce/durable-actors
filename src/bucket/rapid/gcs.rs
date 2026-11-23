@@ -3,6 +3,7 @@ use crate::bucket::{GcsBucket, SnapshotStoreConfig, gcs::GcsClients};
 use futures_util::TryStreamExt;
 use google_cloud_storage::{
     appendable_object_writer::AppendableObjectWriter, model_ext::ReadRange,
+    object_descriptor::ObjectDescriptor,
 };
 
 impl RapidSnapshots {
@@ -90,6 +91,60 @@ struct GcsZone {
     bucket: String,
     clients: GcsClients,
 }
+
+type OpenedRead = (
+    Option<AppendableObjectWriter>,
+    Option<i64>,
+    Option<ObjectDescriptor>,
+);
+
+impl GcsZone {
+    /// Fences the writer when asked, then opens the persisted bytes; `None` when nothing persisted.
+    async fn open_read(&self, replica: &Replica, fence: bool) -> Result<OpenedRead> {
+        let mut writer = if fence {
+            Some(
+                self.clients
+                    .storage
+                    .reopen_appendable_object(&self.bucket, &replica.object, replica.generation)
+                    .send()
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let persisted = match &mut writer {
+            Some(writer) => Some(writer.flush().await?),
+            None => None,
+        };
+        if persisted == Some(0) {
+            return Ok((writer, persisted, None));
+        }
+        let descriptor = self
+            .clients
+            .storage
+            .open_object(&self.bucket, &replica.object)
+            .set_generation(replica.generation)
+            .send()
+            .await?;
+        Ok((writer, persisted, Some(descriptor)))
+    }
+}
+
+async fn download(descriptor: &ObjectDescriptor, start: u64, length: u64) -> Result<Payload> {
+    let mut reader = descriptor
+        .read_range(ReadRange::segment(start, length))
+        .await;
+    let mut download = crate::payload::Download::new();
+    let mut received = 0u64;
+    while let Some(chunk) = reader.next().await {
+        let chunk = chunk?;
+        received += chunk.len() as u64;
+        ensure!(received <= length, "Rapid range exceeded requested length");
+        download = download.append(chunk).await?;
+    }
+    ensure!(received == length, "incomplete Rapid range");
+    download.finish().await
+}
 struct GcsWriter(AppendableObjectWriter);
 
 #[async_trait]
@@ -116,54 +171,22 @@ impl LogZone for GcsZone {
 
     async fn read(&self, replica: &Replica, fence: bool) -> Result<Payload> {
         let _transfer = self.clients.transfers.acquire().await?;
-        let mut writer = if fence {
-            Some(
-                self.clients
-                    .storage
-                    .reopen_appendable_object(&self.bucket, &replica.object, replica.generation)
-                    .send()
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let persisted = if let Some(writer) = &mut writer {
-            Some(writer.flush().await?)
-        } else {
-            None
-        };
-        if persisted == Some(0) {
+        let (writer, persisted, descriptor) = bounded(self.open_read(replica, fence)).await?;
+        let Some(descriptor) = descriptor else {
             return Ok(Payload::default());
-        }
-        let descriptor = self
-            .clients
-            .storage
-            .open_object(&self.bucket, &replica.object)
-            .set_generation(replica.generation)
-            .send()
-            .await?;
+        };
         let size = descriptor.object().size;
         ensure!(size >= 0, "invalid log segment size");
         if size == 0 {
             return Ok(Payload::default());
         }
-        let mut reader = descriptor
-            .read_range(ReadRange::segment(0, size as u64))
-            .await;
-        let mut download = crate::payload::Download::new();
-        let mut length = 0usize;
-        while let Some(chunk) = reader.next().await {
-            let chunk = chunk?;
-            length += chunk.len();
-            ensure!(length <= size as usize, "log read exceeded persisted size");
-            download = download.append(chunk).await?;
-        }
+        let bytes = bounded_transfer(size as u64, download(&descriptor, 0, size as u64)).await?;
         ensure!(
-            length == size as usize && persisted.is_none_or(|size| size as usize == length),
+            persisted.is_none_or(|size| size as usize == bytes.len()),
             "incomplete fenced log read"
         );
         drop(writer);
-        download.finish().await
+        Ok(bytes)
     }
 
     async fn read_range(&self, replica: &Replica, start: u64, length: u64) -> Result<Payload> {
@@ -175,19 +198,7 @@ impl LogZone for GcsZone {
             .set_generation(replica.generation)
             .send()
             .await?;
-        let mut reader = descriptor
-            .read_range(ReadRange::segment(start, length))
-            .await;
-        let mut download = crate::payload::Download::new();
-        let mut received = 0u64;
-        while let Some(chunk) = reader.next().await {
-            let chunk = chunk?;
-            received += chunk.len() as u64;
-            ensure!(received <= length, "Rapid range exceeded requested length");
-            download = download.append(chunk).await?;
-        }
-        ensure!(received == length, "incomplete Rapid range");
-        download.finish().await
+        download(&descriptor, start, length).await
     }
 
     async fn delete(&self, replica: &Replica) -> Result<()> {

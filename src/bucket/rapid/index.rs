@@ -1,10 +1,18 @@
 use super::*;
+use futures_util::{StreamExt, TryStreamExt, stream};
 
 #[derive(Clone)]
 pub(super) struct LiveRecord {
     manifest: Manifest,
     start: u64,
     length: u64,
+}
+
+/// Records a restore downloaded ahead of its walk, and how many batches that took.
+#[derive(Default)]
+pub(super) struct Prefetched {
+    pub records: BTreeMap<String, Payload>,
+    pub batches: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +114,64 @@ impl LogStorage {
         }
     }
 
+    /// Downloads, at once, every archived batch between the checkpoint at `first` and `head`, so
+    /// the restore walks that history in memory instead of one batch per round trip.
+    pub async fn prefetch_indexed(
+        &self,
+        prefix: &str,
+        first: u64,
+        head: u64,
+        keys: &[String],
+    ) -> Prefetched {
+        match self.read_index_batches(prefix, first, head, keys).await {
+            Ok(prefetched) => prefetched,
+            Err(error) => {
+                tracing::warn!(event = "rapid_index_fallback", prefix, %error);
+                Prefetched::default()
+            }
+        }
+    }
+
+    async fn read_index_batches(
+        &self,
+        prefix: &str,
+        first: u64,
+        head: u64,
+        keys: &[String],
+    ) -> Result<Prefetched> {
+        let started = std::time::Instant::now();
+        let physical = object_name(&format!("{prefix}/"))?;
+        let mut wanted = Vec::new();
+        for key in keys {
+            if let Some((low, high, _)) = index_name(key, &physical)?
+                && high >= first
+                && low <= head
+            {
+                wanted.push((key.clone(), high.min(head)));
+            }
+        }
+        let batches = wanted.len();
+        let physical = &physical;
+        let mut reads = stream::iter(wanted)
+            .map(|(key, version): (String, u64)| async move {
+                self.read_index_batch(&key, prefix, physical, first, version)
+                    .await
+            })
+            .buffer_unordered(PREFETCH_BATCHES);
+        let mut records = BTreeMap::new();
+        while let Some(batch) = reads.try_next().await? {
+            records.extend(batch);
+        }
+        tracing::info!(
+            event = "rapid_index_prefetch",
+            prefix,
+            batches,
+            records = records.len(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(Prefetched { records, batches })
+    }
+
     async fn read_indexed(
         &self,
         object: &str,
@@ -117,34 +183,50 @@ impl LogStorage {
         let (prefix, _) = object.rsplit_once('/').context("invalid snapshot object")?;
         let physical = object_name(&format!("{prefix}/"))?;
         for key in keys {
-            let Some(segment) = index_segment(key, &physical, version)? else {
+            if index_segment(key, &physical, version)?.is_none() {
                 continue;
-            };
-            let stored = self
-                .archive
-                .get(key)
-                .await?
-                .context("archive index missing")?;
-            let index: Index = serde_json::from_reader(stored.bytes.reader())?;
-            index.validate(&format!("{physical}log~{segment}~"))?;
-            let (start, length) = index.range(first, version, self.batch.bytes as u64)?;
-            let bytes = self
-                .archive
-                .range(&index.batch, start, length)
-                .await?
-                .context("indexed archive batch missing")?
-                .bytes;
-            let records = decode_records(prefix, bytes)?;
+            }
+            let records = self
+                .read_index_batch(key, prefix, &physical, first, version)
+                .await?;
             ensure!(records.contains_key(object), "indexed record missing");
-            tracing::info!(
-                event = "rapid_index_read",
-                state_version = version,
-                downloaded_bytes = length,
-                records = records.len()
-            );
             return Ok(Some(records));
         }
         Ok(None)
+    }
+
+    /// The records from `first` through `version` held by the batch that `key` indexes.
+    async fn read_index_batch(
+        &self,
+        key: &str,
+        prefix: &str,
+        physical: &str,
+        first: u64,
+        version: u64,
+    ) -> Result<BTreeMap<String, Payload>> {
+        let segment = index_segment(key, physical, version)?.context("index misses version")?;
+        let stored = self
+            .archive
+            .get(key)
+            .await?
+            .context("archive index missing")?;
+        let index: Index = serde_json::from_reader(stored.bytes.reader())?;
+        index.validate(&format!("{physical}log~{segment}~"))?;
+        let (start, length) = index.range(first, version, self.batch.bytes as u64)?;
+        let bytes = self
+            .archive
+            .range(&index.batch, start, length)
+            .await?
+            .context("indexed archive batch missing")?
+            .bytes;
+        let records = decode_records(prefix, bytes)?;
+        tracing::info!(
+            event = "rapid_index_read",
+            state_version = version,
+            downloaded_bytes = length,
+            records = records.len()
+        );
+        Ok(records)
     }
 
     pub async fn index_batch(
@@ -205,6 +287,13 @@ fn validate(object: &str, record: &Record) -> Result<()> {
 }
 
 fn index_segment<'a>(key: &'a str, prefix: &str, version: u64) -> Result<Option<&'a str>> {
+    Ok(index_name(key, prefix)?
+        .filter(|(first, last, _)| (*first..=*last).contains(&version))
+        .map(|(_, _, segment)| segment))
+}
+
+/// The first and last versions an index covers, and the log segment it belongs to.
+fn index_name<'a>(key: &'a str, prefix: &str) -> Result<Option<(u64, u64, &'a str)>> {
     let Some(name) = key
         .strip_prefix(&format!("{prefix}index~"))
         .and_then(|key| key.strip_suffix(".idx"))
@@ -216,7 +305,7 @@ fn index_segment<'a>(key: &'a str, prefix: &str, version: u64) -> Result<Option<
     let first = parts[0].parse::<u64>()?;
     let last = parts[1].parse::<u64>()?;
     ensure!(first <= last, "invalid archive index range");
-    Ok((first..=last).contains(&version).then_some(parts[2]))
+    Ok(Some((first, last, parts[2])))
 }
 
 impl Index {

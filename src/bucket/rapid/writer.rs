@@ -94,7 +94,11 @@ impl Session {
             );
         }
         if self.standard {
-            bounded(storage.snapshots.put(object, bytes.clone())).await?;
+            bounded_transfer(
+                bytes.len() as u64,
+                storage.snapshots.put(object, bytes.clone()),
+            )
+            .await?;
         } else {
             let frame = self
                 .segment
@@ -276,7 +280,11 @@ impl Session {
             self.retirement_error
         );
         if let Some((head, Some(bytes))) = &self.latest {
-            bounded(storage.snapshots.put(&head.object, bytes.clone())).await?;
+            bounded_transfer(
+                bytes.len() as u64,
+                storage.snapshots.put(&head.object, bytes.clone()),
+            )
+            .await?;
         }
         Ok(())
     }

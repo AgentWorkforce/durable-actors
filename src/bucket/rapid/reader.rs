@@ -218,11 +218,13 @@ impl LogStorage {
         manifest: &Manifest,
         fence: bool,
     ) -> Result<Vec<Record>> {
-        let reads =
-            futures_util::future::join_all(manifest.replicas.iter().map(|replica| async move {
-                bounded(self.zone(replica)?.read(replica, fence)).await
-            }))
-            .await;
+        let reads = futures_util::future::join_all(
+            manifest
+                .replicas
+                .iter()
+                .map(|replica| async move { self.zone(replica)?.read(replica, fence).await }),
+        )
+        .await;
         let mut copies = Vec::new();
         for read in reads {
             match read {

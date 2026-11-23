@@ -29,9 +29,13 @@ use tokio_util::task::AbortOnDropHandle;
 use writer::Session;
 
 const ROTATION_INTERVAL: Duration = Duration::from_secs(60);
+/// Archived batches a restore downloads at once; their bodies spool to temporary files.
+const PREFETCH_BATCHES: usize = 64;
 /// Keeps every Rapid object a session writes far younger than the 7-day lifecycle rule.
 const IDLE_SEGMENT_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const RAPID_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The slowest transfer rate a bounded operation is allowed before it counts as stuck.
+const MIN_TRANSFER_BYTES_PER_SECOND: f64 = 32.0 * 1024.0 * 1024.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Replica {
@@ -330,9 +334,20 @@ impl LogStorage {
 }
 
 async fn bounded<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    tokio::time::timeout(RAPID_OPERATION_TIMEOUT, operation)
+    bounded_transfer(0, operation).await
+}
+
+async fn bounded_transfer<T>(
+    bytes: u64,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(transfer_timeout(RAPID_OPERATION_TIMEOUT, bytes), operation)
         .await
         .context("log operation timed out")?
+}
+
+pub(crate) fn transfer_timeout(base: Duration, bytes: u64) -> Duration {
+    base + Duration::from_secs_f64(bytes as f64 / MIN_TRANSFER_BYTES_PER_SECOND)
 }
 
 #[cfg(test)]
