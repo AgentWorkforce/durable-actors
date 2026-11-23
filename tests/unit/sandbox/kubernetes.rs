@@ -64,9 +64,6 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
             .unwrap(),
         &["us-west4-a", "us-west4-b", "us-west4-c"]
     );
-    let spread = &spec.topology_spread_constraints.as_ref().unwrap()[0];
-    assert_eq!(spread.topology_key, "topology.kubernetes.io/zone");
-    assert_eq!(spread.when_unsatisfiable, "ScheduleAnyway");
     assert_eq!(
         spec.containers[0]
             .resources
@@ -123,6 +120,57 @@ async fn retirement_recovers_a_lost_create_reply_and_uses_a_uid_precondition() -
     assert_eq!(
         deleted.lock().unwrap().as_ref().unwrap()["preconditions"]["uid"],
         "created-uid"
+    );
+    Ok(())
+}
+
+#[test]
+fn each_pool_spreads_its_spares_across_nodes() -> Result<()> {
+    let pool = |pod: &Pod| pod.metadata.labels.as_ref().unwrap()[SPARE_POOL].clone();
+    let small = spare_under(GKE_RUNTIME_CLASS);
+    let mut request = spare_request("large");
+    request.resources.memory_mib = 512;
+    let large = spare_pod(
+        &request,
+        &["us-west4-a".into()],
+        "token",
+        None,
+        None,
+        GKE_RUNTIME_CLASS,
+    )?;
+    assert_eq!(pool(&small), pool(&spare_under(GKE_RUNTIME_CLASS)));
+    assert_ne!(pool(&small), pool(&large));
+    let spread = &small.spec.unwrap().topology_spread_constraints.unwrap()[0];
+    assert_eq!(spread.topology_key, "kubernetes.io/hostname");
+    assert_eq!(spread.when_unsatisfiable, "ScheduleAnyway");
+    assert_eq!(spread.match_label_keys, Some(vec![SPARE_POOL.to_owned()]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claimed_spare_leaves_its_pool() -> Result<()> {
+    use axum::{Json, Router, routing::patch};
+    let (sent, mut patched) = tokio::sync::mpsc::unbounded_channel();
+    let routes = Router::new().route(
+        "/api/v1/namespaces/sandboxes/pods/warm-a",
+        patch(move |Json(body): Json<serde_json::Value>| {
+            sent.send(body).unwrap();
+            async { Json(pod("warm-a", "Running")) }
+        }),
+    );
+    let (cluster, _server) = fake_cluster(routes).await?;
+    cluster.claimed(&SpareHandle {
+        node: String::new(),
+        name: "warm-a".into(),
+        resource_id: "sandboxes/warm-a/warm-a-uid".into(),
+        route: String::new(),
+        canonical_region: String::new(),
+        control_route: String::new(),
+        control_token: String::new(),
+    });
+    assert_eq!(
+        patched.recv().await.unwrap(),
+        json!({"metadata": {"labels": {SPARE_POOL: null}}})
     );
     Ok(())
 }

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Cluster {
     creates: AtomicUsize,
+    claims: AtomicUsize,
     retires: AtomicUsize,
 }
 #[async_trait]
@@ -13,6 +14,9 @@ impl SandboxCluster for Cluster {
     async fn create_spare(&self, _: &CreateSpareRequest) -> Result<SpareHandle> {
         self.creates.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("unexpected pod creation")
+    }
+    fn claimed(&self, _: &SpareHandle) {
+        self.claims.fetch_add(1, Ordering::SeqCst);
     }
     async fn retire_spare(&self, _: &SpareHandle) -> Result<()> {
         self.retires.fetch_add(1, Ordering::SeqCst);
@@ -70,6 +74,7 @@ impl HostAssignment for Assign {
 async fn prewarmed_assignment_uses_ready_host_without_creating_a_pod() -> Result<()> {
     let cluster = Arc::new(Cluster {
         creates: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
         retires: AtomicUsize::new(0),
     });
     let provider = RemoteSandboxProvider {
@@ -83,6 +88,7 @@ async fn prewarmed_assignment_uses_ready_host_without_creating_a_pod() -> Result
     assert_eq!(result.owner_epoch, 3);
     assert!(result.provisioning.unwrap().reused);
     assert_eq!(cluster.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(cluster.claims.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -181,6 +187,7 @@ async fn assignment_rejects_a_host_whose_lease_expired_before_its_reply() -> Res
         secrets: Arc::new(Secrets),
         cluster: Arc::new(Cluster {
             creates: AtomicUsize::new(0),
+            claims: AtomicUsize::new(0),
             retires: AtomicUsize::new(0),
         }),
         assignment: Arc::new(ExpiredAssignment),
@@ -193,6 +200,7 @@ async fn assignment_rejects_a_host_whose_lease_expired_before_its_reply() -> Res
 async fn modal_assignment_failure_retires_the_claimed_spare() -> Result<()> {
     let cluster = Arc::new(Cluster {
         creates: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
         retires: AtomicUsize::new(0),
     });
     let provider = RemoteSandboxProvider {
@@ -213,6 +221,7 @@ async fn modal_assignment_delivers_resolved_project_secrets() -> Result<()> {
         "modal",
         Arc::new(Cluster {
             creates: AtomicUsize::new(0),
+            claims: AtomicUsize::new(0),
             retires: AtomicUsize::new(0),
         }),
         Arc::new(Secrets),
@@ -240,6 +249,7 @@ impl SecretResolver for UnavailableSecrets {
 async fn secret_resolution_failure_retires_the_modal_spare_without_assignment() -> Result<()> {
     let cluster = Arc::new(Cluster {
         creates: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
         retires: AtomicUsize::new(0),
     });
     let provider = RemoteSandboxProvider::new(

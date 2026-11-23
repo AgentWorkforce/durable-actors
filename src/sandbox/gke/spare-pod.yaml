@@ -1,6 +1,6 @@
-# A spare actor sandbox. spare_pod in kubernetes.rs sets what varies per request: the name, both
-# images, the zones, CPU and memory, and the spare's token and endpoints. It also replaces the
-# runtime class when the control plane is configured with another.
+# A spare actor sandbox. spare_pod in kubernetes.rs sets what varies per request: the name, the
+# pool label, both images, the zones, CPU and memory, and the spare's token and endpoints. It also
+# replaces the runtime class when the control plane is configured with another.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -25,13 +25,16 @@ spec:
               - key: topology.kubernetes.io/zone
                 operator: In
                 values: []
+  # Spreads each pool's spares across nodes, so a waking actor is likely to find one on its last
+  # node. The control plane removes the pool label when it claims a spare.
   topologySpreadConstraints:
     - maxSkew: 1
-      topologyKey: topology.kubernetes.io/zone
+      topologyKey: kubernetes.io/hostname
       whenUnsatisfiable: ScheduleAnyway
       labelSelector:
         matchLabels:
           terse.ai/purpose: actor
+      matchLabelKeys: [terse.ai/spare-pool]
   securityContext:
     runAsNonRoot: true
     runAsUser: 10000

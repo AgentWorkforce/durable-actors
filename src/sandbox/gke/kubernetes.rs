@@ -10,7 +10,7 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, ResourceExt,
-    api::{DeleteParams, PostParams, Preconditions},
+    api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
         WatchStreamExt,
         reflector::{self, ObjectRef, Store, store::Writer},
@@ -28,6 +28,8 @@ const MANAGED: &str = "app.kubernetes.io/managed-by=terse";
 pub(crate) const GKE_RUNTIME_CLASS: &str = "gvisor";
 /// The volume the node cache moves an actor's database in and out of from outside the sandbox.
 const SLOT_VOLUME: &str = "slot";
+/// Names a spare's pool, one image at one size. Only unclaimed spares carry it.
+const SPARE_POOL: &str = "terse.ai/spare-pool";
 
 #[derive(Clone, Debug)]
 pub(crate) struct GkeConfig {
@@ -173,6 +175,15 @@ impl SandboxCluster for Kubernetes {
         })
     }
 
+    fn claimed(&self, spare: &SpareHandle) {
+        let (pods, name) = (self.pods.clone(), spare.name.clone());
+        tokio::spawn(async move {
+            if let Err(error) = leave_pool(&pods, &name).await {
+                tracing::warn!(%error, %name, "claimed sandbox still counts as a spare");
+            }
+        });
+    }
+
     async fn retire_spare(&self, spare: &SpareHandle) -> Result<()> {
         if let Some(kills) = &self.kills {
             kills.keep_claim(&spare.name).await;
@@ -291,6 +302,10 @@ fn spare_pod(
 ) -> Result<Pod> {
     let mut pod: Pod = serde_yaml::from_str(SPARE_POD).context("spare pod manifest")?;
     pod.metadata.name = Some(request.name.clone());
+    pod.metadata
+        .labels
+        .get_or_insert_with(BTreeMap::new)
+        .insert(SPARE_POOL.into(), spare_pool(request)?);
     let spec = pod
         .spec
         .as_mut()
@@ -332,6 +347,16 @@ fn spare_pod(
             .extend(mounts);
     }
     Ok(pod)
+}
+
+/// A digest, since an image reference is longer than a label value can be.
+fn spare_pool(request: &CreateSpareRequest) -> Result<String> {
+    let pool = serde_json::to_vec(&(&request.image_ref, &request.resources))?;
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &pool);
+    Ok(hash.as_ref()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// The scratch volume the actor's database lives in, which the node cache finds by the pod's UID
@@ -500,6 +525,15 @@ async fn delete_pod(pods: &Api<Pod>, name: &str, uid: &str) -> Result<()> {
         ..DeleteParams::default()
     };
     match retry_throttled(|| pods.delete(name, &params)).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+async fn leave_pool(pods: &Api<Pod>, name: &str) -> Result<()> {
+    let patch = Patch::Merge(serde_json::json!({"metadata": {"labels": {SPARE_POOL: null}}}));
+    let params = PatchParams::default();
+    match retry_throttled(|| pods.patch(name, &params, &patch)).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
         Err(error) => Err(error.into()),

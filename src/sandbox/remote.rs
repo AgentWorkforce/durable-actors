@@ -113,6 +113,7 @@ impl SandboxProvider for RemoteSandboxProvider {
                 .await?
             }
         };
+        self.cluster.claimed(&spare);
         let result = self.assign(request, &spare).await;
         match result {
             Ok(mut handle) => {
@@ -260,6 +261,8 @@ pub(super) trait SandboxCluster: Send + Sync {
         Ok(())
     }
     async fn create_spare(&self, request: &CreateSpareRequest) -> Result<SpareHandle>;
+    /// Runs as `spare` is handed to an actor, without delaying the assignment.
+    fn claimed(&self, _spare: &SpareHandle) {}
     async fn retire_spare(&self, spare: &SpareHandle) -> Result<()>;
 }
 
