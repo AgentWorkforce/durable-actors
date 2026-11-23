@@ -2,6 +2,7 @@ use super::*;
 use crate::bucket::recovery::{Checkpoint, ResolvedSqlite, SnapshotHistory, resolve};
 use crate::state_log::SqliteSnapshot;
 use crate::storage::VerifiedSnapshot;
+use futures_util::{StreamExt, TryStreamExt, stream};
 
 const CHECKPOINT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -176,43 +177,89 @@ struct EpochHistory {
 impl EpochHistory {
     /// The newest checkpointed version at or below `version`, where the walk will stop.
     fn floor(&self, version: u64) -> u64 {
+        self.checkpoint_at_or_below(version).unwrap_or(0)
+    }
+
+    fn checkpoint_at_or_below(&self, version: u64) -> Option<u64> {
         self.checkpoints
             .iter()
             .filter_map(|key| key.strip_suffix(".checkpoint"))
             .filter_map(super::super::snapshots::version)
             .filter(|v| *v <= version)
             .max()
-            .unwrap_or(0)
     }
 }
 
 impl LogHistory<'_> {
-    /// Lists one owner epoch's history and prefetches the batches the walk from `version` needs.
-    async fn load_epoch(&mut self, prefix: &str, version: u64) -> Result<EpochHistory> {
-        let prefix_key = format!("{prefix}/");
-        let (keys, indexes) = tokio::try_join!(
-            self.storage.snapshots.list(&prefix_key),
-            self.storage.index_keys(&prefix_key)
-        )?;
-        let (checkpoints, heads) = keys
-            .into_iter()
-            .filter(|key| key.ends_with(".checkpoint") || key.ends_with(".json"))
-            .partition(|key| key.ends_with(".checkpoint"));
-        let mut epoch = EpochHistory {
-            records: None,
-            indexes,
-            indexed: BTreeMap::new(),
-            checkpoints,
-            heads,
-        };
+    /// Lists owner epochs from `prefix`'s downward, a wave at a time, until one holds a checkpoint
+    /// at or below `version`, then prefetches every batch they hold back to that checkpoint. A
+    /// history that spans many activations is walked in a few round trips, not a few per epoch.
+    async fn plan(&mut self, prefix: &str, version: u64) -> Result<()> {
+        let (root, epoch) = prefix.rsplit_once('/').context("invalid snapshot prefix")?;
+        let mut next = u64::from_str_radix(epoch, 16).context("invalid owner epoch")?;
+        let mut planned = Vec::new();
+        let mut floor = None;
+        while floor.is_none() && next > 0 && planned.len() < MAX_PLANNED_EPOCHS {
+            let lowest = next.saturating_sub(EPOCHS_PER_WAVE - 1).max(1);
+            let storage = self.storage;
+            let mut wave: Vec<(String, EpochHistory)> = stream::iter((lowest..=next).rev())
+                .map(|epoch| async move {
+                    let prefix = format!("{root}/{epoch:032x}");
+                    let history = list_epoch(storage, &prefix).await?;
+                    anyhow::Ok((prefix, history))
+                })
+                .buffered(EPOCHS_PER_WAVE as usize)
+                .try_collect()
+                .await?;
+            floor = wave
+                .iter()
+                .find_map(|(_, epoch)| epoch.checkpoint_at_or_below(version));
+            planned.extend(
+                wave.iter()
+                    .map(|(prefix, epoch)| (prefix.clone(), epoch.indexes.clone())),
+            );
+            for (prefix, epoch) in wave.drain(..) {
+                self.epochs.entry(prefix).or_insert(epoch);
+            }
+            next = lowest - 1;
+        }
         let prefetched = self
             .storage
-            .prefetch_indexed(prefix, epoch.floor(version), version, &epoch.indexes)
+            .prefetch_indexed(&planned, floor.unwrap_or(0), version)
             .await;
         self.reads += prefetched.batches;
-        epoch.indexed = prefetched.records;
-        Ok(epoch)
+        for (object, bytes) in prefetched.records {
+            let (prefix, _) = object.rsplit_once('/').context("invalid snapshot name")?;
+            if let Some(epoch) = self.epochs.get_mut(prefix) {
+                epoch.indexed.insert(object, bytes);
+            }
+        }
+        Ok(())
     }
+}
+
+/// Owner epochs listed together while planning a restore.
+const EPOCHS_PER_WAVE: u64 = 64;
+/// Bounds the listing for a history that has gone without checkpoints for a long time.
+const MAX_PLANNED_EPOCHS: usize = 1024;
+
+async fn list_epoch(storage: &LogStorage, prefix: &str) -> Result<EpochHistory> {
+    let prefix_key = format!("{prefix}/");
+    let (keys, indexes) = tokio::try_join!(
+        storage.snapshots.list(&prefix_key),
+        storage.index_keys(&prefix_key)
+    )?;
+    let (checkpoints, heads) = keys
+        .into_iter()
+        .filter(|key| key.ends_with(".checkpoint") || key.ends_with(".json"))
+        .partition(|key| key.ends_with(".checkpoint"));
+    Ok(EpochHistory {
+        records: None,
+        indexes,
+        indexed: BTreeMap::new(),
+        checkpoints,
+        heads,
+    })
 }
 
 #[async_trait]
@@ -222,8 +269,7 @@ impl SnapshotHistory for LogHistory<'_> {
         let version =
             super::super::snapshots::version(object).context("invalid snapshot version")?;
         if !self.epochs.contains_key(prefix) {
-            let epoch = self.load_epoch(prefix, version).await?;
-            self.epochs.insert(prefix.into(), epoch);
+            self.plan(prefix, version).await?;
         }
         let epoch = self.epochs.get_mut(prefix).unwrap();
         if let Some(bytes) = epoch

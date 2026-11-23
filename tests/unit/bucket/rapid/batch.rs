@@ -10,6 +10,8 @@ struct ArchiveBucket {
     read_requests: AtomicU64,
     read_batches: AtomicU64,
     version_reads: AtomicU64,
+    /// Lists (`L`) and index reads (`I`) in the order they happen.
+    ops: std::sync::Mutex<Vec<char>>,
     range_bytes: AtomicU64,
     index_failure: AtomicU64,
     fail_checkpoint: AtomicBool,
@@ -32,6 +34,7 @@ impl Bucket for ArchiveBucket {
 
     async fn get(&self, key: &str) -> Result<Option<BucketObject>> {
         if key.ends_with(".idx") {
+            self.ops.lock().unwrap().push('I');
             match self.index_failure.load(Ordering::SeqCst) {
                 1 => return Ok(None),
                 2 => anyhow::bail!("injected index read failure"),
@@ -53,6 +56,7 @@ impl Bucket for ArchiveBucket {
             "injected index list failure"
         );
         self.read_requests.fetch_add(1, Ordering::SeqCst);
+        self.ops.lock().unwrap().push('L');
         self.inner.list(prefix).await
     }
     async fn compare_and_swap(
@@ -98,6 +102,7 @@ fn controlled(
         read_requests: AtomicU64::new(0),
         read_batches: AtomicU64::new(0),
         version_reads: AtomicU64::new(0),
+        ops: std::sync::Mutex::new(Vec::new()),
         range_bytes: AtomicU64::new(0),
         index_failure: AtomicU64::new(0),
         fail_checkpoint: AtomicBool::new(false),
@@ -1050,6 +1055,68 @@ async fn restores_prefetch_archived_batches_without_reading_unlisted_versions() 
         )
         .await?,
         serde_json::json!({"count": 20})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn restores_plan_history_spread_across_owner_epochs() -> Result<()> {
+    let source = Fixture::new()?;
+    let (replication, history) = write_history(&source, &source.store()?, 40, None).await?;
+    let f = Fixture::new()?;
+    let actor = crate::storage_paths::actor_from_snapshot(&f.stream.object(1))?;
+    let (mut progress, mut parent, mut head) = (None, None, None);
+    // Each version is its own activation, as for an actor that wakes, writes once and sleeps.
+    for bytes in history {
+        let mut snapshot = StateSnapshot::decode(&bytes)?;
+        let version = snapshot.state_version;
+        snapshot.owner_epoch = version;
+        snapshot.sqlite.parent = parent;
+        let key =
+            crate::storage::snapshot_object_name(&actor, version, &format!("{version:032x}"))?;
+        let stream = StateStream {
+            prefix: format!("{}/", key.rsplit_once('/').unwrap().0),
+            owner_epoch: version,
+            base_version: version - 1,
+            ..f.stream.clone()
+        };
+        let writer = f.store()?;
+        writer
+            .start(&stream, snapshot.sqlite.parent.as_ref().zip(progress))
+            .await?;
+        let bytes = snapshot.encode()?;
+        let reference = stream.snapshot(&bytes)?;
+        writer.put(&key, bytes.clone()).await?;
+        progress = writer
+            .finish(
+                &stream,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+        parent = Some(reference.clone());
+        head = Some(VerifiedSnapshot::matching(reference, bytes)?);
+    }
+    f.cleaned().await?;
+    let (reader, archive) = controlled(&f, 16 * 1024 * 1024, 10_000)?;
+    let restored = reader.storage.restore(head.unwrap(), None).await?;
+
+    assert_eq!(restored.parents, 39);
+    assert_eq!(archive.version_reads.load(Ordering::SeqCst), 0);
+    let ops = archive.ops.lock().unwrap().clone();
+    let last_list = ops.iter().rposition(|op| *op == 'L').unwrap();
+    let first_index = ops.iter().position(|op| *op == 'I').unwrap();
+    assert!(
+        last_list < first_index,
+        "every epoch is listed before any batch is read: {ops:?}"
+    );
+    assert_eq!(
+        crate::litestream::storage::restored_fields(
+            replication.as_ref(),
+            &restored.sqlite.files,
+            restored.sqlite.txid
+        )
+        .await?,
+        serde_json::json!({"count": 40})
     );
     Ok(())
 }

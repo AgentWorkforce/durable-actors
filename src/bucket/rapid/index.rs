@@ -114,19 +114,19 @@ impl LogStorage {
         }
     }
 
-    /// Downloads, at once, every archived batch between the checkpoint at `first` and `head`, so
-    /// the restore walks that history in memory instead of one batch per round trip.
+    /// Downloads, at once, every archived batch the given epochs hold between the checkpoint at
+    /// `first` and `head`, so the restore walks that history in memory instead of one batch per
+    /// round trip. `epochs` pairs each epoch's prefix with its index keys.
     pub async fn prefetch_indexed(
         &self,
-        prefix: &str,
+        epochs: &[(String, Vec<String>)],
         first: u64,
         head: u64,
-        keys: &[String],
     ) -> Prefetched {
-        match self.read_index_batches(prefix, first, head, keys).await {
+        match self.read_index_batches(epochs, first, head).await {
             Ok(prefetched) => prefetched,
             Err(error) => {
-                tracing::warn!(event = "rapid_index_fallback", prefix, %error);
+                tracing::warn!(event = "rapid_index_fallback", %error);
                 Prefetched::default()
             }
         }
@@ -134,29 +134,36 @@ impl LogStorage {
 
     async fn read_index_batches(
         &self,
-        prefix: &str,
+        epochs: &[(String, Vec<String>)],
         first: u64,
         head: u64,
-        keys: &[String],
     ) -> Result<Prefetched> {
         let started = std::time::Instant::now();
-        let physical = object_name(&format!("{prefix}/"))?;
         let mut wanted = Vec::new();
-        for key in keys {
-            if let Some((low, high, _)) = index_name(key, &physical)?
-                && high >= first
-                && low <= head
-            {
-                wanted.push((key.clone(), high.min(head)));
+        for (prefix, keys) in epochs {
+            let physical = object_name(&format!("{prefix}/"))?;
+            for key in keys {
+                if let Some((low, high, _)) = index_name(key, &physical)?
+                    && high >= first
+                    && low <= head
+                {
+                    wanted.push((
+                        prefix.clone(),
+                        physical.clone(),
+                        key.clone(),
+                        high.min(head),
+                    ));
+                }
             }
         }
         let batches = wanted.len();
-        let physical = &physical;
         let mut reads = stream::iter(wanted)
-            .map(|(key, version): (String, u64)| async move {
-                self.read_index_batch(&key, prefix, physical, first, version)
-                    .await
-            })
+            .map(
+                |(prefix, physical, key, version): (String, String, String, u64)| async move {
+                    self.read_index_batch(&key, &prefix, &physical, first, version)
+                        .await
+                },
+            )
             .buffer_unordered(PREFETCH_BATCHES);
         let mut records = BTreeMap::new();
         while let Some(batch) = reads.try_next().await? {
@@ -164,7 +171,7 @@ impl LogStorage {
         }
         tracing::info!(
             event = "rapid_index_prefetch",
-            prefix,
+            epochs = epochs.len(),
             batches,
             records = records.len(),
             duration_ms = started.elapsed().as_secs_f64() * 1000.0
