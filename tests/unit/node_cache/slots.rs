@@ -14,7 +14,7 @@ async fn a_parked_database_moves_to_the_next_spare_with_its_inode() -> Result<()
 
     let parked = node
         .slots
-        .park(&actor("one"), &first, snapshot(1), 7)
+        .park(&actor("one"), &first, snapshot(1), 7, false)
         .await?;
     assert!(!node.database(&first).exists());
     assert!(node.slots.is_parked(&actor("one"), "d1").await);
@@ -40,7 +40,7 @@ async fn a_database_parked_at_another_snapshot_is_dropped() -> Result<()> {
     node.slots.check_out(&actor("one"), &first, None).await?;
     write_value(&node.database(&first), 89)?;
     node.slots
-        .park(&actor("one"), &first, snapshot(1), 7)
+        .park(&actor("one"), &first, snapshot(1), 7, false)
         .await?;
 
     assert!(!node.slots.is_parked(&actor("two"), "d1").await);
@@ -65,20 +65,57 @@ async fn only_a_closed_database_of_plain_files_is_parked() -> Result<()> {
     std::fs::write(database.join("actor.sqlite-wal"), b"frames")?;
     assert!(
         node.slots
-            .park(&actor("one"), &slot, snapshot(1), 7)
+            .park(&actor("one"), &slot, snapshot(1), 7, false)
             .await
             .is_err()
     );
 
-    std::fs::remove_file(database.join("actor.sqlite-wal"))?;
+    assert!(!database.exists());
+
+    write_value(&database, 89)?;
     std::os::unix::fs::symlink("/etc/passwd", database.join("link"))?;
     assert!(
         node.slots
-            .park(&actor("one"), &slot, snapshot(1), 7)
+            .park(&actor("one"), &slot, snapshot(1), 7, false)
             .await
             .is_err()
     );
     assert!(!node.slots.is_parked(&actor("one"), "d1").await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_parks_only_at_its_own_actors_snapshot() -> Result<()> {
+    let node = Node::start().await?;
+    let slot = node.spare()?;
+    write_value(&node.database(&slot), 89)?;
+
+    let parked = node
+        .slots
+        .park(&actor("two"), &slot, snapshot(1), 7, true)
+        .await;
+
+    assert!(parked.is_err());
+    assert!(node.database(&slot).join(DATABASE_FILE).exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn parking_moves_a_symlinked_database_directory_without_following_it() -> Result<()> {
+    let node = Node::start().await?;
+    let slot = node.spare()?;
+    let elsewhere = node.root.path().join("elsewhere");
+    write_value(&elsewhere, 89)?;
+    std::os::unix::fs::symlink(&elsewhere, node.database(&slot))?;
+
+    let parked = node
+        .slots
+        .park(&actor("one"), &slot, snapshot(1), 7, false)
+        .await;
+
+    assert!(parked.is_err());
+    assert!(!node.slots.is_parked(&actor("one"), "d1").await);
+    assert_eq!(read_value(&elsewhere)?, 89);
     Ok(())
 }
 
@@ -89,11 +126,16 @@ struct Node {
 
 impl Node {
     async fn start() -> Result<Self> {
+        Self::uploading(None).await
+    }
+
+    async fn uploading(bucket: Option<Arc<dyn crate::bucket::Bucket>>) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let cache = root.path().join("cache");
         let store = Arc::new(DiskStore::open(cache.clone(), 1 << 30, 1 << 10).await?);
         let layout = SlotLayout::Kubelet(root.path().join("pods"));
-        let slots = SqliteSlots::open(cache, Some(layout), store).await?;
+        let uploads = BaseUploads::new(bucket, store.staging().join("bases"));
+        let slots = SqliteSlots::open(cache, Some(layout), store, uploads).await?;
         Ok(Self { root, slots })
     }
 
@@ -125,9 +167,15 @@ fn actor(id: &str) -> ActorKey {
     }
 }
 
+/// A snapshot of actor `one`.
 fn snapshot(version: u64) -> SnapshotRef {
     SnapshotRef {
-        object: format!("state/{version}"),
+        object: crate::storage::snapshot_object_name(
+            &actor("one"),
+            version,
+            &format!("{:032x}", 1),
+        )
+        .unwrap(),
         state_version: version,
         request_id: format!("request-{version}"),
         digest: format!("d{version}"),
@@ -147,4 +195,38 @@ fn write_value(directory: &Path, value: i64) -> Result<()> {
 fn read_value(directory: &Path) -> Result<i64> {
     let db = rusqlite::Connection::open(directory.join(DATABASE_FILE))?;
     Ok(db.query_row("SELECT v FROM marker", [], |row| row.get(0))?)
+}
+
+#[tokio::test]
+async fn parking_with_a_due_base_uploads_the_parked_file() -> Result<()> {
+    let bucket_dir = tempfile::tempdir()?;
+    let bucket = Arc::new(crate::bucket::FileBucket::new(bucket_dir.path().into())?);
+    let node = Node::uploading(Some(bucket.clone())).await?;
+    let slot = node.spare()?;
+    write_value(&node.database(&slot), 5)?;
+    let snapshot = snapshot(5);
+    let parked = node
+        .slots
+        .park(&actor("one"), &slot, snapshot.clone(), 9, true)
+        .await?;
+    let bytes = std::fs::metadata(
+        node.slots
+            .parked(&actor("one"))
+            .join(DATABASE)
+            .join(DATABASE_FILE),
+    )?
+    .len();
+    assert_eq!(parked.bytes, bytes);
+    let key = crate::bucket::base_key(&snapshot, 9, bytes)?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while crate::bucket::Bucket::get(bucket.as_ref(), &key)
+            .await?
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    Ok(())
 }

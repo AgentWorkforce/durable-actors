@@ -512,6 +512,7 @@ async fn parts_land_at_their_offsets_and_are_checked_whole() -> Result<()> {
     let data: Vec<u8> = (0..1_000_003u32).map(|i| (i % 251) as u8).collect();
     let file = Arc::new(tempfile::tempfile()?);
     file.set_len(data.len() as u64)?;
+    let mut crc = 0;
     for (index, (offset, size)) in download_parts(data.len() as u64).into_iter().enumerate() {
         // The first part streams from a whole-object response, which runs past its end.
         let end = if index == 0 {
@@ -521,19 +522,19 @@ async fn parts_land_at_their_offsets_and_are_checked_whole() -> Result<()> {
         };
         let source = bytes::Bytes::copy_from_slice(&data[offset as usize..end]);
         let response = ReadObjectResponse::from_source(ObjectHighlights::default(), source);
-        write_part(file.clone(), offset, size, response).await?;
+        let part = write_part(file.clone(), offset, size, response, true).await?;
+        crc = crc32c::crc32c_combine(crc, part, size as usize);
     }
     let payload = crate::payload::Payload::from_file(file.clone(), data.len());
     assert_eq!(payload.to_bytes()?.as_ref(), data.as_slice());
-    verify_crc32c(file.clone(), data.len() as u64, crc32c::crc32c(&data)).await?;
-    assert!(verify_crc32c(file, data.len() as u64, 7).await.is_err());
+    assert_eq!(crc, crc32c::crc32c(&data));
 
     let short = ReadObjectResponse::from_source(
         ObjectHighlights::default(),
         bytes::Bytes::from_static(b"abc"),
     );
     assert!(
-        write_part(Arc::new(tempfile::tempfile()?), 0, 10, short)
+        write_part(Arc::new(tempfile::tempfile()?), 0, 10, short, true)
             .await
             .is_err()
     );

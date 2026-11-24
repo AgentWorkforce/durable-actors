@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::FutureExt;
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, CredentialsProvider, EntityTag,
 };
@@ -14,6 +13,7 @@ use google_cloud_storage::{
     model_ext::ReadRange,
     read_object::ReadObjectResponse,
 };
+use tokio_util::task::AbortOnDropHandle;
 
 use super::{Bucket, BucketObject};
 
@@ -85,6 +85,17 @@ impl GcsBucket {
             clients: GcsClients::new(credentials, Some(HOST_GRPC_SUBCHANNELS)).await?,
         })
     }
+
+    /// A node's bucket: its own, or one restore's read with a host's forwarded token. Outside the
+    /// sandbox it can afford the connections and transfers its parallel reads need.
+    pub(crate) async fn for_restore(bucket: &str, credentials: Credentials) -> Result<Self> {
+        let mut clients = GcsClients::new(credentials, Some(RESTORE_GRPC_SUBCHANNELS)).await?;
+        clients.transfers = Arc::new(tokio::sync::Semaphore::new(RESTORE_TRANSFERS));
+        Ok(Self {
+            bucket: bucket_name(bucket)?,
+            clients,
+        })
+    }
 }
 
 impl WarmStorage {
@@ -150,6 +161,10 @@ impl WarmGcs {
 /// activation through the egress proxy.
 /// One actor's storage traffic fits in one HTTP/2 connection (~100 concurrent RPCs).
 pub(crate) const HOST_GRPC_SUBCHANNELS: usize = 1;
+/// A restore reads up to 64 Rapid segments at once; one HTTP/2 connection carried ~140 MB/s.
+const RESTORE_GRPC_SUBCHANNELS: usize = 8;
+/// Large transfers at once for a restore's client; a host's stays at two to bound its memory.
+const RESTORE_TRANSFERS: usize = 8;
 
 impl GcsClients {
     async fn transfer(&self, length: u64) -> Result<Option<tokio::sync::SemaphorePermit<'_>>> {
@@ -179,6 +194,32 @@ impl GcsClients {
 impl Bucket for GcsBucket {
     async fn get(&self, key: &str) -> Result<Option<BucketObject>> {
         self.read(key, None).await
+    }
+    async fn download_to(&self, key: &str, path: &std::path::Path) -> Result<Option<u64>> {
+        let Some(response) = self.open(key, None).await? else {
+            return Ok(None);
+        };
+        let length = response.object().size as u64;
+        let _transfer = self.clients.transfer(length).await?;
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+            let file = std::fs::File::create_new(path)?;
+            file.set_len(length)?;
+            Ok(file)
+        })
+        .await??;
+        let crc32c = response.object().checksums.and_then(|c| c.crc32c);
+        let generation = response.object().generation;
+        self.download_parts(
+            key,
+            generation,
+            (0, length),
+            crc32c,
+            response,
+            Arc::new(file),
+        )
+        .await?;
+        Ok(Some(length))
     }
     async fn range(&self, key: &str, start: u64, length: u64) -> Result<Option<BucketObject>> {
         let result = self.read(key, Some((start, length))).await?;
@@ -281,27 +322,61 @@ impl CredentialsProvider for PendingCredentials {
     }
 }
 
+/// Credentials that send one access token a host forwarded, for the node to act with its scope.
+#[derive(Debug)]
+struct ForwardedToken(String);
+
+pub(crate) fn forwarded_token(access_token: String) -> Credentials {
+    ForwardedToken(access_token).into()
+}
+
+impl CredentialsProvider for ForwardedToken {
+    async fn headers(
+        &self,
+        _: axum::http::Extensions,
+    ) -> std::result::Result<
+        CacheableResource<axum::http::HeaderMap>,
+        google_cloud_auth::errors::CredentialsError,
+    > {
+        bearer(&self.0)
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        Some("googleapis.com".into())
+    }
+}
+
+/// The headers that authorize requests with `access_token`.
+pub(crate) fn bearer(
+    access_token: &str,
+) -> std::result::Result<
+    CacheableResource<axum::http::HeaderMap>,
+    google_cloud_auth::errors::CredentialsError,
+> {
+    let mut value: axum::http::HeaderValue =
+        format!("Bearer {access_token}").parse().map_err(|_| {
+            google_cloud_auth::errors::CredentialsError::from_msg(
+                false,
+                "invalid storage credential",
+            )
+        })?;
+    value.set_sensitive(true);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::AUTHORIZATION, value);
+    Ok(CacheableResource::New {
+        entity_tag: EntityTag::new(),
+        data: headers,
+    })
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/bucket/gcs.rs"]
 mod tests;
 
 impl GcsBucket {
     async fn read(&self, key: &str, range: Option<(u64, u64)>) -> Result<Option<BucketObject>> {
-        let mut request = self.clients.storage.read_object(&self.bucket, key);
-        if let Some((start, length)) = range {
-            request = request.set_read_range(ReadRange::segment(start, length));
-        }
-        let mut response = match request.send().await {
-            Ok(response) => response,
-            Err(error)
-                if error.http_status_code() == Some(404)
-                    || error
-                        .status()
-                        .is_some_and(|status| status.code.name() == "NOT_FOUND") =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
+        let Some(mut response) = self.open(key, range).await? else {
+            return Ok(None);
         };
         let (start, length) = range.unwrap_or((0, response.object().size as u64));
         let _transfer = self.clients.transfer(length).await?;
@@ -312,8 +387,23 @@ impl GcsBucket {
                 .is_none()
                 .then(|| response.object().checksums.and_then(|c| c.crc32c))
                 .flatten();
-            self.download_parts(key, generation, (start, length), crc32c, response)
-                .await?
+            let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                let file = tempfile::tempfile()?;
+                file.set_len(length)?;
+                Ok(file)
+            })
+            .await??;
+            let file = Arc::new(file);
+            self.download_parts(
+                key,
+                generation,
+                (start, length),
+                crc32c,
+                response,
+                file.clone(),
+            )
+            .await?;
+            crate::payload::Payload::from_file(file, usize::try_from(length)?)
         } else {
             let mut download = crate::payload::Download::new();
             while let Some(chunk) = response.next().await {
@@ -324,8 +414,31 @@ impl GcsBucket {
         Ok(Some(BucketObject { generation, bytes }))
     }
 
-    /// Streams the first part from the response already open and the rest as concurrent ranges
-    /// of the same generation, each written at its offset in one temporary file.
+    async fn open(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<Option<ReadObjectResponse>> {
+        let mut request = self.clients.storage.read_object(&self.bucket, key);
+        if let Some((start, length)) = range {
+            request = request.set_read_range(ReadRange::segment(start, length));
+        }
+        match request.send().await {
+            Ok(response) => Ok(Some(response)),
+            Err(error)
+                if error.http_status_code() == Some(404)
+                    || error
+                        .status()
+                        .is_some_and(|status| status.code.name() == "NOT_FOUND") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Streams the first part from the response already open and, for a large object, the rest
+    /// as concurrent ranges of the same generation, each written at its offset in `file`.
     async fn download_parts(
         &self,
         key: &str,
@@ -333,42 +446,53 @@ impl GcsBucket {
         (start, length): (u64, u64),
         crc32c: Option<u32>,
         first: ReadObjectResponse,
-    ) -> Result<crate::payload::Payload> {
-        let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-            let file = tempfile::tempfile()?;
-            file.set_len(length)?;
-            Ok(file)
-        })
-        .await??;
-        let file = Arc::new(file);
-        let parts = download_parts(length);
+        file: Arc<std::fs::File>,
+    ) -> Result<()> {
+        let parts = if length >= PARALLEL_DOWNLOAD_BYTES {
+            download_parts(length)
+        } else {
+            vec![(0, length)]
+        };
+        // A task per range: on one task the ranges took turns receiving and writing, at half the
+        // speed of the node's disks.
+        let check = crc32c.is_some();
         let (offset, size) = parts[0];
-        let mut downloads = vec![write_part(file.clone(), offset, size, first).boxed()];
+        let mut downloads = vec![AbortOnDropHandle::new(tokio::spawn(write_part(
+            file.clone(),
+            offset,
+            size,
+            first,
+            check,
+        )))];
         for &(offset, size) in &parts[1..] {
-            let file = file.clone();
-            downloads.push(
-                async move {
-                    let response = self
-                        .clients
-                        .storage
-                        .read_object(&self.bucket, key)
-                        .set_generation(generation)
-                        .set_read_range(ReadRange::segment(start + offset, size))
-                        .send()
-                        .await?;
-                    write_part(file, offset, size, response).await
-                }
-                .boxed(),
+            let (storage, bucket, key, file) = (
+                self.clients.storage.clone(),
+                self.bucket.clone(),
+                key.to_owned(),
+                file.clone(),
             );
+            downloads.push(AbortOnDropHandle::new(tokio::spawn(async move {
+                let response = storage
+                    .read_object(&bucket, &key)
+                    .set_generation(generation)
+                    .set_read_range(ReadRange::segment(start + offset, size))
+                    .send()
+                    .await?;
+                write_part(file, offset, size, response, check).await
+            })));
         }
-        futures_util::future::try_join_all(downloads).await?;
+        let mut checksums = Vec::with_capacity(downloads.len());
+        for download in downloads {
+            checksums.push(download.await??);
+        }
         if let Some(expected) = crc32c {
-            verify_crc32c(file.clone(), length, expected).await?;
+            let mut crc = 0;
+            for ((_, size), part) in parts.into_iter().zip(checksums) {
+                crc = crc32c::crc32c_combine(crc, part, usize::try_from(size)?);
+            }
+            anyhow::ensure!(crc == expected, "parallel download failed its CRC32C check");
         }
-        Ok(crate::payload::Payload::from_file(
-            file,
-            usize::try_from(length)?,
-        ))
+        Ok(())
     }
 }
 
@@ -376,6 +500,8 @@ impl GcsBucket {
 /// reaches about 100 MiB/s.
 const PARALLEL_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const DOWNLOAD_PARTS: u64 = 8;
+/// Each range writes 4 MiB at a time, ~10% faster than 256 KiB on the node's local SSDs.
+const PART_WRITE_BYTES: usize = 4 << 20;
 
 /// Contiguous `(offset, size)` ranges that cover `length` bytes.
 fn download_parts(length: u64) -> Vec<(u64, u64)> {
@@ -386,55 +512,41 @@ fn download_parts(length: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
-async fn write_part(
+pub(super) async fn write_part(
     file: Arc<std::fs::File>,
     offset: u64,
     size: u64,
     mut response: ReadObjectResponse,
-) -> Result<()> {
+    checksum: bool,
+) -> Result<u32> {
+    let mut crc = 0;
     let mut written = 0u64;
-    let mut buffer = Vec::with_capacity(crate::payload::IO_BUFFER_BYTES);
+    let mut buffer = Vec::with_capacity(PART_WRITE_BYTES);
     while written + (buffer.len() as u64) < size {
         let Some(chunk) = response.next().await else {
             break;
         };
         let chunk = chunk?;
         let wanted = (size - written - buffer.len() as u64).min(chunk.len() as u64) as usize;
+        if checksum {
+            crc = crc32c::crc32c_append(crc, &chunk[..wanted]);
+        }
         buffer.extend_from_slice(&chunk[..wanted]);
-        if buffer.len() >= crate::payload::IO_BUFFER_BYTES {
-            written += flush_part(&file, offset + written, &mut buffer).await?;
+        if buffer.len() >= PART_WRITE_BYTES {
+            written += flush_part(&file, offset + written, &mut buffer)?;
         }
     }
-    written += flush_part(&file, offset + written, &mut buffer).await?;
+    written += flush_part(&file, offset + written, &mut buffer)?;
     anyhow::ensure!(written == size, "incomplete object part");
-    Ok(())
+    Ok(crc)
 }
 
-async fn verify_crc32c(file: Arc<std::fs::File>, length: u64, expected: u32) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::FileExt;
-        let mut buffer = vec![0; crate::payload::IO_BUFFER_BYTES];
-        let (mut crc, mut offset) = (0u32, 0u64);
-        while offset < length {
-            let size = (length - offset).min(buffer.len() as u64) as usize;
-            let chunk = &mut buffer[..size];
-            file.read_exact_at(chunk, offset)?;
-            crc = crc32c::crc32c_append(crc, chunk);
-            offset += chunk.len() as u64;
-        }
-        anyhow::ensure!(crc == expected, "parallel download failed its CRC32C check");
-        Ok(())
-    })
-    .await?
-}
-
-async fn flush_part(file: &Arc<std::fs::File>, at: u64, buffer: &mut Vec<u8>) -> Result<u64> {
-    let (file, bytes) = (file.clone(), std::mem::take(buffer));
-    let length = bytes.len() as u64;
-    tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::FileExt;
-        file.write_all_at(&bytes, at)
-    })
-    .await??;
+/// Writes on the range's own task: in gVisor, handing each buffer to the blocking pool cost ~10x
+/// the CPU of the write itself.
+fn flush_part(file: &std::fs::File, at: u64, buffer: &mut Vec<u8>) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buffer, at)?;
+    let length = buffer.len() as u64;
+    buffer.clear();
     Ok(length)
 }

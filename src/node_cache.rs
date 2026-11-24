@@ -3,13 +3,16 @@ use std::{future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Durat
 use anyhow::{Context, Result, ensure};
 use tokio::net::TcpListener;
 
+mod bases;
 mod client;
 mod keys;
+mod restores;
 mod server;
 mod slots;
 mod store;
 
 pub(crate) use client::{NodeCacheClient, NodeCacheConnection};
+pub(crate) use restores::{SlotRestored, SlotStorage};
 pub(crate) use slots::SlotFile;
 
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
@@ -30,18 +33,30 @@ pub async fn serve_node_cache(shutdown: impl Future<Output = ()> + Send + 'stati
         )
         .await?,
     );
+    // One client for the node's own base uploads and prepared downloads, with a transfer for each.
+    let bucket = match &config.base_bucket {
+        Some(name) => Some(Arc::new(
+            crate::bucket::GcsBucket::for_restore(
+                name,
+                google_cloud_auth::credentials::Builder::default().build()?,
+            )
+            .await?,
+        ) as Arc<dyn crate::bucket::Bucket>),
+        None => None,
+    };
     let slots = Arc::new(
         slots::SqliteSlots::open(
             config.directory,
             config.pods_directory.map(slots::SlotLayout::Kubelet),
             store.clone(),
+            bases::BaseUploads::new(bucket.clone(), store.staging().join("bases")),
         )
         .await?,
     );
     let tokens = keys::HostTokens::load(config.verifier);
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "node cache is ready");
-    axum::serve(listener, server::router(store, slots, tokens))
+    axum::serve(listener, server::router(store, slots, tokens, bucket))
         .with_graceful_shutdown(shutdown)
         .await
         .context("serve node cache")
@@ -59,11 +74,14 @@ pub(crate) async fn local_router(
             .await?,
     );
     let layout = Some(slots::SlotLayout::Hosts(slots));
-    let slots = Arc::new(slots::SqliteSlots::open(directory, layout, store.clone()).await?);
+    let uploads = bases::BaseUploads::new(None, store.staging().join("bases"));
+    let slots =
+        Arc::new(slots::SqliteSlots::open(directory, layout, store.clone(), uploads).await?);
     Ok(server::router(
         store,
         slots,
         keys::HostTokens::fixed(verifier),
+        None,
     ))
 }
 
@@ -75,6 +93,8 @@ struct NodeCacheConfig {
     capacity_bytes: u64,
     max_entries: u64,
     verifier: keys::VerifierConfig,
+    /// The archive bucket parked databases are uploaded to as bases; none means no uploads.
+    base_bucket: Option<String>,
 }
 
 impl NodeCacheConfig {
@@ -105,6 +125,8 @@ impl NodeCacheConfig {
                 .unwrap_or_else(|| "/cache".into())
                 .into(),
             pods_directory: get("DURABLE_ACTORS_NODE_CACHE_PODS_DIR").map(PathBuf::from),
+            base_bucket: get("DURABLE_ACTORS_NODE_CACHE_BASE_BUCKET")
+                .filter(|name| !name.is_empty()),
             capacity_bytes,
             max_entries,
             verifier: keys::VerifierConfig {

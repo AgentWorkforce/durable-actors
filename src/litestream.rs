@@ -12,7 +12,7 @@ use terse_litestream::{
 
 use storage::LtxFile;
 
-pub(crate) mod compaction;
+pub(crate) mod apply;
 pub(crate) mod storage;
 
 /// How often a database whose store has no checkpoints of its own writes a full copy, which
@@ -88,8 +88,18 @@ impl DatabaseRestore for EmbeddedRestore {
         ensure!(txid > 0, "cannot restore an empty SQLite position");
         let (files, path) = (files.to_vec(), path.to_owned());
         tokio::task::spawn_blocking(move || {
-            let replica = MemoryReplica::decode(&files)?;
-            terse_litestream::restore_with(&replica, path, Some(txid), Durability::Scratch)?;
+            if !apply::supported(&files)? {
+                let replica = MemoryReplica::decode(&files)?;
+                terse_litestream::restore_with(&replica, path, Some(txid), Durability::Scratch)?;
+                return Ok(());
+            }
+            ensure!(!path.exists(), "restore output already exists");
+            let partial = path.with_extension("restoring");
+            if partial.exists() {
+                std::fs::remove_file(&partial)?;
+            }
+            apply::apply(&partial, None, &files, txid)?;
+            std::fs::rename(&partial, &path)?;
             anyhow::Ok(())
         })
         .await?

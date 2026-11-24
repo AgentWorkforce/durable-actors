@@ -5,9 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use google_cloud_auth::credentials::{
-    CacheableResource, Credentials, CredentialsProvider, EntityTag,
-};
+use google_cloud_auth::credentials::{CacheableResource, Credentials, CredentialsProvider};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -39,8 +37,11 @@ pub(crate) struct HostStorage {
     new_actor: bool,
     owner_hint: Option<crate::bucket::OwnershipHint>,
     node_cache: Option<NodeCacheClient>,
+    /// What the node needs to restore this Rapid actor's database with the host's scope.
+    forwarding: Option<SlotForwarding>,
     activation: Mutex<Option<ActorActivation>>,
-    checkpoint: Mutex<Option<crate::bucket::recovery::PrefetchedCheckpoint>>,
+    /// Whether sealing found a new base due, for the park that follows.
+    base_due: std::sync::atomic::AtomicBool,
     fence: Mutex<LeaseFence>,
     lease: Mutex<Option<HostLease>>,
     renewal: tokio::sync::Mutex<()>,
@@ -57,8 +58,16 @@ impl HostStorage {
         actor: ActorKey,
     ) -> Result<Self> {
         let credentials = HostCredentials::new(config.tokens, client.clone(), stop.clone());
+        let mut forwarding = None;
         let (runtime, objects) = match config.bucket {
             crate::bucket::access::BucketLocation::Gcs { bucket, .. } => {
+                if config.persistence.rapid_settings().is_some() {
+                    forwarding = Some(SlotForwarding {
+                        bucket: bucket.clone(),
+                        persistence: config.persistence.clone(),
+                        credentials: credentials.clone(),
+                    });
+                }
                 Self::open_gcs(
                     &bucket,
                     config.persistence,
@@ -90,8 +99,9 @@ impl HostStorage {
             new_actor: false,
             owner_hint: None,
             node_cache: None,
+            forwarding,
             activation: Mutex::new(None),
-            checkpoint: Mutex::new(None),
+            base_due: std::sync::atomic::AtomicBool::new(false),
             fence: Mutex::new(LeaseFence::default()),
             lease: Mutex::new(None),
             renewal: tokio::sync::Mutex::new(()),
@@ -217,6 +227,10 @@ impl HostStorage {
             }
         };
         let sealed = checkpoint.is_some();
+        self.base_due.store(
+            checkpoint.as_ref().is_some_and(|sealed| sealed.base_due()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let storage_ms = started.elapsed().as_secs_f64() * 1000.0;
         let release_started = Instant::now();
         self.fence.lock().unwrap().fenced = true;
@@ -246,6 +260,30 @@ impl HostStorage {
 impl ActorStorage for HostStorage {
     async fn get_alarm(&self) -> Result<Option<i64>> {
         HostStorage::get_alarm(self).await
+    }
+
+    fn base_due(&self) -> bool {
+        self.base_due.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn restored_in_slot(
+        &self,
+        snapshot: &crate::storage::VerifiedSnapshot,
+        restored: &crate::node_cache::SlotRestored,
+    ) -> Result<()> {
+        self.runtime
+            .restored_elsewhere(snapshot, restored.progress, restored.base)
+            .await
+    }
+
+    fn slot_storage(&self) -> Option<crate::node_cache::SlotStorage> {
+        let forwarding = self.forwarding.as_ref()?;
+        let tokens = forwarding.credentials.tokens.read().unwrap();
+        Some(crate::node_cache::SlotStorage {
+            bucket: forwarding.bucket.clone(),
+            persistence: forwarding.persistence.clone(),
+            access_token: tokens.as_ref()?.state.access_token.clone(),
+        })
     }
 
     async fn update_alarm(&self, timestamp_ms: Option<i64>) -> Result<()> {
@@ -327,12 +365,9 @@ impl ActorStorage for HostStorage {
     async fn read_sqlite(
         &self,
         snapshot: &crate::storage::VerifiedSnapshot,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
+    ) -> Result<crate::bucket::RestoredSqlite> {
         self.ensure_authority()?;
-        let checkpoint = self.checkpoint.lock().unwrap().take();
-        self.runtime
-            .read_sqlite_prefetched(snapshot.clone(), checkpoint)
-            .await
+        self.runtime.read_sqlite(snapshot.clone(), None).await
     }
 
     async fn prepare_state_write(&self, epoch: u64, version: u64) -> Result<WritePlan> {
@@ -409,7 +444,6 @@ impl HostStorage {
                 &cached,
             )
             .await?;
-        *self.checkpoint.lock().unwrap() = loaded.checkpoint;
         *self.activation.lock().unwrap() = Some(ActorActivation {
             owner_epoch: loaded.placement.owner_epoch,
             state_version: loaded.placement.state_version,
@@ -431,6 +465,12 @@ impl HostStorage {
             }
         }
     }
+}
+
+struct SlotForwarding {
+    bucket: String,
+    persistence: crate::bucket::SnapshotStoreConfig,
+    credentials: HostCredentials,
 }
 
 #[derive(Clone)]
@@ -508,21 +548,7 @@ impl CredentialsProvider for HostCredentials {
         let token = stored.as_ref().map(self.scope).ok_or_else(|| {
             google_cloud_auth::errors::CredentialsError::from_msg(false, "GCS credentials missing")
         })?;
-        let mut headers = axum::http::HeaderMap::new();
-        let mut value: axum::http::HeaderValue = format!("Bearer {}", token.access_token)
-            .parse()
-            .map_err(|_| {
-            google_cloud_auth::errors::CredentialsError::from_msg(
-                false,
-                "invalid storage credential",
-            )
-        })?;
-        value.set_sensitive(true);
-        headers.insert(axum::http::header::AUTHORIZATION, value);
-        Ok(CacheableResource::New {
-            entity_tag: EntityTag::new(),
-            data: headers,
-        })
+        crate::bucket::bearer_headers(&token.access_token)
     }
     async fn universe_domain(&self) -> Option<String> {
         Some("googleapis.com".into())

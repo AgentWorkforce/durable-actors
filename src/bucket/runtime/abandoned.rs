@@ -5,7 +5,6 @@ use super::*;
 
 /// Long enough that an actor with traffic is reactivated, and recovered, by its next host first.
 const ABANDONED_AFTER_MS: u64 = 10 * 60 * 1000;
-/// Well inside the Rapid lifecycle rule's 7 days, so every log reaches Standard before deletion.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CONCURRENT_RECORDS: usize = 16;
 

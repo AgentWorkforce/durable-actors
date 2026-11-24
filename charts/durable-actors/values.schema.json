@@ -322,7 +322,17 @@
           }
         },
         "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+        "googleServiceAccount": {"type": "string"},
         "resources": {"type": "object"}
+      }
+    },
+    "historySweeper": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minAgeHours": {"type": "integer", "minimum": 1},
+        "intervalSeconds": {"type": "integer", "minimum": 60},
+        "dryRun": {"type": "boolean"}
       }
     },
     "redis": {

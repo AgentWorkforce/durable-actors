@@ -1632,15 +1632,19 @@ impl ActorStorage for FakeAuthority {
     async fn read_sqlite(
         &self,
         snapshot: &crate::storage::VerifiedSnapshot,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
+    ) -> Result<crate::bucket::RestoredSqlite> {
         self.sqlite_reads.fetch_add(1, Ordering::SeqCst);
-        Ok(crate::bucket::recovery::resolve(
+        let resolved = crate::bucket::recovery::resolve(
             &mut FakeHistory(&self.history),
             snapshot.clone(),
             None,
         )
-        .await?
-        .sqlite)
+        .await?;
+        Ok(crate::bucket::RestoredSqlite {
+            sqlite: resolved.sqlite,
+            progress: resolved.progress,
+            base: None,
+        })
     }
     async fn prepare_state_write(
         &self,

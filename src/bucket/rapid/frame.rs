@@ -1,5 +1,6 @@
 use super::*;
 use aws_lc_rs::digest::{Context as Digest, SHA256};
+#[cfg(test)]
 use std::io::Write;
 
 pub(super) const HEADER: usize = 48;
@@ -32,6 +33,7 @@ impl Record {
         })
     }
 
+    #[cfg(test)]
     pub fn write_to(&self, writer: &mut impl Write) -> Result<()> {
         self.clone().frame()?.write_to(writer)
     }
@@ -42,6 +44,7 @@ impl Frame {
         self.header.len() + self.state.len()
     }
 
+    #[cfg(test)]
     pub fn write_to(&self, writer: &mut impl Write) -> Result<()> {
         writer.write_all(&self.header)?;
         self.state.write_to(writer)?;

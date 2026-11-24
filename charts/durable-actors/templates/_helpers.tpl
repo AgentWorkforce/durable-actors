@@ -39,6 +39,9 @@
 {{- if ne .Values.analytics.backend "clickhouse" }}{{ fail "telemetry.collector requires analytics.backend=clickhouse" }}{{ end -}}
 {{- if not .Values.redis.urlSecretKey }}{{ fail "telemetry.collector requires redis.urlSecretKey for live updates" }}{{ end -}}
 {{- end -}}
+{{- if and (eq .Values.storage.mode "rapid") (not (and .Values.nodeCache.enabled .Values.nodeCache.sqliteSlots.enabled)) -}}
+{{ fail "storage.mode=rapid requires nodeCache.enabled and nodeCache.sqliteSlots.enabled: the node cache restores Rapid databases" }}
+{{- end -}}
 {{- if and .Values.telemetry.nodeCollector.enabled (not (and .Values.telemetry.collector.enabled .Values.telemetry.collector.platform.issuer)) -}}
 {{ fail "telemetry.nodeCollector requires telemetry.collector with platform.issuer" }}
 {{- end -}}

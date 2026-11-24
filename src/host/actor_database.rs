@@ -6,7 +6,6 @@ use crate::{
     },
     litestream::Replicator,
     request_tracking::{RequestStage, RequestTracker},
-    state_log::SqliteSnapshot,
     storage::{VerifiedSnapshot, WritePlan},
 };
 use anyhow::{Context, Result, ensure};
@@ -29,7 +28,10 @@ use session::DatabaseSession;
 pub(crate) trait ActorStorage: Send + Sync {
     async fn acquire_actor(&self) -> Result<ActorActivation>;
     async fn load_actor_state(&self, epoch: u64) -> Result<(u64, Option<VerifiedSnapshot>)>;
-    async fn read_sqlite(&self, snapshot: &VerifiedSnapshot) -> Result<SqliteSnapshot>;
+    async fn read_sqlite(
+        &self,
+        snapshot: &VerifiedSnapshot,
+    ) -> Result<crate::bucket::RestoredSqlite>;
     async fn get_alarm(&self) -> Result<Option<i64>>;
     async fn update_alarm(&self, timestamp_ms: Option<i64>) -> Result<()>;
     fn ensure_authority(&self) -> Result<()>;
@@ -49,6 +51,23 @@ pub(crate) trait ActorStorage: Send + Sync {
         _head: &crate::storage::SnapshotRef,
     ) -> Result<Option<crate::storage::SnapshotRef>> {
         Ok(None)
+    }
+    /// Whether sealing this activation found a new base due.
+    fn base_due(&self) -> bool {
+        false
+    }
+    /// What the node file service needs to restore this actor's database, for a store whose
+    /// databases the node restores.
+    fn slot_storage(&self) -> Option<crate::node_cache::SlotStorage> {
+        None
+    }
+    /// Records what the node's restore found, which decides when this session's base is due.
+    async fn restored_in_slot(
+        &self,
+        _snapshot: &VerifiedSnapshot,
+        _restored: &crate::node_cache::SlotRestored,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 

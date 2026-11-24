@@ -1,5 +1,5 @@
 use super::{DatabaseRestore, Replicator};
-use crate::payload::Payload;
+use crate::{bucket::SqliteBase, payload::Payload};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -135,7 +135,14 @@ impl SqliteCapture {
         full_snapshots: Option<Duration>,
         resume: bool,
     ) -> Result<Self> {
-        restore_database(replication.as_ref(), directory.database(), files, txid).await?;
+        restore_database(
+            replication.as_ref(),
+            directory.database(),
+            None,
+            files,
+            txid,
+        )
+        .await?;
         Self::open(
             replication,
             directory,
@@ -163,8 +170,9 @@ impl SqliteCapture {
     }
 
     /// Stops capture and leaves the committed database alone in its directory, synced, with its
-    /// WAL folded in, so another host can reopen it.
-    pub(crate) async fn close(mut self) -> Result<()> {
+    /// WAL folded in, so another host can reopen it. A temporary directory lasts as long as the
+    /// returned value.
+    pub(crate) async fn close(mut self) -> Result<CaptureDirectory> {
         let path = self.path();
         self.registered = false;
         self.replication.unregister(&path).await?;
@@ -173,7 +181,7 @@ impl SqliteCapture {
             fold_wal(&path)?;
             std::fs::File::open(&path)?.sync_all()?;
             std::fs::File::open(directory.database())?.sync_all()?;
-            anyhow::Ok(())
+            anyhow::Ok(directory)
         })
         .await?
     }
@@ -399,12 +407,13 @@ fn range(name: &str) -> Option<(u64, u64)> {
 }
 
 pub(crate) async fn restored_fields(
+    directory: tempfile::TempDir,
     restore: &dyn DatabaseRestore,
+    base: Option<&SqliteBase>,
     files: &[LtxFile],
     txid: u64,
 ) -> Result<serde_json::Value> {
-    let directory = tempfile::tempdir()?;
-    restore_database(restore, directory.path(), files, txid).await?;
+    restore_database(restore, directory.path(), base, files, txid).await?;
     tokio::task::spawn_blocking(move || {
         let db = rusqlite::Connection::open(directory.path().join("actor.sqlite"))?;
         read_fields(&db)
@@ -412,15 +421,61 @@ pub(crate) async fn restored_fields(
     .await?
 }
 
-async fn restore_database(
+pub(crate) async fn restore_database(
     restore: &dyn DatabaseRestore,
     directory: &Path,
+    base: Option<&SqliteBase>,
     files: &[LtxFile],
     txid: u64,
 ) -> Result<()> {
-    restore
-        .restore(files, &directory.join("actor.sqlite"), txid)
-        .await
+    let path = directory.join("actor.sqlite");
+    match base {
+        Some(base) => restore_onto_base(base, files, restoring(directory), &path, txid).await,
+        None => restore.restore(files, &path, txid).await,
+    }
+}
+
+/// Where a restore builds the database in `directory` before moving it into place.
+pub(crate) fn restoring(directory: &Path) -> PathBuf {
+    directory.join("actor.restoring")
+}
+
+/// Downloads `base` to `partial`, unless the history read already did, applies `files` to it
+/// and moves it to `path`.
+async fn restore_onto_base(
+    base: &SqliteBase,
+    files: &[LtxFile],
+    partial: PathBuf,
+    path: &Path,
+    txid: u64,
+) -> Result<()> {
+    ensure!(!path.exists(), "restore output already exists");
+    let started = std::time::Instant::now();
+    if base.downloaded.as_deref() != Some(partial.as_path()) {
+        if tokio::fs::try_exists(&partial).await? {
+            tokio::fs::remove_file(&partial).await?;
+        }
+        base.download_to(&partial).await?;
+    }
+    let download_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (files, path, base_txid) = (files.to_vec(), path.to_owned(), base.name.txid);
+    let applied = tokio::task::spawn_blocking(move || {
+        let applied = super::apply::apply(&partial, Some(base_txid), &files, txid)?;
+        std::fs::rename(&partial, &path)?;
+        anyhow::Ok(applied)
+    })
+    .await??;
+    tracing::info!(
+        event = "sqlite_base_restored",
+        base = %base.key,
+        base_bytes = base.name.bytes,
+        files = applied.files,
+        pages = applied.pages,
+        page_bytes = applied.bytes,
+        download_ms,
+        apply_ms = started.elapsed().as_secs_f64() * 1000.0 - download_ms
+    );
+    Ok(())
 }
 
 pub(crate) fn read_fields(db: &rusqlite::Connection) -> Result<serde_json::Value> {

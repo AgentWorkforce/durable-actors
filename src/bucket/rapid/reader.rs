@@ -1,5 +1,6 @@
 use super::*;
 use futures_util::{StreamExt, TryStreamExt, stream};
+use std::collections::BTreeSet;
 
 impl LogStorage {
     pub async fn latest(&self, prefix: &str, fence: bool) -> Result<Option<(String, Payload)>> {
@@ -17,29 +18,16 @@ impl LogStorage {
     pub async fn records(&self, prefix: &str, fence: bool) -> Result<BTreeMap<String, Payload>> {
         let started = std::time::Instant::now();
         let physical = super::super::rapid::object_name(prefix)?;
-        let keys: Vec<_> = self
-            .archive
-            .list(&physical)
-            .await?
-            .into_iter()
-            .filter(|key| key.ends_with(".manifest"))
-            .collect();
-        let manifests = keys.len();
-        let mut segments = stream::iter(keys)
-            .map(|key| async move { self.read_manifest(&key, prefix, fence).await })
-            .buffered(1);
+        let listed: BTreeSet<String> = self.archive.list(&physical).await?.into_iter().collect();
         let mut records = BTreeMap::new();
-        while let Some((manifest, segment)) = segments.try_next().await? {
-            for record in segment {
-                let object = manifest.stream.object(record.version);
-                let reference = manifest.stream.snapshot(&record.state)?;
-                ensure!(
-                    reference.object == object && record.version >= manifest.first_version,
-                    "log record identity mismatch"
-                );
-                insert(&mut records, object, record.state)?;
-            }
-        }
+        let manifests = self
+            .read_segments(
+                &[(prefix.to_owned(), &listed)],
+                fence,
+                &|_, _| false,
+                &mut |object, state| insert(&mut records, object, state),
+            )
+            .await?;
         tracing::info!(
             event = "rapid_history_scanned",
             prefix,
@@ -50,11 +38,118 @@ impl LogStorage {
         Ok(records)
     }
 
+    /// Every key the archive holds under an epoch's `prefix`: its manifests, markers, batches and
+    /// indexes. A failed listing leaves the epoch to be read on demand.
+    pub async fn epoch_keys(&self, prefix: &str) -> Arc<BTreeSet<String>> {
+        let listed = match object_name(prefix) {
+            Ok(physical) => self.archive.list(&physical).await,
+            Err(error) => Err(error),
+        };
+        Arc::new(listed.map_or_else(
+            |error| {
+                tracing::warn!(event = "rapid_epoch_listing_failed", prefix, %error);
+                BTreeSet::new()
+            },
+            |keys| keys.into_iter().collect(),
+        ))
+    }
+
+    /// Reads, at once, the log segments of the given epochs, and keeps their records above
+    /// `first` through `head`, so a restore walks that history in memory.
+    pub async fn prefetch_segments(
+        &self,
+        epochs: &[(String, Arc<BTreeSet<String>>)],
+        first: u64,
+        head: u64,
+    ) -> index::Prefetched {
+        let started = std::time::Instant::now();
+        let epochs: Vec<_> = epochs
+            .iter()
+            .map(|(prefix, listed)| (format!("{prefix}/"), listed.as_ref()))
+            .collect();
+        let mut records = BTreeMap::new();
+        // Live segments read as bounded ranges, and archived ones through their indexes.
+        let live = self.live_manifests();
+        let skip =
+            |listed: &BTreeSet<String>, key: &str| live.contains(key) || archived(listed, key);
+        let read = self
+            .read_segments(&epochs, false, &skip, &mut |object, state| {
+                if super::super::snapshots::version(&object)
+                    .is_some_and(|version| version > first && version <= head)
+                {
+                    records.insert(object, state);
+                }
+                Ok(())
+            })
+            .await;
+        let segments = match read {
+            Ok(segments) => segments,
+            Err(error) => {
+                tracing::warn!(event = "rapid_segment_prefetch_failed", %error);
+                return index::Prefetched::default();
+            }
+        };
+        tracing::info!(
+            event = "rapid_segment_prefetch",
+            epochs = epochs.len(),
+            segments,
+            records = records.len(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0
+        );
+        index::Prefetched {
+            records,
+            batches: segments,
+        }
+    }
+
+    /// Reads every segment whose manifest `listed` holds and `skip` passes over,
+    /// `PREFETCH_BATCHES` at a time, and passes each checked record to `keep`. Returns how many
+    /// segments it read.
+    async fn read_segments(
+        &self,
+        epochs: &[(String, &BTreeSet<String>)],
+        fence: bool,
+        skip: &(dyn Fn(&BTreeSet<String>, &str) -> bool + Sync),
+        keep: &mut (dyn FnMut(String, Payload) -> Result<()> + Send),
+    ) -> Result<usize> {
+        let manifests: Vec<(usize, String)> = epochs
+            .iter()
+            .enumerate()
+            .flat_map(|(epoch, (_, listed))| {
+                listed
+                    .iter()
+                    .filter(|key| key.ends_with(".manifest"))
+                    .filter(|key| !skip(listed, key))
+                    .map(move |key| (epoch, key.clone()))
+            })
+            .collect();
+        let count = manifests.len();
+        let mut segments = stream::iter(manifests)
+            .map(|(epoch, key): (usize, String)| async move {
+                let (prefix, listed) = &epochs[epoch];
+                self.read_manifest(&key, prefix, fence, Some(listed)).await
+            })
+            .buffer_unordered(PREFETCH_BATCHES);
+        while let Some((manifest, segment)) = segments.try_next().await? {
+            for record in segment {
+                let object = manifest.stream.object(record.version);
+                let reference = manifest.stream.snapshot(&record.state)?;
+                ensure!(
+                    reference.object == object && record.version >= manifest.first_version,
+                    "log record identity mismatch"
+                );
+                keep(object, record.state)?;
+            }
+        }
+        Ok(count)
+    }
+
     async fn read_manifest(
         &self,
         key: &str,
         prefix: &str,
         fence: bool,
+        listed: Option<&BTreeSet<String>>,
     ) -> Result<(Manifest, Vec<Record>)> {
         let stored = self
             .archive
@@ -63,11 +158,23 @@ impl LogStorage {
             .context("log manifest disappeared")?;
         let manifest: Manifest = serde_json::from_reader(stored.bytes.reader())?;
         manifest.validate(key, prefix, &self.zones)?;
-        let records = self.read_segment(&manifest, fence).await?;
+        let records = self.read_segment(&manifest, fence, listed).await?;
         Ok((manifest, records))
     }
 
-    async fn read_segment(&self, manifest: &Manifest, fence: bool) -> Result<Vec<Record>> {
+    /// A segment's records from its Rapid replicas, merged with any archived copy. `listed`, the
+    /// keys around it, spares the archive lookups when it shows the segment was never archived.
+    async fn read_segment(
+        &self,
+        manifest: &Manifest,
+        fence: bool,
+        listed: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<Record>> {
+        if let Some(listed) = listed
+            && !archived(listed, &manifest.key()?)
+        {
+            return self.read_replicas(manifest, fence).await;
+        }
         let marker = self.archive.get(&manifest.marker("replicated")?).await?;
         let (end, archived) = self.archived(manifest).await?;
         if let Some(marker) = marker {
@@ -164,8 +271,17 @@ impl LogStorage {
         Ok((through, records))
     }
 
+    /// Fences a segment whose owner never sealed it, so its writer can append nothing more, and
+    /// checks that it reads.
     pub async fn recover_segment(&self, manifest: &Manifest) -> Result<()> {
-        let records = self.read_segment(manifest, true).await?;
+        self.read_segment(manifest, true, None).await?;
+        Ok(())
+    }
+
+    /// Archives a segment as hosts did before bases, so tests can build legacy history.
+    #[cfg(test)]
+    pub async fn archive_segment(&self, manifest: &Manifest) -> Result<()> {
+        let records = self.read_segment(manifest, true, None).await?;
         if self
             .archive
             .get(&manifest.marker("replicated")?)
@@ -257,4 +373,17 @@ fn insert(records: &mut BTreeMap<String, Payload>, key: String, bytes: Payload) 
     );
     records.insert(key, bytes);
     Ok(())
+}
+
+/// Whether the archive holds any of the segment `manifest` names: its marker or a batch.
+fn archived(listed: &BTreeSet<String>, manifest: &str) -> bool {
+    let Some(stem) = manifest.strip_suffix(".manifest") else {
+        return true;
+    };
+    let batches = format!("{stem}~");
+    listed.contains(&format!("{stem}.replicated"))
+        || listed
+            .range(batches.clone()..)
+            .next()
+            .is_some_and(|key| key.starts_with(&batches))
 }

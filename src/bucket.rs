@@ -2,11 +2,18 @@ pub(crate) mod access;
 mod file;
 mod gcs;
 mod rapid;
-pub(crate) use rapid::{RAPID_OPERATION_TIMEOUT, RapidSnapshots, transfer_timeout};
+pub(crate) use rapid::{RAPID_OPERATION_TIMEOUT, RapidSnapshots};
 pub(crate) mod recovery;
 mod snapshots;
+#[cfg(test)]
+pub(crate) use rapid::base::key as base_key;
+pub(crate) use rapid::base::{
+    BaseName, SqliteBase, newest_base_of, upload_file as upload_sqlite_base,
+};
+pub use rapid::sweep::{SweepConfig, serve as serve_history_sweeper};
+pub(crate) use recovery::RestoredSqlite;
 pub use snapshots::{ArchiveBatchConfig, RapidBucket, RapidPlacement, SnapshotStoreConfig};
-pub(crate) use snapshots::{BucketSnapshots, SnapshotStore};
+pub(crate) use snapshots::{Bases, BucketSnapshots, SnapshotStore};
 mod runtime;
 
 use anyhow::Result;
@@ -15,7 +22,7 @@ use async_trait::async_trait;
 pub use crate::payload::Payload;
 pub use file::FileBucket;
 pub use gcs::GcsBucket;
-pub(crate) use gcs::WarmStorage;
+pub(crate) use gcs::{WarmStorage, bearer as bearer_headers, forwarded_token};
 pub(crate) use runtime::{ActorStateReader, CachedBase};
 pub use runtime::{LoadedActor, OwnershipHint, RuntimeStorage, RuntimeStorageReader};
 
@@ -36,6 +43,18 @@ pub trait Bucket: Send + Sync {
         bytes: Payload,
     ) -> Result<bool>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Writes the object to a new file at `path` and returns its size, or `None` when missing.
+    async fn download_to(&self, key: &str, path: &std::path::Path) -> Result<Option<u64>> {
+        let Some(object) = self.get(key).await? else {
+            return Ok(None);
+        };
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::create_new(path)?;
+            Ok(Some(std::io::copy(&mut object.bytes.reader(), &mut file)?))
+        })
+        .await?
+    }
 }
 
 pub(crate) async fn replace(

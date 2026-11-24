@@ -13,6 +13,7 @@ pub mod node_cache;
 mod payload;
 pub mod placement;
 mod postgres;
+mod process_usage;
 mod redis_client;
 pub mod sandbox;
 pub mod state_log;

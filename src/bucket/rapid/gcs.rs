@@ -71,15 +71,7 @@ impl RapidSnapshots {
                 }) as Arc<dyn LogZone>
             })
             .collect();
-        let store = Self::new(
-            archive,
-            snapshots,
-            zones,
-            *placement,
-            *archive_batch,
-            Arc::new(crate::litestream::compaction::RustCompactor),
-            stop,
-        )?;
+        let store = Self::new(archive, snapshots, zones, *placement, *archive_batch, stop)?;
         if let Some(actor) = actor {
             store.prepare(actor)?;
         }
@@ -129,6 +121,67 @@ impl GcsZone {
         Ok((writer, persisted, Some(descriptor)))
     }
 }
+
+impl GcsZone {
+    /// A large segment downloads as ranges, each on its own descriptor: ranges on one descriptor
+    /// share a stream, which carried ~90 MB/s.
+    async fn download_segment(
+        &self,
+        replica: &Replica,
+        descriptor: ObjectDescriptor,
+        size: u64,
+    ) -> Result<Payload> {
+        if size < PARALLEL_SEGMENT_BYTES {
+            return download(&descriptor, 0, size).await;
+        }
+        let file = Arc::new(
+            tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                let file = tempfile::tempfile()?;
+                file.set_len(size)?;
+                Ok(file)
+            })
+            .await??,
+        );
+        let part = size.div_ceil(SEGMENT_PARTS);
+        let mut ranges = Vec::new();
+        for (index, offset) in (0..size).step_by(part as usize).enumerate() {
+            let length = part.min(size - offset);
+            let (file, descriptor) = (file.clone(), descriptor.clone());
+            let (storage, bucket, replica) = (
+                self.clients.storage.clone(),
+                self.bucket.clone(),
+                replica.clone(),
+            );
+            ranges.push(AbortOnDropHandle::new(tokio::spawn(async move {
+                let descriptor = match index {
+                    0 => descriptor,
+                    _ => {
+                        storage
+                            .open_object(&bucket, &replica.object)
+                            .set_generation(replica.generation)
+                            .send()
+                            .await?
+                    }
+                };
+                let response = descriptor
+                    .read_range(ReadRange::segment(offset, length))
+                    .await;
+                crate::bucket::gcs::write_part(file, offset, length, response, false).await
+            })));
+        }
+        for range in ranges {
+            range.await??;
+        }
+        Ok(Payload::from_file(file, usize::try_from(size)?))
+    }
+}
+
+/// Segments at least this large download as parallel ranges.
+const PARALLEL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Parallel segment downloads at once in this process, however many restores run: each holds
+/// `SEGMENT_PARTS` write buffers, so this bounds the node's memory.
+static PARALLEL_SEGMENTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+const SEGMENT_PARTS: u64 = 8;
 
 async fn download(descriptor: &ObjectDescriptor, start: u64, length: u64) -> Result<Payload> {
     let mut reader = descriptor
@@ -180,7 +233,16 @@ impl LogZone for GcsZone {
         if size == 0 {
             return Ok(Payload::default());
         }
-        let bytes = bounded_transfer(size as u64, download(&descriptor, 0, size as u64)).await?;
+        // Queued outside the transfer's deadline, which only times the download itself.
+        let _reading = match size as u64 >= PARALLEL_SEGMENT_BYTES {
+            true => Some(PARALLEL_SEGMENTS.acquire().await?),
+            false => None,
+        };
+        let bytes = bounded_transfer(
+            size as u64,
+            self.download_segment(replica, descriptor, size as u64),
+        )
+        .await?;
         ensure!(
             persisted.is_none_or(|size| size as usize == bytes.len()),
             "incomplete fenced log read"
@@ -236,10 +298,10 @@ impl LogWriter for GcsWriter {
     }
 }
 
-/// The control plane archives abandoned logs within hours, so a week leaves ample margin.
+/// Rapid holds every change no base covers yet, so only the history sweeper deletes log objects:
+/// a lifecycle rule would delete them by age, covered or not.
 pub(crate) fn validate_retention(bucket: &google_cloud_storage::model::Bucket) -> Result<()> {
     const PREFIX: &str = "durable-actors-v3-logs-";
-    const MIN_AGE_DAYS: i32 = 7;
     if let Some(lifecycle) = &bucket.lifecycle {
         for rule in &lifecycle.rule {
             if rule
@@ -258,11 +320,8 @@ pub(crate) fn validate_retention(bucket: &google_cloud_storage::model::Bucket) -
                     .iter()
                     .any(|prefix| PREFIX.starts_with(prefix) || prefix.starts_with(PREFIX));
             ensure!(
-                !covers_logs
-                    || condition
-                        .and_then(|condition| condition.age_days)
-                        .is_some_and(|age| age >= MIN_AGE_DAYS),
-                "Rapid log objects must stay at least {MIN_AGE_DAYS} days before lifecycle deletion"
+                !covers_logs,
+                "Rapid log objects must have no lifecycle delete rule; the history sweeper deletes them"
             );
         }
     }

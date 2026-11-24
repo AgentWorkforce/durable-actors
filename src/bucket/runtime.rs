@@ -97,7 +97,6 @@ pub struct LoadedActor {
     pub state: Option<VerifiedSnapshot>,
     /// The head's reference, also when `state` was not loaded.
     pub head: Option<SnapshotRef>,
-    pub(crate) checkpoint: Option<super::recovery::PrefetchedCheckpoint>,
 }
 
 #[derive(Default)]
@@ -110,6 +109,13 @@ struct UploadedSnapshots {
 pub(crate) struct SessionCheckpoint {
     snapshot: Option<SnapshotRef>,
     progress: Option<CheckpointProgress>,
+}
+
+impl SessionCheckpoint {
+    /// Whether the sealed session found a new base due.
+    pub(crate) fn base_due(&self) -> bool {
+        self.progress.is_some_and(|progress| progress.base_due)
+    }
 }
 
 impl Ownership {
@@ -170,20 +176,24 @@ impl std::ops::Deref for RuntimeStorage {
 }
 
 impl RuntimeStorageReader {
+    pub(crate) async fn restored_elsewhere(
+        &self,
+        snapshot: &VerifiedSnapshot,
+        progress: super::recovery::CheckpointProgress,
+        base: Option<super::BaseName>,
+    ) -> Result<()> {
+        self.snapshots
+            .restored_elsewhere(snapshot, progress, base)
+            .await
+    }
+
     pub(crate) async fn read_sqlite(
         &self,
         snapshot: VerifiedSnapshot,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
-        self.read_sqlite_prefetched(snapshot, None).await
-    }
-
-    pub(crate) async fn read_sqlite_prefetched(
-        &self,
-        snapshot: VerifiedSnapshot,
-        checkpoint: Option<super::recovery::PrefetchedCheckpoint>,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
+        download: Option<&std::path::Path>,
+    ) -> Result<super::recovery::RestoredSqlite> {
         self.snapshots
-            .restore_prefetched(snapshot, checkpoint)
+            .restore_sqlite(snapshot, super::Bases::Newest(None), download)
             .await
     }
 
@@ -352,7 +362,6 @@ impl RuntimeStorage {
             placement,
             state: snapshot,
             head,
-            checkpoint: None,
         }
     }
 

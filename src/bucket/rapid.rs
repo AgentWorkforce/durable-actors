@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 mod archive;
+pub(crate) mod base;
 mod checkpoint;
 mod frame;
 mod gcs;
@@ -20,6 +21,7 @@ mod prepared;
 mod reader;
 mod segment;
 mod standard;
+pub(crate) mod sweep;
 mod writer;
 
 use frame::{Frame, Record};
@@ -29,10 +31,9 @@ use tokio_util::task::AbortOnDropHandle;
 use writer::Session;
 
 const ROTATION_INTERVAL: Duration = Duration::from_secs(60);
-/// Archived batches a restore downloads at once; their bodies spool to temporary files.
+/// Archived batches or log segments a restore downloads at once; their bodies spool to
+/// temporary files.
 const PREFETCH_BATCHES: usize = 64;
-/// Keeps every Rapid object a session writes far younger than the 7-day lifecycle rule.
-const IDLE_SEGMENT_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const RAPID_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// The slowest transfer rate a bounded operation is allowed before it counts as stuck.
 const MIN_TRANSFER_BYTES_PER_SECOND: f64 = 32.0 * 1024.0 * 1024.0;
@@ -71,7 +72,6 @@ struct LogStorage {
     prepared: std::sync::Mutex<Option<Prepared>>,
     batch: super::ArchiveBatchConfig,
     live: std::sync::Mutex<BTreeMap<u64, index::LiveRecord>>,
-    compactor: Arc<dyn crate::litestream::compaction::LtxCompactor>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -105,7 +105,6 @@ impl RapidSnapshots {
         zones: Vec<Arc<dyn LogZone>>,
         placement: super::RapidPlacement,
         batch: super::ArchiveBatchConfig,
-        compactor: Arc<dyn crate::litestream::compaction::LtxCompactor>,
         stop: CancellationToken,
     ) -> Result<Self> {
         ensure!(
@@ -124,7 +123,6 @@ impl RapidSnapshots {
             prepared: std::sync::Mutex::new(None),
             batch,
             live: std::sync::Mutex::new(BTreeMap::new()),
-            compactor,
         });
         let session = Arc::new(Mutex::new(None));
         writer::start_rotation(storage.clone(), Arc::downgrade(&session), stop);
@@ -165,32 +163,25 @@ impl SnapshotStore for RapidSnapshots {
         let records = self.storage.records(&format!("{prefix}/"), false).await?;
         Ok(records.get(object).cloned())
     }
-    async fn prefetch_checkpoint(
-        &self,
-        source: &crate::storage::SnapshotRef,
-    ) -> Result<Option<super::recovery::PrefetchedCheckpoint>> {
-        let bytes = self
-            .storage
-            .snapshots
-            .get(&format!("{}.checkpoint", source.object))
-            .await?;
-        Ok(Some(super::recovery::PrefetchedCheckpoint {
-            source: source.clone(),
-            bytes,
-        }))
-    }
-    async fn restore_prefetched(
+    async fn restore_sqlite(
         &self,
         snapshot: crate::storage::VerifiedSnapshot,
-        checkpoint: Option<super::recovery::PrefetchedCheckpoint>,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
-        let restored = self.storage.restore(snapshot.clone(), checkpoint).await?;
+        bases: super::Bases,
+        download: Option<&std::path::Path>,
+    ) -> Result<super::recovery::RestoredSqlite> {
+        let restored = self
+            .storage
+            .restore(snapshot.clone(), bases, download)
+            .await?;
         if let Some(session) = self.session.lock().await.as_mut() {
-            session
-                .restored(self.storage.clone(), &snapshot, &restored)
-                .await?;
+            let base = restored.base.as_ref().map(|base| base.name);
+            session.restored(&snapshot, restored.progress, base).await?;
         }
-        Ok(restored.sqlite)
+        Ok(super::recovery::RestoredSqlite {
+            sqlite: restored.sqlite,
+            progress: restored.progress,
+            base: restored.base,
+        })
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys: std::collections::BTreeSet<_> = self
@@ -206,6 +197,17 @@ impl SnapshotStore for RapidSnapshots {
     }
     async fn latest(&self, prefix: &str) -> Result<Option<(String, Payload)>> {
         self.storage.latest(prefix, false).await
+    }
+    async fn restored_elsewhere(
+        &self,
+        snapshot: &crate::storage::VerifiedSnapshot,
+        progress: CheckpointProgress,
+        base: Option<base::BaseName>,
+    ) -> Result<()> {
+        if let Some(session) = self.session.lock().await.as_mut() {
+            session.restored(snapshot, progress, base).await?;
+        }
+        Ok(())
     }
     async fn put(&self, object: &str, bytes: Payload) -> Result<()> {
         let mut session = self.session.lock().await;

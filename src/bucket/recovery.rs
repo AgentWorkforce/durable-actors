@@ -8,11 +8,6 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub(crate) struct PrefetchedCheckpoint {
-    pub source: SnapshotRef,
-    pub bytes: Option<Payload>,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
     pub source: SnapshotRef,
@@ -27,9 +22,19 @@ pub(crate) trait SnapshotHistory: Send {
 
 pub(crate) struct ResolvedSqlite {
     pub sqlite: SqliteSnapshot,
+    /// The base `sqlite`'s files apply to; without one they start at a full copy.
+    pub base: Option<super::rapid::base::SqliteBase>,
     pub checkpoint: bool,
     pub parents: usize,
     pub progress: CheckpointProgress,
+}
+
+/// What a restore needs to rebuild a database: an optional base and the files after it.
+pub(crate) struct RestoredSqlite {
+    pub sqlite: SqliteSnapshot,
+    /// What the restored history holds since its base, for deciding when the next base is due.
+    pub progress: CheckpointProgress,
+    pub base: Option<super::rapid::base::SqliteBase>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -38,12 +43,17 @@ pub(crate) struct CheckpointProgress {
     pub base_bytes: u64,
     /// Restores count LTX payloads. Live writes count the encoded records.
     pub log_bytes: u64,
+    /// Whether the sealing owner found a new base due; never stored.
+    #[serde(skip)]
+    pub base_due: bool,
 }
 
+/// Walks `snapshot`'s SQLite history back to the first full copy it reaches: `base` when the walk
+/// meets its version and transaction, a checkpoint, or the history's first snapshot.
 pub(crate) async fn resolve(
     history: &mut dyn SnapshotHistory,
     snapshot: VerifiedSnapshot,
-    prefetched: Option<PrefetchedCheckpoint>,
+    base: Option<super::rapid::base::SqliteBase>,
 ) -> Result<ResolvedSqlite> {
     let VerifiedSnapshot {
         mut reference,
@@ -51,15 +61,20 @@ pub(crate) async fn resolve(
         ..
     } = snapshot;
     let txid = current.sqlite.txid;
-    let mut prefetched = prefetched.filter(|checkpoint| checkpoint.source == reference);
     let mut segments = Vec::new();
     let mut checkpoint = false;
+    let mut based = None;
     let mut parents = 0;
     loop {
+        if let Some(base) = base
+            .as_ref()
+            .filter(|base| base.matches(&reference, current.sqlite.txid))
+        {
+            based = Some(base.clone());
+            break;
+        }
         let checkpoint_bytes = if current.sqlite.parent.is_none() {
             None
-        } else if let Some(checkpoint) = prefetched.take() {
-            checkpoint.bytes
         } else {
             history.checkpoint(&reference.object).await?
         };
@@ -75,6 +90,15 @@ pub(crate) async fn resolve(
         let Some(parent) = current.sqlite.parent else {
             break;
         };
+        if let Some(base) = base.as_ref().filter(|base| {
+            first
+                .checked_sub(1)
+                .is_some_and(|txid| base.matches(&parent, txid))
+        }) {
+            based = Some(base.clone());
+            reference = parent;
+            break;
+        }
         let bytes = history
             .read(&parent.object)
             .await
@@ -94,15 +118,21 @@ pub(crate) async fn resolve(
     let size = |files: &Vec<crate::litestream::storage::LtxFile>| {
         files.iter().map(|file| file.data.len() as u64).sum::<u64>()
     };
-    let base_bytes = segments.last().map_or(0, size);
-    let log_bytes = segments.iter().map(size).sum::<u64>() - base_bytes;
+    let base_bytes = match &based {
+        Some(base) => base.name.bytes,
+        None => segments.last().map_or(0, size),
+    };
+    let log_bytes =
+        segments.iter().map(size).sum::<u64>() - if based.is_some() { 0 } else { base_bytes };
     Ok(ResolvedSqlite {
+        base: based,
         checkpoint,
         parents,
         progress: CheckpointProgress {
             version: reference.state_version,
             base_bytes,
             log_bytes,
+            base_due: false,
         },
         sqlite: SqliteSnapshot {
             txid,
@@ -113,6 +143,7 @@ pub(crate) async fn resolve(
 }
 
 impl Checkpoint {
+    #[cfg(test)]
     pub fn encode(&self) -> Result<Payload> {
         let mut header = self.clone();
         let files = std::mem::take(&mut header.sqlite.files);

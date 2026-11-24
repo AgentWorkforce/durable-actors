@@ -1012,7 +1012,7 @@ type SnapshotGate = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
 
 struct PausedSnapshots {
     inner: crate::bucket::BucketSnapshots,
-    gates: [Mutex<Option<SnapshotGate>>; 2],
+    gate: Mutex<Option<SnapshotGate>>,
     downloaded: tokio::sync::Semaphore,
     starts: AtomicU64,
     reject_head: AtomicBool,
@@ -1030,7 +1030,7 @@ async fn pause_snapshot(gate: &Mutex<Option<SnapshotGate>>) -> Result<()> {
 #[async_trait]
 impl crate::bucket::SnapshotStore for PausedSnapshots {
     async fn get(&self, object: &str) -> Result<Option<Payload>> {
-        pause_snapshot(&self.gates[0]).await?;
+        pause_snapshot(&self.gate).await?;
         ensure!(
             !self.reject_head.load(Ordering::SeqCst),
             "head download failed"
@@ -1038,16 +1038,6 @@ impl crate::bucket::SnapshotStore for PausedSnapshots {
         let bytes = self.inner.get(object).await?;
         self.downloaded.add_permits(1);
         Ok(bytes)
-    }
-    async fn prefetch_checkpoint(
-        &self,
-        source: &SnapshotRef,
-    ) -> Result<Option<crate::bucket::recovery::PrefetchedCheckpoint>> {
-        pause_snapshot(&self.gates[1]).await?;
-        Ok(Some(crate::bucket::recovery::PrefetchedCheckpoint {
-            source: source.clone(),
-            bytes: None,
-        }))
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.inner.list(prefix).await
@@ -1076,7 +1066,7 @@ async fn sealed_activation() -> Result<(Fixture, Arc<PausedSnapshots>, Ownership
     let mut f = Fixture::new()?;
     let snapshots = Arc::new(PausedSnapshots {
         inner: crate::bucket::BucketSnapshots(f.bucket.clone()),
-        gates: [Mutex::new(None), Mutex::new(None)],
+        gate: Mutex::new(None),
         downloaded: tokio::sync::Semaphore::new(0),
         starts: AtomicU64::new(0),
         reject_head: AtomicBool::new(false),
@@ -1121,10 +1111,10 @@ async fn sealed_activation() -> Result<(Fixture, Arc<PausedSnapshots>, Ownership
 }
 
 #[tokio::test]
-async fn sealed_activation_overlaps_ownership_head_and_checkpoint_but_waits_to_open_the_stream()
--> Result<()> {
+async fn sealed_activation_overlaps_ownership_and_head_but_waits_to_open_the_stream() -> Result<()>
+{
     let (f, snapshots, hint) = sealed_activation().await?;
-    let gates: Vec<SnapshotGate> = (0..3)
+    let gates: Vec<SnapshotGate> = (0..2)
         .map(|_| {
             (
                 Arc::new(tokio::sync::Semaphore::new(0)),
@@ -1133,8 +1123,7 @@ async fn sealed_activation_overlaps_ownership_head_and_checkpoint_but_waits_to_o
         })
         .collect();
     *f.bucket.delay_write.lock().unwrap() = Some(gates[0].clone());
-    *snapshots.gates[0].lock().unwrap() = Some(gates[1].clone());
-    *snapshots.gates[1].lock().unwrap() = Some(gates[2].clone());
+    *snapshots.gate.lock().unwrap() = Some(gates[1].clone());
     let next = request("next");
     let activated = tokio::time::timeout(Duration::from_secs(5), async {
         let control = async {

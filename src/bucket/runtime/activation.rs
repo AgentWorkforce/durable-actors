@@ -8,8 +8,6 @@ struct ActivationRecovery {
     snapshot: Option<VerifiedSnapshot>,
     /// The head, when the host already holds its database and needs no snapshot.
     head: Option<SnapshotRef>,
-    checkpoint: Option<super::super::recovery::PrefetchedCheckpoint>,
-    checkpoint_ms: Option<f64>,
     session_ms: Option<f64>,
     snapshot_ms: Option<f64>,
 }
@@ -150,13 +148,10 @@ impl RuntimeStorage {
                 stream_open_ms,
                 session_recovery_ms = recovery.session_ms,
                 snapshot_load_ms = recovery.snapshot_ms,
-                checkpoint_prefetch_ms = recovery.checkpoint_ms,
                 ownership_write_ms = ownership_cas_ms + stream_open_ms,
                 duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
             );
-            let mut loaded = self.remember(record, recovery.snapshot, recovery.head);
-            loaded.checkpoint = recovery.checkpoint;
-            return Ok(loaded);
+            return Ok(self.remember(record, recovery.snapshot, recovery.head));
         }
         anyhow::bail!("actor activation changed concurrently")
     }
@@ -319,7 +314,7 @@ impl RuntimeStorage {
             });
         }
         if record.sealed {
-            return self.recover_sealed_activation(record).await;
+            return self.load_activation_snapshot(record).await;
         }
         let started = Instant::now();
         let recovered = self
@@ -336,29 +331,6 @@ impl RuntimeStorage {
         })
     }
 
-    async fn recover_sealed_activation(&self, record: &Ownership) -> Result<ActivationRecovery> {
-        let snapshot = self.load_activation_snapshot(record);
-        let checkpoint = self.prefetch_activation_checkpoint(record);
-        tokio::pin!(snapshot, checkpoint);
-        let (mut recovery, (checkpoint, checkpoint_ms)) = tokio::select! {
-            result = &mut snapshot => {
-                let recovery = result?;
-                let needs_checkpoint = recovery
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.snapshot.sqlite.parent.is_some());
-                if !needs_checkpoint {
-                    return Ok(recovery);
-                }
-                (recovery, checkpoint.await)
-            }
-            checkpoint = &mut checkpoint => (snapshot.await?, checkpoint),
-        };
-        recovery.checkpoint = checkpoint;
-        recovery.checkpoint_ms = Some(checkpoint_ms);
-        Ok(recovery)
-    }
-
     async fn load_activation_snapshot(&self, record: &Ownership) -> Result<ActivationRecovery> {
         let started = Instant::now();
         let snapshot = self.load_latest(record, None).await?;
@@ -367,24 +339,6 @@ impl RuntimeStorage {
             snapshot_ms: Some(started.elapsed().as_secs_f64() * 1_000.0),
             ..ActivationRecovery::default()
         })
-    }
-
-    async fn prefetch_activation_checkpoint(
-        &self,
-        record: &Ownership,
-    ) -> (Option<super::super::recovery::PrefetchedCheckpoint>, f64) {
-        let started = Instant::now();
-        let checkpoint = match &record.base {
-            Some(base) => match self.snapshots.prefetch_checkpoint(base).await {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => {
-                    tracing::warn!(%error, "checkpoint prefetch deferred to SQLite recovery");
-                    None
-                }
-            },
-            None => None,
-        };
-        (checkpoint, started.elapsed().as_secs_f64() * 1_000.0)
     }
 
     fn new_lease(&self, request: &HostLeaseRequest) -> Result<HostLease> {

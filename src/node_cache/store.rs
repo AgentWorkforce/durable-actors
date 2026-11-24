@@ -12,6 +12,11 @@ pub(super) struct DiskStore {
 }
 
 impl DiskStore {
+    /// A directory for files in progress, emptied whenever the cache starts.
+    pub fn staging(&self) -> PathBuf {
+        self.root.join(STAGING)
+    }
+
     pub async fn open(root: PathBuf, capacity_bytes: u64, max_entries: u64) -> Result<Self> {
         let staging = root.join(STAGING);
         if tokio::fs::try_exists(&staging).await? {

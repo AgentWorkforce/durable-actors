@@ -1,4 +1,14 @@
 {{- if .Values.nodeCache.enabled }}
+{{- $uploads := and .Values.nodeCache.googleServiceAccount (eq .Values.storage.mode "rapid") }}
+{{- if $uploads }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "actors.nodeCacheName" . }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ .Values.nodeCache.googleServiceAccount | quote }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -12,6 +22,9 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "actors.nodeCacheName" . }}
     spec:
+      {{- if $uploads }}
+      serviceAccountName: {{ include "actors.nodeCacheName" . }}
+      {{- end }}
       automountServiceAccountToken: false
       nodeSelector:
         sandbox.gke.io/runtime: gvisor
@@ -67,6 +80,9 @@ spec:
             periodSeconds: 5
           env:
             - {name: DURABLE_ACTORS_PROCESS_ROLE, value: node_cache}
+            {{- if $uploads }}
+            - {name: DURABLE_ACTORS_NODE_CACHE_BASE_BUCKET, value: {{ .Values.storage.bucket | quote }}}
+            {{- end }}
             - {name: DURABLE_ACTORS_NODE_CACHE_CAPACITY_BYTES, value: {{ mul .Values.nodeCache.capacityGiB 1073741824 | quote }}}
             - {name: DURABLE_ACTORS_NODE_CACHE_MAX_ENTRIES, value: {{ int64 .Values.nodeCache.maxEntries | quote }}}
             - name: DURABLE_ACTORS_CONTROL_PLANE_URL
@@ -77,7 +93,10 @@ spec:
             {{- end }}
           volumeMounts:
             - {name: cache, mountPath: {{ ternary "/disk" "/cache" $slots }}}
+            - {name: tmp, mountPath: /tmp}
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: cache
           {{- if $slots }}
           hostPath: {path: {{ .Values.nodeCache.sqliteSlots.diskRoot | quote }}, type: Directory}

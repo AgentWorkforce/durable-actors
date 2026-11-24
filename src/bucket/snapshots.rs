@@ -144,25 +144,41 @@ impl SnapshotStoreConfig {
     }
 }
 
+/// The base a restore starts from, in a store that keeps bases.
+pub(crate) enum Bases {
+    /// The newest, or this one when the caller already listed it.
+    Newest(Option<super::SqliteBase>),
+    /// The newest below this version, after a restore from that base failed.
+    Below(u64),
+}
+
 #[async_trait]
 pub(crate) trait SnapshotStore: Send + Sync {
     async fn get(&self, object: &str) -> Result<Option<Payload>>;
-    async fn prefetch_checkpoint(
-        &self,
-        _source: &crate::storage::SnapshotRef,
-    ) -> Result<Option<recovery::PrefetchedCheckpoint>> {
-        Ok(None)
-    }
-    async fn restore_prefetched(
+    /// Resolves `snapshot`'s SQLite history. A store with bases starts from the one `bases` picks,
+    /// falling back to older ones and then history alone, and may download it to `download`.
+    async fn restore_sqlite(
         &self,
         snapshot: crate::storage::VerifiedSnapshot,
-        checkpoint: Option<recovery::PrefetchedCheckpoint>,
-    ) -> Result<crate::state_log::SqliteSnapshot> {
-        Ok(
-            recovery::resolve(&mut recovery::StoredHistory(self), snapshot, checkpoint)
-                .await?
-                .sqlite,
-        )
+        _bases: Bases,
+        _download: Option<&std::path::Path>,
+    ) -> Result<recovery::RestoredSqlite> {
+        let resolved =
+            recovery::resolve(&mut recovery::StoredHistory(self), snapshot, None).await?;
+        Ok(recovery::RestoredSqlite {
+            sqlite: resolved.sqlite,
+            progress: resolved.progress,
+            base: resolved.base,
+        })
+    }
+    /// Records the progress of a restore the node made for this host, as if the host had made it.
+    async fn restored_elsewhere(
+        &self,
+        _snapshot: &crate::storage::VerifiedSnapshot,
+        _progress: recovery::CheckpointProgress,
+        _base: Option<super::BaseName>,
+    ) -> Result<()> {
+        Ok(())
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn latest(&self, prefix: &str) -> Result<Option<(String, Payload)>>;

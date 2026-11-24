@@ -18,6 +18,7 @@ use tokio_util::io::ReaderStream;
 use super::{
     FILE_CHUNK_BYTES, MAX_ENTRY_BYTES,
     keys::HostTokens,
+    restores::{Restores, SlotPrepare, SlotRestore},
     slots::{SlotCheckout, SlotPark, SqliteSlots},
     store::DiskStore,
     valid_digest,
@@ -28,6 +29,7 @@ use crate::control_plane::ActorPrincipal;
 struct NodeCache {
     store: Arc<DiskStore>,
     slots: Arc<SqliteSlots>,
+    restores: Arc<Restores>,
     tokens: Arc<HostTokens>,
 }
 
@@ -35,16 +37,21 @@ pub(super) fn router(
     store: Arc<DiskStore>,
     slots: Arc<SqliteSlots>,
     tokens: Arc<HostTokens>,
+    bases: Option<Arc<dyn crate::bucket::Bucket>>,
 ) -> Router {
+    let restores = Arc::new(Restores::new(bases, store.staging().join("restores")));
     Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/code/{digest}", get(read_code).put(write_code))
         .route("/sqlite/parked/{digest}", get(is_parked))
         .route("/slot/checkout", post(check_out))
         .route("/slot/park", post(park))
+        .route("/slot/prepare", post(prepare))
+        .route("/slot/restore", post(restore))
         .with_state(NodeCache {
             store,
             slots,
+            restores,
             tokens,
         })
 }
@@ -100,6 +107,9 @@ async fn check_out(
         .await
     {
         Ok(reused) => {
+            if reused.is_some() {
+                cache.cancel_prepared(&slot).await;
+            }
             tracing::info!(
                 event = "sqlite_slot_checkout",
                 host_id = %host.host_id,
@@ -128,9 +138,16 @@ async fn park(
         Err(status) => return status.into_response(),
     };
     let started = Instant::now();
+    cache.cancel_prepared(&slot).await;
     match cache
         .slots
-        .park(&host.actor, &slot, request.snapshot, request.txid)
+        .park(
+            &host.actor,
+            &slot,
+            request.snapshot,
+            request.txid,
+            request.base,
+        )
         .await
     {
         Ok(file) => {
@@ -151,7 +168,78 @@ async fn park(
     }
 }
 
+/// Starts downloading the host's newest base into its slot while the host activates. It starts
+/// even when the node holds a parked database, which may not match the head; checkout cancels it
+/// when it reuses one.
+async fn prepare(
+    State(cache): State<NodeCache>,
+    headers: HeaderMap,
+    Json(request): Json<SlotPrepare>,
+) -> Response {
+    let (host, slot) = match cache.slot_holder(&headers) {
+        Ok(holder) => holder,
+        Err(status) => return status.into_response(),
+    };
+    match cache
+        .restores
+        .prepare(&host.actor, &slot, request.storage)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), host_id = %host.host_id, "slot prepare failed");
+            StatusCode::CONFLICT.into_response()
+        }
+    }
+}
+
+/// Writes the host's database at its verified head into its slot.
+async fn restore(
+    State(cache): State<NodeCache>,
+    headers: HeaderMap,
+    Json(request): Json<SlotRestore>,
+) -> Response {
+    let (host, slot) = match cache.slot_holder(&headers) {
+        Ok(holder) => holder,
+        Err(status) => return status.into_response(),
+    };
+    let restored = match cache.slots.slot(&slot) {
+        Ok(directory) => {
+            cache
+                .restores
+                .restore(&host.actor, &slot, &directory, request)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    match restored {
+        Ok(restored) => {
+            tracing::info!(
+                event = "sqlite_slot_restored",
+                host_id = %host.host_id,
+                txid = restored.txid,
+                source = restored.source,
+                base_bytes = restored.base_bytes,
+                open_ms = restored.open_ms,
+                head_ms = restored.head_ms,
+                wait_ms = restored.wait_ms,
+                duration_ms = restored.duration_ms
+            );
+            Json(restored).into_response()
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            tracing::warn!(error, host_id = %host.host_id, "slot restore failed");
+            (StatusCode::CONFLICT, error).into_response()
+        }
+    }
+}
+
 impl NodeCache {
+    async fn cancel_prepared(&self, slot: &str) {
+        self.restores.cancel(slot).await;
+    }
+
     fn authorize(&self, headers: &HeaderMap, digest: &str) -> Result<ActorPrincipal, StatusCode> {
         let host = self.authenticate(headers)?;
         if !valid_digest(digest) {

@@ -42,17 +42,22 @@ async fn a_host_moves_databases_only_through_the_slot_its_token_names() -> Resul
         std::fs::create_dir_all(&database)?;
         std::fs::write(database.join("actor.sqlite"), b"pages")?;
     }
+    let actor = ActorKey {
+        project_id: "default".into(),
+        actor_name: "Counter".into(),
+        actor_id: "one".into(),
+    };
     let snapshot = crate::storage::SnapshotRef {
-        object: "state/1".into(),
+        object: crate::storage::snapshot_object_name(&actor, 1, &format!("{:032x}", 1))?,
         state_version: 1,
         request_id: "request-1".into(),
         digest: sha256(b"state"),
     };
     let unslotted = cache.client(&host_token(&issuer, "one")?)?;
-    assert!(unslotted.park_slot(&snapshot, 1).await.is_err());
+    assert!(unslotted.park_slot(&snapshot, 1, false).await.is_err());
 
     let host = cache.client(&slotted_token(&issuer, "one", &mine)?)?;
-    host.park_slot(&snapshot, 1).await?;
+    host.park_slot(&snapshot, 1, false).await?;
 
     assert!(!cache.slot(&mine).join("db").exists());
     assert!(cache.slot(&other).join("db/actor.sqlite").exists());
@@ -84,10 +89,11 @@ impl NodeCache {
                 directory.path().into(),
                 Some(slots::SlotLayout::Kubelet(directory.path().join("pods"))),
                 store.clone(),
+                bases::BaseUploads::new(None, store.staging().join("bases")),
             )
             .await?,
         );
-        let routes = server::router(store, slots, tokens);
+        let routes = server::router(store, slots, tokens, None);
         Ok(Self {
             url,
             directory,

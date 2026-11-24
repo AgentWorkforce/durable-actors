@@ -326,6 +326,9 @@ async fn prepare_actor_host(
         .with_activation(assignment.new_actor, assignment.owner_hint.clone())
         .with_node_cache(node_cache.clone()),
     );
+    if !assignment.new_actor {
+        prepare_slot(storage.as_ref(), node_cache.as_ref());
+    }
     let persistence = super::persistence::ActorPersistence::new(storage.clone());
     let database = super::HostDatabase::new(
         endpoint.clone(),
@@ -698,6 +701,27 @@ fn executor_command(generic: bool, socket: &str, runtime: ActorRuntime) -> Comma
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     command
+}
+
+/// Lets the node start downloading the actor's newest base before the host takes ownership, so
+/// the download overlaps the whole activation, crash recovery included.
+fn prepare_slot(
+    storage: &super::storage::HostStorage,
+    node_cache: Option<&crate::node_cache::NodeCacheClient>,
+) {
+    use super::actor_database::ActorStorage;
+    let (Some(cache), Some(slot_storage)) = (node_cache, storage.slot_storage()) else {
+        return;
+    };
+    if cache.slot_database().is_none() {
+        return;
+    }
+    let cache = cache.clone();
+    tokio::spawn(async move {
+        if let Err(error) = cache.prepare_slot(slot_storage).await {
+            tracing::warn!(error = %format!("{error:#}"), "node slot prepare failed");
+        }
+    });
 }
 
 #[cfg(test)]

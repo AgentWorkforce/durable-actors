@@ -78,6 +78,11 @@ spec:
             - {name: DURABLE_ACTORS_ALARM_POLL_INTERVAL_MS, value: {{ $.Values.alarms.pollIntervalMs | quote }}}
             - {name: DURABLE_ACTORS_POSTGRES_MAX_CONNECTIONS, value: {{ $.Values.postgres.maxConnections | quote }}}
             - {name: DURABLE_ACTORS_ANALYTICS_BACKEND, value: {{ $.Values.analytics.backend | quote }}}
+            {{- if and (eq $workload.role "pool_manager") (eq $.Values.storage.mode "rapid") }}
+            - {name: DURABLE_ACTORS_SWEEP_MIN_AGE_HOURS, value: {{ $.Values.historySweeper.minAgeHours | quote }}}
+            - {name: DURABLE_ACTORS_SWEEP_INTERVAL_SECONDS, value: {{ $.Values.historySweeper.intervalSeconds | quote }}}
+            - {name: DURABLE_ACTORS_SWEEP_DRY_RUN, value: {{ $.Values.historySweeper.dryRun | quote }}}
+            {{- end }}
             {{- if $.Values.telemetry.collector.enabled }}
             - name: DURABLE_ACTORS_OTLP_ENDPOINT
               value: {{ printf "http://%s.%s.svc.cluster.local:4317" (include "actors.collectorName" $) $.Release.Namespace | quote }}

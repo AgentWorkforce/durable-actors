@@ -8,13 +8,21 @@ use bytes::Bytes;
 use futures_util::{TryStreamExt, stream::BoxStream};
 use reqwest::header::AUTHORIZATION;
 
-use super::slots::{SlotCheckout, SlotFile, SlotPark};
+use super::{
+    restores::{SlotPrepare, SlotRestore, SlotRestored, SlotStorage},
+    slots::{SlotCheckout, SlotFile, SlotPark},
+};
 use crate::{control_plane::HostAuthorization, storage::SnapshotRef};
 
 // With no cache pod on the node the Service drops packets instead of refusing them, so only a
 // short connect timeout keeps installs from stalling.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// A restore answers only when the database is ready, after up to several seconds of silence.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Heads up to this size go with the restore request, so the node need not read them again. As
+/// base64 they stay under the 2 MiB the node accepts in a request.
+const SENT_HEAD_BYTES: usize = 1 << 20;
 /// Activation reads code, the database and the snapshot at once, and a read that finds no idle
 /// connection pays for a new one inside gVisor.
 const WARM_CONNECTIONS: usize = 4;
@@ -26,6 +34,7 @@ const SLOT_MOUNT: &str = "/slot";
 #[derive(Clone)]
 pub(crate) struct NodeCacheConnection {
     http: reqwest::Client,
+    restores: reqwest::Client,
     url: reqwest::Url,
 }
 
@@ -51,6 +60,10 @@ impl NodeCacheConnection {
                 .connect_timeout(CONNECT_TIMEOUT)
                 .read_timeout(READ_TIMEOUT)
                 .pool_idle_timeout(None)
+                .build()?,
+            restores: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(RESTORE_TIMEOUT)
                 .build()?,
             url: reqwest::Url::parse(url).context("node cache URL is invalid")?,
         })
@@ -78,7 +91,9 @@ impl NodeCacheConnection {
             return;
         };
         futures_util::future::join_all(
-            (0..WARM_CONNECTIONS).map(|_| self.http.get(url.clone()).send()),
+            (0..WARM_CONNECTIONS)
+                .map(|_| self.http.get(url.clone()).send())
+                .chain([self.restores.get(url.clone()).send()]),
         )
         .await;
     }
@@ -145,12 +160,60 @@ impl NodeCacheClient {
 
     /// Hands the closed database in this host's slot to the node, recorded at `snapshot`, whose
     /// SQLite transaction is `txid`.
-    pub(crate) async fn park_slot(&self, snapshot: &SnapshotRef, txid: u64) -> Result<SlotFile> {
+    /// Parks the closed database; with `base`, the node also uploads it as the actor's base.
+    pub(crate) async fn park_slot(
+        &self,
+        snapshot: &SnapshotRef,
+        txid: u64,
+        base: bool,
+    ) -> Result<SlotFile> {
         let request = SlotPark {
             snapshot: snapshot.clone(),
             txid,
+            base,
         };
         self.slot_call("park", &request).await
+    }
+
+    /// Asks the node to start downloading the actor's newest base into this host's slot.
+    pub(crate) async fn prepare_slot(&self, storage: SlotStorage) -> Result<()> {
+        self.connection
+            .http
+            .post(self.connection.url.join("slot/prepare")?)
+            .header(AUTHORIZATION, self.authorization.header()?)
+            .json(&SlotPrepare { storage })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Has the node write the actor's database at `head` into this host's slot.
+    pub(crate) async fn restore_slot(
+        &self,
+        storage: SlotStorage,
+        head: &crate::storage::VerifiedSnapshot,
+    ) -> Result<SlotRestored> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let head_bytes = (head.bytes.len() <= SENT_HEAD_BYTES)
+            .then(|| head.bytes.to_bytes().map(|bytes| STANDARD.encode(bytes)))
+            .transpose()?;
+        let response = self
+            .connection
+            .restores
+            .post(self.connection.url.join("slot/restore")?)
+            .header(AUTHORIZATION, self.authorization.header()?)
+            .json(&SlotRestore {
+                storage,
+                head: head.reference.clone(),
+                head_bytes,
+            })
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            anyhow::bail!("node restore failed: {}", response.text().await?);
+        }
+        Ok(response.error_for_status()?.json().await?)
     }
 
     async fn slot_call<T: serde::de::DeserializeOwned>(

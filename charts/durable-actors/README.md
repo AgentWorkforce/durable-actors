@@ -42,7 +42,7 @@ A single controller can interrupt service during replacement; clients must recon
 
 ## Rapid writes
 
-Add one or two precreated Rapid buckets in distinct supported zones. The Standard bucket continues to store ownership, code, and permanent archives.
+Add one or two precreated Rapid buckets in distinct supported zones. The Standard bucket continues to store ownership, code, and each actor's bases: whole SQLite files the node cache uploads, with `nodeCache.googleServiceAccount`, as an actor's changes outgrow its last base. The node cache also rebuilds cold actors' databases in their slots, so Rapid requires `nodeCache.enabled` and `nodeCache.sqliteSlots.enabled`. The pool manager deletes changes a base covers after `historySweeper.minAgeHours` (720).
 
 ```yaml
 storage:
@@ -56,7 +56,7 @@ storage:
 
 Set `storage.rapid.placement: nearest` with one bucket in each of two regions to write each actor's log only in the zone that opens first from its host.
 
-Every configured copy must durably flush before a Rapid write is acknowledged. With one zone, there is no second Rapid copy if that zone is lost before archival. Mode and bucket identities are fixed for existing actor ownership records; choose Rapid before creating actors in that installation. An existing installation needs a planned data migration, not a values-only mode change.
+Every configured copy must durably flush before a Rapid write is acknowledged. With one zone, changes since an actor's last base are unavailable while that zone is down. Mode and bucket identities are fixed for existing actor ownership records; choose Rapid before creating actors in that installation. An existing installation needs a planned data migration, not a values-only mode change.
 
 ## Advanced settings
 

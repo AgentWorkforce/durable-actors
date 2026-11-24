@@ -1,4 +1,3 @@
-use super::archive::Archiver;
 use super::*;
 use futures_util::FutureExt;
 use std::sync::Weak;
@@ -11,9 +10,6 @@ pub(super) struct Session {
     segment: Option<Segment>,
     preparing: Option<Preparing>,
     next: Option<Preparing>,
-    archive: Option<Archiver>,
-    retired: Option<Archiver>,
-    retirement_error: Option<String>,
     latest: Option<(SnapshotRef, Option<Payload>)>,
     version: u64,
     /// The version the current segment opened after; equal to `version` while it holds no frames.
@@ -42,9 +38,6 @@ impl Session {
             preparing: Some(preparing),
             segment: None,
             next: None,
-            archive: None,
-            retired: None,
-            retirement_error: None,
             latest: resume.map(|(head, _)| (head.clone(), None)),
             version,
             installed_at: version,
@@ -88,10 +81,7 @@ impl Session {
         self.rotate(storage.clone()).await;
         self.healthy = false;
         if let Some(preparing) = self.preparing.take() {
-            self.install(
-                storage.clone(),
-                preparing.await.context("Rapid preparation failed")??,
-            );
+            self.install(preparing.await.context("Rapid preparation failed")??);
         }
         if self.standard {
             bounded_transfer(
@@ -111,19 +101,12 @@ impl Session {
                 reference.state_version,
                 frame.len(),
             );
-            self.archive
-                .as_ref()
-                .context("archive worker missing")?
-                .append(frame, reference.state_version);
         }
         self.version = reference.state_version;
         let size = bytes.len();
-        self.checkpoint.logged(self.version, size as u64);
+        self.checkpoint.logged(size as u64);
         self.latest = Some((reference, Some(bytes)));
         self.healthy = true;
-        self.checkpoint
-            .schedule(storage, self.latest.as_ref())
-            .await;
         tracing::info!(
             event = "rapid_log_snapshot",
             state_version = self.version,
@@ -140,9 +123,9 @@ impl Session {
 
     pub async fn restored(
         &mut self,
-        storage: Arc<LogStorage>,
         snapshot: &crate::storage::VerifiedSnapshot,
-        restored: &crate::bucket::recovery::ResolvedSqlite,
+        progress: CheckpointProgress,
+        base: Option<super::base::BaseName>,
     ) -> Result<()> {
         let object = &snapshot.reference.object;
         if self
@@ -156,36 +139,23 @@ impl Session {
             return Ok(());
         }
         self.latest = Some((snapshot.reference.clone(), Some(snapshot.bytes.clone())));
-        self.checkpoint.restored(restored.progress, self.version);
-        self.checkpoint
-            .schedule(storage, self.latest.as_ref())
-            .await;
+        self.checkpoint.restored(progress, base);
         Ok(())
     }
 
-    fn install(&mut self, storage: Arc<LogStorage>, segment: Option<Segment>) {
+    fn install(&mut self, segment: Option<Segment>) {
         self.standard = segment.is_none();
         self.installed_at = self.version;
-        self.archive = segment
-            .as_ref()
-            .map(|s| Archiver::new(storage, s.manifest.clone(), self.version));
         self.segment = segment;
     }
 
     pub async fn rotate(&mut self, storage: Arc<LogStorage>) {
-        self.install_prepared(storage.clone()).await;
-        if self.retired.as_ref().is_some_and(Archiver::is_finished)
-            && let Err(error) = self.retired.take().unwrap().finish().await
-        {
-            self.retirement_error = Some(format!("{error:#}"));
-            tracing::warn!(%error, "Rapid retirement deferred");
-        }
+        self.install_prepared().await;
         if !self.healthy
             || self.standard
             || self.segment.is_none()
-            || self.retired.is_some()
+            || self.version == self.installed_at
             || self.rotated.elapsed() < ROTATION_INTERVAL
-            || (self.version == self.installed_at && self.rotated.elapsed() < IDLE_SEGMENT_REFRESH)
         {
             return;
         }
@@ -202,13 +172,7 @@ impl Session {
         };
         self.next = None;
         match result {
-            Ok(Ok(Some(segment))) => {
-                if let Some(archive) = self.archive.take() {
-                    archive.close();
-                    self.retired = Some(archive);
-                }
-                self.install(storage, Some(segment));
-            }
+            Ok(Ok(Some(segment))) => self.install(Some(segment)),
             Ok(Ok(None)) => {}
             Ok(Err(error)) => tracing::warn!(%error, "Rapid rotation preparation deferred"),
             Err(error) => tracing::warn!(%error, "Rapid rotation preparation failed"),
@@ -218,12 +182,12 @@ impl Session {
 
     /// Installs a finished preparation before the first write, so an idle session's segment
     /// ages, and rotates, like any other.
-    async fn install_prepared(&mut self, storage: Arc<LogStorage>) {
+    async fn install_prepared(&mut self) {
         if !self.preparing.as_ref().is_some_and(|p| p.is_finished()) {
             return;
         }
         let error = match self.preparing.take().unwrap().await {
-            Ok(Ok(segment)) => return self.install(storage, segment),
+            Ok(Ok(segment)) => return self.install(segment),
             Ok(Err(error)) => error,
             Err(error) => error.into(),
         };
@@ -231,6 +195,8 @@ impl Session {
         self.healthy = false;
     }
 
+    /// Seals the session: the head's snapshot becomes its own object, and the progress says
+    /// whether a base of it is due.
     pub async fn finish(
         &mut self,
         storage: Arc<LogStorage>,
@@ -239,46 +205,45 @@ impl Session {
         ensure!(self.healthy, "uncertain write cannot be sealed");
         self.healthy = false;
         let started = Instant::now();
-        tokio::time::timeout_at(deadline, self.finish_archive(storage.clone()))
-            .await
-            .context("archive drain timed out")??;
+        tokio::time::timeout_at(deadline, async {
+            self.seal_head(storage.clone()).await?;
+            self.find_base(&storage).await;
+            anyhow::Ok(())
+        })
+        .await
+        .context("head seal timed out")??;
+        let progress = self.checkpoint.seal(self.version);
         tracing::info!(
-            event = "rapid_archive_finished",
+            event = "rapid_log_sealed",
             state_version = self.version,
+            base_version = progress.version,
+            log_bytes = progress.log_bytes,
+            base_due = progress.base_due,
             duration_ms = started.elapsed().as_secs_f64() * 1000.0
         );
-        let progress = self.checkpoint.finish(deadline).await;
         self.segment = None;
+        self.next = None;
         self.healthy = true;
         Ok(progress)
     }
 
-    async fn finish_archive(&mut self, storage: Arc<LogStorage>) -> Result<()> {
+    /// A session that reopened a parked database never listed the actor's bases, so it lists them
+    /// before deciding whether one is due.
+    async fn find_base(&mut self, storage: &LogStorage) {
+        let Some((head, _)) = self.latest.as_ref().filter(|_| !self.checkpoint.based()) else {
+            return;
+        };
+        match storage.newest_base(head).await {
+            Ok(base) => self.checkpoint.found(base.map(|base| base.name)),
+            Err(error) => tracing::warn!(error = %format!("{error:#}"),
+                "SQLite bases unavailable; a base is due"),
+        }
+    }
+
+    async fn seal_head(&mut self, storage: Arc<LogStorage>) -> Result<()> {
         if let Some(preparing) = self.preparing.take() {
-            self.install(
-                storage.clone(),
-                preparing.await.context("Rapid preparation failed")??,
-            );
+            self.install(preparing.await.context("Rapid preparation failed")??);
         }
-        // Prepared replacement streams already have a manifest and must also be retired.
-        if let Some(next) = self.next.take()
-            && let Some(segment) = next.await.context("Rapid preparation failed")??
-        {
-            Archiver::new(storage.clone(), segment.manifest.clone(), self.version)
-                .finish()
-                .await?;
-        }
-        if let Some(archive) = self.archive.take() {
-            archive.finish().await?;
-        }
-        if let Some(retired) = self.retired.take() {
-            retired.finish().await?;
-        }
-        ensure!(
-            self.retirement_error.is_none(),
-            "previous archive retirement failed: {:?}",
-            self.retirement_error
-        );
         if let Some((head, Some(bytes))) = &self.latest {
             bounded_transfer(
                 bytes.len() as u64,
@@ -314,12 +279,6 @@ pub(super) fn start_rotation(
             };
             if let Some(session) = session.lock().await.as_mut() {
                 session.rotate(storage.clone()).await;
-                if session.healthy {
-                    session
-                        .checkpoint
-                        .schedule(storage.clone(), session.latest.as_ref())
-                        .await;
-                }
             }
         }
     });

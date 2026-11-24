@@ -496,6 +496,7 @@ pub async fn serve_pool_manager(
         .context("bind durable-actors pool manager")?;
     let stop = tokio_util::sync::CancellationToken::new();
     let housekeeping = tokio::spawn(pool.run(registry, stop.clone()));
+    let sweep = history_sweep(&config.storage.persistence, stop.clone())?;
     info!(bind = %config.bind, "durable-actors pool manager is ready");
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown)
@@ -503,7 +504,34 @@ pub async fn serve_pool_manager(
         .context("serve durable-actors pool manager health")?;
     stop.cancel();
     housekeeping.await?;
+    if let Some(sweep) = sweep {
+        sweep.await??;
+    }
     Ok(())
+}
+
+/// The history sweep of a Rapid installation, which runs beside the pool's housekeeping because
+/// both need exactly one instance.
+fn history_sweep(
+    persistence: &crate::bucket::SnapshotStoreConfig,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<Option<tokio::task::JoinHandle<Result<()>>>> {
+    let crate::bucket::SnapshotStoreConfig::Rapid {
+        archive_bucket,
+        buckets,
+        ..
+    } = persistence
+    else {
+        return Ok(None);
+    };
+    let config =
+        crate::bucket::SweepConfig::new(archive_bucket.clone(), buckets.clone(), |name| {
+            env::var(name).ok()
+        })?;
+    Ok(Some(tokio::spawn(crate::bucket::serve_history_sweeper(
+        config,
+        stop.cancelled_owned(),
+    ))))
 }
 
 /// Kills are reported only where something takes them: platform telemetry, the events topic, or
