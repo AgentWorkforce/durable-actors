@@ -171,7 +171,7 @@ fn assignment_environment(
         ),
         (
             "DURABLE_ACTORS_HOST_TOKEN".into(),
-            request.host_token.clone(),
+            host_token(request, spare)?,
         ),
         (
             "DURABLE_ACTORS_JWT_PUBLIC_KEYS".into(),
@@ -234,6 +234,17 @@ fn assignment_environment(
         environment.insert("DURABLE_ACTORS_OWNER_HINT".into(), hint.clone());
     }
     Ok(environment)
+}
+
+/// The host's token, naming the slot of a sandbox created for it now that its pod has a UID.
+fn host_token(request: &EnsureHostRequest, spare: &SpareHandle) -> Result<String> {
+    match (
+        &request.slot_token,
+        crate::sandbox::slot_of(&spare.resource_id),
+    ) {
+        (Some(token), Some(slot)) => (token.0)(slot),
+        _ => Ok(request.host_token.clone()),
+    }
 }
 
 pub(crate) fn validate_image(image: &str) -> Result<()> {

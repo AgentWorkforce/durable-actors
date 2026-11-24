@@ -121,6 +121,10 @@ pub struct EnsureHostRequest {
     pub host_id: HostId,
     pub session_id: String,
     pub host_token: String,
+    /// Signs `host_token` again naming a slot, for a sandbox created for this host whose pod UID
+    /// was unknown when the control plane signed it.
+    #[serde(skip)]
+    pub slot_token: Option<SlotToken>,
     pub jwt_public_keys: String,
     pub control_plane_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +136,30 @@ pub struct EnsureHostRequest {
     pub actor_entrypoint: Option<String>,
     pub secret_refs: Vec<String>,
     pub host_idle_timeout_ms: u64,
+}
+
+/// Signs a host's token naming its slot, the scratch volume of its pod, which the node cache finds
+/// by pod UID.
+#[derive(Clone)]
+pub struct SlotToken(pub std::sync::Arc<SignInSlot>);
+
+pub type SignInSlot = dyn Fn(&str) -> Result<String> + Send + Sync;
+
+impl std::fmt::Debug for SlotToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SlotToken")
+    }
+}
+
+impl PartialEq for SlotToken {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// A sandbox's slot: its pod's UID, the last part of its resource ID.
+pub(crate) fn slot_of(resource_id: &str) -> Option<&str> {
+    resource_id.splitn(3, '/').nth(2)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]

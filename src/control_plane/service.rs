@@ -1224,6 +1224,40 @@ impl SandboxHostProvisioner {
         launched
     }
 
+    /// Signs the host's token naming a slot, the pod UID the node cache finds its database by.
+    fn slot_token(
+        &self,
+        spec: &HostLaunchSpec,
+        region: &str,
+        actor: &ActorKey,
+        request: &EnsureHostRequest,
+    ) -> crate::sandbox::SlotToken {
+        let issuer = self.issuer.clone();
+        let (organization, host, session) = (
+            spec.organization_id.clone(),
+            request.host_id.clone(),
+            request.session_id.clone(),
+        );
+        let (config, region, actor) = (
+            request.host_config_key.clone(),
+            region.to_owned(),
+            actor.clone(),
+        );
+        crate::sandbox::SlotToken(std::sync::Arc::new(move |slot| {
+            Ok(issuer
+                .issue_host_in_slot(
+                    &organization,
+                    &host,
+                    &session,
+                    &config,
+                    &region,
+                    &actor,
+                    Some(slot),
+                )?
+                .token)
+        }))
+    }
+
     async fn provision(
         &self,
         spec: &HostLaunchSpec,
@@ -1263,25 +1297,15 @@ impl SandboxHostProvisioner {
         };
         let (runtime_config, spare) = tokio::join!(token, spare);
         request.spare = spare?;
-        // A claimed spare's slot is its pod's scratch volume, which the node cache finds by pod UID.
-        if let Some(slot) = request
+        let in_slot = self.slot_token(spec, region, actor, &request);
+        // A sandbox created for this host has no pod UID yet, so its provider names the slot.
+        match request
             .spare
             .as_ref()
-            .and_then(|spare| spare.resource_id.splitn(3, '/').nth(2))
-            .map(str::to_owned)
+            .and_then(|spare| crate::sandbox::slot_of(&spare.resource_id))
         {
-            request.host_token = self
-                .issuer
-                .issue_host_in_slot(
-                    &spec.organization_id,
-                    &request.host_id,
-                    &request.session_id,
-                    &request.host_config_key,
-                    region,
-                    actor,
-                    Some(&slot),
-                )?
-                .token;
+            Some(slot) => request.host_token = (in_slot.0)(slot)?,
+            None => request.slot_token = Some(in_slot),
         }
         if let Some(pool) = &self.pool {
             if request.spare.is_none() {
@@ -1457,6 +1481,7 @@ impl SandboxHostProvisioner {
             host_id,
             session_id,
             host_token,
+            slot_token: None,
             jwt_public_keys: self.issuer.verifier_keys_json()?,
             control_plane_url: self.runtime.control_plane_url.clone(),
             otlp_endpoint: self.runtime.otlp_endpoint.clone(),

@@ -73,6 +73,7 @@ fn request(id: &str) -> EnsureHostRequest {
         host_id: crate::host::HostId::new(format!("host-{id}")),
         session_id: format!("session-{id}"),
         host_token: "unused".into(),
+        slot_token: None,
         jwt_public_keys: "unused".into(),
         otlp_endpoint: None,
         control_plane_url: "http://127.0.0.1:7100".into(),

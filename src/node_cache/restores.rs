@@ -333,6 +333,7 @@ async fn finish(
         restored.sqlite.txid,
     )
     .await?;
+    opens(&database.join(DATABASE_FILE)).await?;
     Ok(Restored {
         txid: restored.sqlite.txid,
         base_bytes: restored.base.as_ref().map(|base| base.name.bytes),
@@ -340,6 +341,31 @@ async fn finish(
         progress: restored.progress,
         base: restored.base.map(|base| base.name),
     })
+}
+
+/// Reads the restored database's schema, as the host's open will. A base at the head itself has no
+/// changes to apply, so nothing else reads it before the host would find it damaged, past the
+/// fallback to an older base.
+async fn opens(file: &Path) -> Result<()> {
+    use rusqlite::{Connection, OpenFlags};
+    let uri = format!(
+        "file:{}?immutable=1",
+        file.display()
+            .to_string()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23")
+    );
+    tokio::task::spawn_blocking(move || {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection = Connection::open_with_flags(uri, flags)?;
+        connection.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+        anyhow::Ok(())
+    })
+    .await?
+    .context("restored database does not open")
 }
 
 /// Opens the actor's store beside finding and downloading its newest base, so the restore finds

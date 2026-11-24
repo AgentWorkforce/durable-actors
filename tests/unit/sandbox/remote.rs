@@ -128,6 +128,7 @@ fn request() -> Result<EnsureHostRequest> {
         host_id: HostId::new("host.v3.test.one"),
         session_id: uuid::Uuid::new_v4().to_string(),
         host_token: "host-jwt".into(),
+        slot_token: None,
         jwt_public_keys: "{}".into(),
         otlp_endpoint: None,
         control_plane_url: "http://control:7100".into(),
@@ -139,6 +140,22 @@ fn request() -> Result<EnsureHostRequest> {
         secret_refs: vec!["customer".into()],
         host_idle_timeout_ms: 10000,
     })
+}
+
+#[test]
+fn a_host_in_a_sandbox_created_for_it_gets_a_token_naming_its_slot() -> Result<()> {
+    let mut request = request()?;
+    let spare = request.spare.take().unwrap();
+    let environment = assignment_environment(&request, &spare, HashMap::new())?;
+    assert_eq!(environment["DURABLE_ACTORS_HOST_TOKEN"], "host-jwt");
+
+    request.slot_token = Some(crate::sandbox::SlotToken(Arc::new(|slot| {
+        Ok(format!("host-jwt-in-{slot}"))
+    })));
+    let environment = assignment_environment(&request, &spare, HashMap::new())?;
+
+    assert_eq!(environment["DURABLE_ACTORS_HOST_TOKEN"], "host-jwt-in-uid");
+    Ok(())
 }
 
 #[test]

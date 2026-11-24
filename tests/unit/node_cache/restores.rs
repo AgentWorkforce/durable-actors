@@ -257,6 +257,47 @@ async fn restores_from_an_older_base_when_the_newest_fails() -> Result<()> {
 }
 
 #[tokio::test]
+async fn restores_from_an_older_base_when_the_newest_at_the_head_does_not_open() -> Result<()> {
+    let slot = tempfile::tempdir()?;
+    let bucket = Arc::new(FileBucket::new(slot.path().join("bucket"))?);
+    let bytes = database(slot.path(), 2)?;
+    let mut damaged = bytes.clone();
+    damaged[..4096].fill(0);
+    for (key, bytes) in [("older", bytes.clone()), ("newest", damaged)] {
+        assert!(bucket.compare_and_swap(key, None, bytes.into()).await?);
+    }
+    let mut newest = base("newest", bytes.len() as u64, bucket.clone());
+    newest.name.version = 2;
+    let store = Layered(vec![base("older", bytes.len() as u64, bucket), newest]);
+    let database = slot.path().join(DATABASE);
+
+    let restored = restore_into(&store, head()?, None, &database).await?;
+
+    assert_eq!(restored.base.map(|base| base.version), Some(1));
+    assert_eq!(std::fs::read(database.join(DATABASE_FILE))?, bytes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sole_base_that_does_not_open_fails_the_restore() -> Result<()> {
+    let slot = tempfile::tempdir()?;
+    let bucket = Arc::new(FileBucket::new(slot.path().join("bucket"))?);
+    let mut damaged = database(slot.path(), 2)?;
+    damaged[..4096].fill(0);
+    assert!(
+        bucket
+            .compare_and_swap("sole", None, damaged.clone().into())
+            .await?
+    );
+    let store = Layered(vec![base("sole", damaged.len() as u64, bucket)]);
+
+    let restored = restore_into(&store, head()?, None, &slot.path().join(DATABASE)).await;
+
+    assert!(restored.is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn hands_the_database_over_replacing_an_earlier_attempt() -> Result<()> {
     let (staged, slot) = (tempfile::tempdir()?, tempfile::tempdir()?);
     std::fs::create_dir(slot.path().join(DATABASE))?;
