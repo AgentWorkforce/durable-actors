@@ -176,6 +176,21 @@ impl std::ops::Deref for RuntimeStorage {
 }
 
 impl RuntimeStorageReader {
+    /// Fails unless the actor owning `owner` (an owner-record key) can be activated from this
+    /// storage: the snapshot activation would load exists, and its SQLite chain restores.
+    pub(crate) async fn verify_restorable(&self, owner: &str) -> Result<()> {
+        let object = self
+            .authority
+            .get(owner)
+            .await?
+            .context("owner record vanished")?;
+        let record: Ownership = serde_json::from_reader(object.bytes.reader())?;
+        if let Some(snapshot) = self.latest(&record, None).await? {
+            self.read_sqlite(snapshot, None).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn restored_elsewhere(
         &self,
         snapshot: &VerifiedSnapshot,

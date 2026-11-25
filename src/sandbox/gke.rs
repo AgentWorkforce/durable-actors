@@ -14,7 +14,7 @@ use crate::platform_events::{PlatformEvents, sandboxes::SandboxKill};
 mod kills;
 mod kubernetes;
 pub(crate) use super::remote::validate_image;
-pub(crate) use kubernetes::{GKE_RUNTIME_CLASS, GkeConfig};
+pub(crate) use kubernetes::{GkeConfig, PodScheduling};
 
 /// What reporting sandbox kills takes: the actor each sandbox was claimed for, and where its
 /// kill is recorded.

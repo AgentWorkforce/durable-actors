@@ -29,7 +29,7 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
         "test-token",
         Some("http://node-cache:7103"),
         None,
-        GKE_RUNTIME_CLASS,
+        &PodScheduling::default(),
         &BTreeMap::new(),
     )?;
     assert_eq!(
@@ -44,6 +44,18 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
     );
     let spec = pod.spec.unwrap();
     assert_eq!(spec.runtime_class_name.as_deref(), Some("gvisor"));
+    assert_eq!(
+        spec.node_selector.as_ref().unwrap()["sandbox.gke.io/runtime"],
+        "gvisor"
+    );
+    assert!(spec.tolerations.is_none());
+    assert_eq!(
+        spec.security_context
+            .as_ref()
+            .and_then(|context| context.seccomp_profile.as_ref())
+            .map(|profile| profile.type_.as_str()),
+        Some("RuntimeDefault")
+    );
     assert_eq!(spec.automount_service_account_token, Some(false));
     let affinity = spec
         .affinity
@@ -137,7 +149,7 @@ fn each_pool_spreads_its_spares_across_nodes() -> Result<()> {
         "token",
         None,
         None,
-        GKE_RUNTIME_CLASS,
+        &PodScheduling::default(),
         &BTreeMap::new(),
     )?;
     assert_eq!(pool(&small), pool(&spare_under(GKE_RUNTIME_CLASS)));
@@ -558,8 +570,8 @@ async fn reporting_cluster(
             reap_concurrency: 4,
             node_cache_url: None,
             sqlite_slot_gib: None,
-            runtime_class: GKE_RUNTIME_CLASS.into(),
             pod_annotations: BTreeMap::new(),
+            scheduling: PodScheduling::default(),
         },
         kills,
     );
@@ -659,7 +671,7 @@ fn operator_annotations_reach_spares_without_replacing_gvisor_annotations() -> R
         "token",
         Some("http://node-cache:7103"),
         Some(8),
-        "gvisor-with-overhead",
+        &runtime("gvisor-with-overhead"),
         &annotations,
     )?;
     let annotations = pod.metadata.annotations.unwrap();
@@ -673,16 +685,30 @@ fn spare_json() -> serde_json::Value {
 }
 
 fn spare_under(runtime_class: &str) -> Pod {
+    pod_with(Some(runtime_class))
+}
+
+fn pod_with(runtime_class: Option<&str>) -> Pod {
     spare_pod(
         &spare_request("actor"),
         &["us-west4-a".into()],
         "token",
         None,
         None,
-        runtime_class,
+        &PodScheduling {
+            runtime_class: runtime_class.map(Into::into),
+            ..PodScheduling::default()
+        },
         &BTreeMap::new(),
     )
     .unwrap()
+}
+
+fn runtime(class: &str) -> PodScheduling {
+    PodScheduling {
+        runtime_class: Some(class.into()),
+        ..PodScheduling::default()
+    }
 }
 
 #[test]
@@ -693,7 +719,7 @@ fn a_spare_gets_a_sized_database_slot_the_node_cache_can_reach() -> Result<()> {
         "token",
         Some("http://node-cache:7103"),
         Some(8),
-        "gvisor-with-overhead",
+        &runtime("gvisor-with-overhead"),
         &BTreeMap::new(),
     )?;
     let annotations = pod.metadata.annotations.unwrap();
@@ -756,4 +782,46 @@ fn gvisor_mounts(pod: Pod) -> Vec<(String, String)> {
             Some((mount.to_owned(), value))
         })
         .collect()
+}
+
+#[test]
+fn pods_run_on_the_configured_runtime_and_reserved_nodes() -> Result<()> {
+    let scheduling = PodScheduling {
+        runtime_class: None,
+        node_selector: BTreeMap::from([("durable-actors/role".into(), "actor-host".into())]),
+        tolerations: vec![serde_json::json!({
+            "key": "durable-actors/actor-host", "operator": "Exists", "effect": "NoSchedule"
+        })],
+    };
+    let pod = spare_pod(
+        &spare_request("runc-one"),
+        &["us-west-2a".into()],
+        "test-token",
+        None,
+        None,
+        &scheduling,
+        &BTreeMap::new(),
+    )?;
+    let spec = pod.spec.unwrap();
+    assert_eq!(spec.runtime_class_name, None);
+    assert_eq!(
+        spec.node_selector,
+        Some(BTreeMap::from([(
+            "durable-actors/role".into(),
+            "actor-host".into()
+        )]))
+    );
+    let toleration = &spec.tolerations.unwrap()[0];
+    assert_eq!(toleration.key.as_deref(), Some("durable-actors/actor-host"));
+    assert_eq!(toleration.effect.as_deref(), Some("NoSchedule"));
+    assert_eq!(spec.automount_service_account_token, Some(false));
+    let container = &spec.containers[0];
+    let security = container.security_context.as_ref().unwrap();
+    assert_eq!(security.read_only_root_filesystem, Some(true));
+    assert_eq!(security.allow_privilege_escalation, Some(false));
+    assert!(
+        gvisor_mounts(pod_with(None)).is_empty(),
+        "a pod under the default runtime carries no gVisor annotations"
+    );
+    Ok(())
 }

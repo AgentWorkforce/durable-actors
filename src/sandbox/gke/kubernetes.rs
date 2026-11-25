@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use futures_util::StreamExt;
 use k8s_openapi::{
     api::core::v1::{
-        Container, EmptyDirVolumeSource, EnvVar, NodeSelectorRequirement, Pod, PodSpec, Volume,
-        VolumeMount,
+        Container, EmptyDirVolumeSource, EnvVar, NodeSelectorRequirement, Pod, PodSpec, Toleration,
+        Volume, VolumeMount,
     },
     apimachinery::pkg::api::resource::Quantity,
 };
@@ -39,9 +39,28 @@ pub(crate) struct GkeConfig {
     pub node_cache_url: Option<String>,
     /// The size of each spare's database slot, which kubelet enforces and deletes with the pod.
     pub sqlite_slot_gib: Option<u32>,
-    pub runtime_class: String,
     /// Added to every spare pod, for cluster tooling such as log agents.
     pub pod_annotations: BTreeMap<String, String>,
+    pub scheduling: PodScheduling,
+}
+
+/// Where sandbox pods run. The defaults are GKE Sandbox's; other clusters name their own runtime
+/// class (or none, for the cluster's default runtime) and the nodes reserved for actors.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PodScheduling {
+    pub runtime_class: Option<String>,
+    pub node_selector: BTreeMap<String, String>,
+    pub tolerations: Vec<serde_json::Value>,
+}
+
+impl Default for PodScheduling {
+    fn default() -> Self {
+        Self {
+            runtime_class: Some(GKE_RUNTIME_CLASS.into()),
+            node_selector: BTreeMap::from([("sandbox.gke.io/runtime".into(), "gvisor".into())]),
+            tolerations: Vec::new(),
+        }
+    }
 }
 
 /// Reads pod state from one shared watch so provisioning costs a single API call per pod.
@@ -125,7 +144,7 @@ impl Kubernetes {
             .zones
             .get(region)
             .map(Vec::as_slice)
-            .with_context(|| format!("no GKE zone configured for {region}"))
+            .with_context(|| format!("no placement zone configured for {region}"))
     }
 }
 
@@ -143,7 +162,7 @@ impl SandboxCluster for Kubernetes {
             &token,
             self.config.node_cache_url.as_deref(),
             self.config.sqlite_slot_gib,
-            &self.config.runtime_class,
+            &self.config.scheduling,
             &self.config.pod_annotations,
         )?;
         let ready = self.start(pod).await?;
@@ -301,7 +320,7 @@ fn spare_pod(
     token: &str,
     node_cache_url: Option<&str>,
     sqlite_slot_gib: Option<u32>,
-    runtime_class: &str,
+    scheduling: &PodScheduling,
     annotations: &BTreeMap<String, String>,
 ) -> Result<Pod> {
     let mut pod: Pod = serde_yaml::from_str(SPARE_POD).context("spare pod manifest")?;
@@ -341,25 +360,48 @@ fn spare_pod(
     if let Some(gib) = slot {
         add_slot(spec, gib);
     }
-    if runtime_class == GKE_RUNTIME_CLASS {
-        if slot.is_some() {
+    schedule(spec, scheduling)?;
+    match scheduling.runtime_class.as_deref() {
+        Some(GKE_RUNTIME_CLASS) => {
+            if slot.is_some() {
+                pod.metadata
+                    .annotations
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(
+                        format!("dev.gvisor.empty-dir.{SLOT_VOLUME}.force-shared"),
+                        "true".into(),
+                    );
+            }
+        }
+        Some(_) => {
+            let mounts = mount_annotations(spec);
             pod.metadata
                 .annotations
                 .get_or_insert_with(BTreeMap::new)
-                .insert(
-                    format!("dev.gvisor.empty-dir.{SLOT_VOLUME}.force-shared"),
-                    "true".into(),
-                );
+                .extend(mounts);
         }
-    } else {
-        spec.runtime_class_name = Some(runtime_class.to_owned());
-        let mounts = mount_annotations(spec);
-        pod.metadata
-            .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .extend(mounts);
+        None => {}
     }
     Ok(pod)
+}
+
+/// Replaces the manifest's GKE Sandbox placement with the configured runtime class (none runs
+/// under the cluster's default runtime), node selector and tolerations.
+fn schedule(spec: &mut PodSpec, scheduling: &PodScheduling) -> Result<()> {
+    spec.runtime_class_name = scheduling.runtime_class.clone();
+    spec.node_selector =
+        (!scheduling.node_selector.is_empty()).then(|| scheduling.node_selector.clone());
+    spec.tolerations = (!scheduling.tolerations.is_empty())
+        .then(|| {
+            scheduling
+                .tolerations
+                .iter()
+                .map(|toleration| serde_json::from_value(toleration.clone()))
+                .collect::<serde_json::Result<Vec<Toleration>>>()
+        })
+        .transpose()
+        .context("invalid sandbox toleration")?;
+    Ok(())
 }
 
 /// The scratch volume the actor's database lives in, which the node cache finds by the pod's UID
