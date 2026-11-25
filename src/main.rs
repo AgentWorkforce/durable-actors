@@ -6,7 +6,7 @@ use durable_actors::{
     },
     entrypoint::{init_logging, shutdown_signal},
 };
-use tracing::error;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {

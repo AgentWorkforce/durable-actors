@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use bytes::Bytes;
+use crate::payload::Payload;
 use tokio::time::{Duration, Instant};
 
 /// What the copy of a queued write must hold.
@@ -18,7 +18,7 @@ pub(super) struct Pending {
     pub key: String,
     pub expect: Expect,
     /// `None` when the payload was dropped to bound memory or was never known.
-    pub bytes: Option<Bytes>,
+    pub bytes: Option<Payload>,
     pub since: Instant,
 }
 
@@ -26,7 +26,7 @@ pub(super) struct Job {
     pub lane: String,
     pub key: String,
     pub expect: Expect,
-    pub bytes: Option<Bytes>,
+    pub bytes: Option<Payload>,
 }
 
 pub(super) enum Outcome {
@@ -197,7 +197,7 @@ fn supersedes(queued: Expect, incoming: Expect) -> bool {
 }
 
 fn payload(entry: &Pending) -> usize {
-    entry.bytes.as_ref().map_or(0, Bytes::len)
+    entry.bytes.as_ref().map_or(0, Payload::len)
 }
 
 fn backoff(failures: u32) -> Duration {

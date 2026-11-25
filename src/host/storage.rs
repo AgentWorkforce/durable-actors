@@ -735,7 +735,7 @@ impl<B: Bucket + 'static> Bucket for ByScope<B> {
         &self,
         key: &str,
         generation: Option<i64>,
-        bytes: bytes::Bytes,
+        bytes: crate::payload::Payload,
     ) -> Result<bool> {
         self.client(key)
             .compare_and_swap(key, generation, bytes)
@@ -749,7 +749,12 @@ impl<B: Bucket + 'static> Bucket for ByScope<B> {
 
 #[async_trait]
 impl<B: Mirror + 'static> Mirror for ByScope<B> {
-    async fn mirror(&self, key: &str, generation: i64, bytes: bytes::Bytes) -> Result<()> {
+    async fn mirror(
+        &self,
+        key: &str,
+        generation: i64,
+        bytes: crate::payload::Payload,
+    ) -> Result<()> {
         self.client(key).mirror(key, generation, bytes).await
     }
 }

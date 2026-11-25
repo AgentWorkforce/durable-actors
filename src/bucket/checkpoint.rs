@@ -42,7 +42,12 @@ use super::{Bucket, BucketObject};
 pub trait Mirror: Bucket {
     /// Stores `bytes` as `key` at `generation`, unless the mirror already holds that generation or
     /// a later one, which keeps a delayed copy from overwriting a newer one.
-    async fn mirror(&self, key: &str, generation: i64, bytes: bytes::Bytes) -> Result<()>;
+    async fn mirror(
+        &self,
+        key: &str,
+        generation: i64,
+        bytes: crate::payload::Payload,
+    ) -> Result<()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +130,7 @@ impl Checkpointer {
     }
 
     /// Queues a successful write. Never blocks on the mirror.
-    pub fn record(&self, key: &str, generation: i64, bytes: bytes::Bytes) {
+    pub fn record(&self, key: &str, generation: i64, bytes: crate::payload::Payload) {
         self.push(key, Expect::Exact(generation), Some(bytes));
     }
 
@@ -173,7 +178,7 @@ impl Checkpointer {
         }
     }
 
-    fn push(&self, key: &str, expect: Expect, bytes: Option<bytes::Bytes>) {
+    fn push(&self, key: &str, expect: Expect, bytes: Option<crate::payload::Payload>) {
         let entry = Pending {
             key: key.into(),
             expect,
@@ -444,7 +449,7 @@ impl Bucket for CheckpointedBucket {
         &self,
         key: &str,
         generation: Option<i64>,
-        bytes: bytes::Bytes,
+        bytes: crate::payload::Payload,
     ) -> Result<bool> {
         let result = self
             .source

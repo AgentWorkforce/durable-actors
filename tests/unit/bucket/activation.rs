@@ -109,7 +109,10 @@ async fn sqlite_dependencies_must_exist_in_the_snapshot_backend_before_publicati
 
 #[tokio::test]
 async fn verify_finds_actors_whose_sqlite_chain_is_incomplete() -> Result<()> {
-    use crate::litestream::{Litestream, Replicator, storage::SqliteCapture};
+    use crate::litestream::{
+        Litestream, Replicator,
+        storage::{CaptureDirectory, SqliteCapture},
+    };
     use crate::state_log::{SqliteSnapshot, StateSnapshot};
     use crate::state_transport::SnapshotWriter;
 
@@ -122,8 +125,11 @@ async fn verify_finds_actors_whose_sqlite_chain_is_incomplete() -> Result<()> {
     let first_plan = f.runtime.prepare_actor_write(&f.actor, lease, 1, 1).await?;
     let next_plan = f.runtime.prepare_actor_write(&f.actor, lease, 1, 2).await?;
     let replication = Arc::new(Litestream::default());
-    let mut capture = SqliteCapture::new(replication.clone()).await?;
-    let initial = capture.txid();
+    let mut capture =
+        SqliteCapture::new(CaptureDirectory::temporary()?, replication.clone(), None).await?;
+    let database = rusqlite::Connection::open(capture.path())?;
+    database.execute("INSERT INTO __terse_fields VALUES ('seed', '1')", [])?;
+    let initial = replication.sync(&capture.path()).await?;
     let first = StateSnapshot::new(
         1,
         1,
@@ -136,8 +142,7 @@ async fn verify_finds_actors_whose_sqlite_chain_is_incomplete() -> Result<()> {
         serde_json::Value::Null,
     )?;
     let first_bytes = first.encode()?;
-    rusqlite::Connection::open(capture.path())?
-        .execute("INSERT INTO __terse_fields VALUES ('count', '1')", [])?;
+    database.execute("INSERT INTO __terse_fields VALUES ('count', '1')", [])?;
     let changed = replication.sync(&capture.path()).await?;
     let next = StateSnapshot::new(
         2,

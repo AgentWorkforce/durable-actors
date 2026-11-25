@@ -176,10 +176,7 @@ impl Bucket for S3Bucket {
         generation: Option<i64>,
         bytes: Payload,
     ) -> Result<bool> {
-        let bytes = match bytes {
-            Payload::Memory(bytes) => bytes,
-            file => tokio::task::spawn_blocking(move || file.to_bytes()).await??,
-        };
+        let bytes = in_memory(bytes).await?;
         let mut request = self.client.put_object().bucket(&self.bucket).key(key);
         let next = match generation {
             None => {
@@ -245,8 +242,9 @@ impl super::checkpoint::Mirror for S3Bucket {
     /// One PUT per copy in the common case: new objects (every snapshot) are created with
     /// `If-None-Match: *`, and replacements use the ETag this bucket cached from its own last
     /// write. Only a failed precondition re-reads the copy with a HEAD.
-    async fn mirror(&self, key: &str, generation: i64, bytes: bytes::Bytes) -> Result<()> {
+    async fn mirror(&self, key: &str, generation: i64, bytes: Payload) -> Result<()> {
         ensure!(generation > 0, "S3 object generation is invalid");
+        let bytes = in_memory(bytes).await?;
         let mut current = self.versions.get(key).await;
         for _ in 0..MIRROR_ATTEMPTS {
             let mut request = self.client.put_object().bucket(&self.bucket).key(key);
@@ -331,3 +329,11 @@ fn validate_bucket(bucket: &str) -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/unit/bucket/s3.rs"]
 mod tests;
+
+/// The SDK sends a request body from memory; file-backed payloads are read off the runtime.
+async fn in_memory(payload: Payload) -> Result<bytes::Bytes> {
+    Ok(match payload {
+        Payload::Memory(bytes) => bytes,
+        file => tokio::task::spawn_blocking(move || file.to_bytes()).await??,
+    })
+}

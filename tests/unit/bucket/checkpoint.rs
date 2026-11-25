@@ -9,6 +9,8 @@ use std::{
 use anyhow::ensure;
 use bytes::Bytes;
 
+use crate::payload::Payload;
+
 use super::*;
 
 /// An in-memory bucket numbering generations like S3Bucket: a create is 1, each replace adds one.
@@ -62,15 +64,18 @@ impl Memory {
 #[async_trait]
 impl Bucket for Memory {
     async fn get(&self, key: &str) -> Result<Option<BucketObject>> {
-        Ok(self
-            .object(key)
-            .map(|(generation, bytes)| BucketObject { generation, bytes }))
+        Ok(self.object(key).map(|(generation, bytes)| BucketObject {
+            generation,
+            bytes: bytes.into(),
+        }))
     }
 
     async fn range(&self, key: &str, start: u64, length: u64) -> Result<Option<BucketObject>> {
         Ok(self.object(key).map(|(generation, bytes)| BucketObject {
             generation,
-            bytes: bytes.slice(start as usize..(start + length) as usize),
+            bytes: bytes
+                .slice(start as usize..(start + length) as usize)
+                .into(),
         }))
     }
 
@@ -78,8 +83,9 @@ impl Bucket for Memory {
         &self,
         key: &str,
         generation: Option<i64>,
-        bytes: Bytes,
+        bytes: Payload,
     ) -> Result<bool> {
+        let bytes = bytes.to_bytes()?;
         {
             let mut objects = self.objects.lock().unwrap();
             let current = objects.get(key).map(|(generation, _)| *generation);
@@ -113,7 +119,8 @@ impl Bucket for Memory {
 
 #[async_trait]
 impl Mirror for Memory {
-    async fn mirror(&self, key: &str, generation: i64, bytes: Bytes) -> Result<()> {
+    async fn mirror(&self, key: &str, generation: i64, bytes: Payload) -> Result<()> {
+        let bytes = bytes.to_bytes()?;
         self.mirrors.fetch_add(1, Ordering::SeqCst);
         while self.gated.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -191,7 +198,11 @@ fn soon() -> Instant {
 }
 
 async fn create(bucket: &dyn Bucket, key: &str, bytes: impl Into<Bytes>) -> Result<()> {
-    ensure!(bucket.compare_and_swap(key, None, bytes.into()).await?);
+    ensure!(
+        bucket
+            .compare_and_swap(key, None, Payload::from(bytes.into()))
+            .await?
+    );
     Ok(())
 }
 
@@ -210,7 +221,7 @@ async fn writes_are_copied_with_their_generation() -> Result<()> {
     create(&f.bucket, &key, "v1").await?;
     assert!(
         f.bucket
-            .compare_and_swap(&key, Some(1), Bytes::from_static(b"v2"))
+            .compare_and_swap(&key, Some(1), Bytes::from_static(b"v2").into())
             .await?
     );
     assert!(f.checkpointer.flush(soon()).await);
@@ -230,7 +241,7 @@ async fn a_lost_compare_and_swap_copies_what_the_source_holds() -> Result<()> {
     f.source.put(&key, 3, "theirs");
     assert!(
         !f.bucket
-            .compare_and_swap(&key, Some(1), Bytes::from_static(b"mine"))
+            .compare_and_swap(&key, Some(1), Bytes::from_static(b"mine").into())
             .await?
     );
     assert!(f.checkpointer.flush(soon()).await);
@@ -267,7 +278,7 @@ async fn queued_writes_of_one_key_coalesce_to_the_latest() -> Result<()> {
     create(&f.bucket, &key, "v1").await?;
     for (generation, bytes) in [(1, "v2"), (2, "v3")] {
         f.bucket
-            .compare_and_swap(&key, Some(generation), Bytes::from(bytes))
+            .compare_and_swap(&key, Some(generation), Bytes::from(bytes).into())
             .await?;
     }
     assert_eq!(f.checkpointer.stats().pending, 2);
@@ -319,8 +330,10 @@ async fn a_late_completion_never_replaces_a_newer_queued_write() -> Result<()> {
     create(&f.bucket, &snapshot("a", 1), "blocker").await?;
     hold(&f.copy).await;
     let key = owner("a");
-    f.checkpointer.record(&key, 2, Bytes::from_static(b"two"));
-    f.checkpointer.record(&key, 1, Bytes::from_static(b"one"));
+    f.checkpointer
+        .record(&key, 2, Bytes::from_static(b"two").into());
+    f.checkpointer
+        .record(&key, 1, Bytes::from_static(b"one").into());
     f.copy.gated.store(false, Ordering::SeqCst);
     assert!(f.checkpointer.flush(soon()).await);
     assert_eq!(f.copy.object(&key), Some((2, Bytes::from_static(b"two"))));
@@ -408,7 +421,7 @@ async fn lag_reports_the_oldest_uncopied_write() -> Result<()> {
     create(&f.bucket, &key, "v1").await?;
     tokio::time::sleep(Duration::from_millis(120)).await;
     f.bucket
-        .compare_and_swap(&key, Some(1), Bytes::from_static(b"v2"))
+        .compare_and_swap(&key, Some(1), Bytes::from_static(b"v2").into())
         .await?;
     let stats = f.checkpointer.stats();
     assert_eq!(stats.pending, 1);
@@ -424,7 +437,7 @@ async fn lag_reports_the_oldest_uncopied_write() -> Result<()> {
 async fn a_late_copy_never_overwrites_a_newer_one() -> Result<()> {
     let copy = Memory::default();
     copy.put(&owner("a"), 7, "newer");
-    copy.mirror(&owner("a"), 6, Bytes::from_static(b"older"))
+    copy.mirror(&owner("a"), 6, Bytes::from_static(b"older").into())
         .await?;
     assert_eq!(
         copy.object(&owner("a")),
@@ -487,10 +500,12 @@ async fn write_chain(bucket: &dyn Bucket, actor: &str, writes: u32) -> Result<()
             format!("after:{}", snapshot(actor, n - 1))
         };
         let _ = bucket
-            .compare_and_swap(&snapshot(actor, n), None, Bytes::from(parent))
+            .compare_and_swap(&snapshot(actor, n), None, Bytes::from(parent).into())
             .await;
         let record = Bytes::from(format!("after:{}", snapshot(actor, n)));
-        let _ = bucket.compare_and_swap(&key, generation, record).await;
+        let _ = bucket
+            .compare_and_swap(&key, generation, record.into())
+            .await;
         generation = Some(generation.map_or(1, |g| g + 1));
         tokio::task::yield_now().await;
     }
@@ -519,7 +534,7 @@ async fn restore_copies_a_prefix_keeping_generations_and_is_rerunnable() -> Resu
     );
     assert!(
         express
-            .compare_and_swap(&owner("a"), Some(9), Bytes::from_static(b"next"))
+            .compare_and_swap(&owner("a"), Some(9), Bytes::from_static(b"next").into())
             .await?
     );
     let again = restore(&standard, &express, "durable-actors/v3/snapshots/", 4).await?;
