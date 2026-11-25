@@ -95,6 +95,14 @@ impl S3Bucket {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if status(&error) == Some(404) => return Ok(None),
+            // Without an unconditioned s3:ListBucket grant, S3 answers a GET for a missing key
+            // with 403. Actor sessions may list only their own prefixes, so confirm absence with
+            // an exact-key listing they are allowed to make.
+            Err(error)
+                if status(&error) == Some(403) && self.absent(key).await.unwrap_or(false) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(error.into()),
         };
         let generation = generation(response.metadata())?;
@@ -112,6 +120,22 @@ impl S3Bucket {
             generation,
             bytes: Payload::Memory(bytes),
         }))
+    }
+
+    /// Whether a listing at exactly `key` finds no object named `key`.
+    async fn absent(&self, key: &str) -> Result<bool> {
+        let listed = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(key)
+            .max_keys(1)
+            .send()
+            .await?;
+        Ok(!listed
+            .contents()
+            .iter()
+            .any(|object| object.key() == Some(key)))
     }
 
     async fn head(&self, key: &str) -> Result<Option<(i64, String)>> {

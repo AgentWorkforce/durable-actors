@@ -572,3 +572,31 @@ async fn control_plane_owner_records_copy_their_snapshots_first() -> Result<()> 
     assert_eq!(f.copy.violations.load(Ordering::SeqCst), 0);
     Ok(())
 }
+
+#[test]
+fn catch_up_copies_snapshots_in_numeric_dependency_order() {
+    let actor = "durable-actors/v3/snapshots/00/cA/Qw/b25l";
+    let mut keys: Vec<String> = [
+        format!("{actor}/0000000000000002/1.json"),
+        format!("{actor}/0000000000000001/10.json"),
+        format!("{actor}/0000000000000001/9.json.checkpoint"),
+        format!("{actor}/0000000000000001/9.json"),
+        format!("{actor}/0000000000000001/2.json"),
+    ]
+    .into();
+    sort_by_dependency(&mut keys);
+    let names: Vec<_> = keys
+        .iter()
+        .map(|key| key.strip_prefix(actor).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "/0000000000000001/2.json",
+            "/0000000000000001/9.json",
+            "/0000000000000001/10.json",
+            "/0000000000000002/1.json",
+            "/0000000000000001/9.json.checkpoint",
+        ]
+    );
+}

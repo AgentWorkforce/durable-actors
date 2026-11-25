@@ -225,7 +225,7 @@ impl Checkpointer {
             .into_iter()
             .filter(|key| !copied.contains(key))
             .collect();
-        missing.sort();
+        sort_by_dependency(&mut missing);
         if missing.is_empty() {
             return Ok(());
         }
@@ -358,7 +358,7 @@ async fn copy_missing(shared: &Shared, prefix: &str) -> Result<()> {
         .into_iter()
         .filter(|key| !copied.contains(key))
         .collect();
-    missing.sort();
+    sort_by_dependency(&mut missing);
     for key in missing {
         if let Some(object) = shared.source.get(&key).await? {
             shared
@@ -471,3 +471,27 @@ impl Bucket for CheckpointedBucket {
 #[cfg(test)]
 #[path = "../../tests/unit/bucket/checkpoint.rs"]
 mod tests;
+
+/// Orders keys so every snapshot is copied after the ones it can depend on: snapshot keys by
+/// owner epoch and numeric state version (their names are unpadded, so `10.json` sorts before
+/// `9.json` as a string), everything else after them by name.
+fn sort_by_dependency(keys: &mut [String]) {
+    keys.sort_by(
+        |a, b| match (dependency_position(a), dependency_position(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(b),
+        },
+    );
+}
+
+fn dependency_position(key: &str) -> Option<(&str, u64, u64)> {
+    crate::storage::snapshot_position(key)
+        .map(|(epoch, version)| (actor_prefix(key), epoch, version))
+}
+
+fn actor_prefix(key: &str) -> &str {
+    let stream = key.rsplit_once('/').map_or("", |(parent, _)| parent);
+    stream.rsplit_once('/').map_or("", |(actor, _)| actor)
+}
