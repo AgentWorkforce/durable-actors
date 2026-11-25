@@ -117,6 +117,9 @@ spec:
             - {name: DURABLE_ACTORS_PYTHON_IMAGE, value: {{ include "actors.image" $.Values.images.python | quote }}}
             - {name: DURABLE_ACTORS_GKE_NAMESPACE, value: {{ include "actors.sandboxNamespace" $ | quote }}}
             - {name: DURABLE_ACTORS_GKE_ZONE, value: {{ $.Values.placement.zone | quote }}}
+            {{- with $.Values.actors.podAnnotations }}
+            - {name: DURABLE_ACTORS_GKE_POD_ANNOTATIONS, value: {{ toJson . | quote }}}
+            {{- end }}
             {{- if $.Values.nodeCache.enabled }}
             - name: DURABLE_ACTORS_GKE_NODE_CACHE_URL
               value: {{ printf "http://%s.%s.svc.cluster.local:7103" (include "actors.nodeCacheName" $) $.Release.Namespace | quote }}

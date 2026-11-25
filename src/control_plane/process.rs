@@ -975,6 +975,14 @@ fn sandbox_backend(
                     runtime_class: get("DURABLE_ACTORS_GKE_RUNTIME_CLASS")
                         .filter(|class| !class.is_empty())
                         .unwrap_or_else(|| GKE_RUNTIME_CLASS.into()),
+                    pod_annotations: get("DURABLE_ACTORS_GKE_POD_ANNOTATIONS")
+                        .filter(|annotations| !annotations.is_empty())
+                        .map(|annotations| serde_json::from_str(&annotations))
+                        .transpose()
+                        .context(
+                            "DURABLE_ACTORS_GKE_POD_ANNOTATIONS must be a JSON object of strings",
+                        )?
+                        .unwrap_or_default(),
                 }),
                 regions,
             ))

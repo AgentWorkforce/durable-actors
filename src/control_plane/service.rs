@@ -1297,6 +1297,10 @@ impl SandboxHostProvisioner {
         };
         let (runtime_config, spare) = tokio::join!(token, spare);
         request.spare = spare?;
+        let spare_miss = match (&self.pool, &request.spare) {
+            (Some(pool), None) => Some(pool.miss(spec, &request.resources).as_str()),
+            _ => None,
+        };
         let in_slot = self.slot_token(spec, region, actor, &request);
         // A sandbox created for this host has no pod UID yet, so its provider names the slot.
         match request
@@ -1341,6 +1345,7 @@ impl SandboxHostProvisioner {
                     project_id = %spec.project_id,
                     region,
                     host_id = %request.host_id,
+                    spare_miss,
                     started_at_ms = 0,
                     completed_at_ms = elapsed_ms(started_at),
                     outcome = "provider_failed",
@@ -1418,6 +1423,7 @@ impl SandboxHostProvisioner {
             provider = provisioning.as_ref().map(|value| value.provider.as_str()).unwrap_or("unknown"),
             provider_resource_id = provisioning.as_ref().map(|value| value.resource_id.as_str()).unwrap_or(""),
             provider_reused = provisioning.as_ref().is_some_and(|value| value.reused),
+            spare_miss,
             preferred_node = node.unwrap_or(""),
             spare_node = request.spare.as_ref().map(|spare| spare.node.as_str()).unwrap_or(""),
             started_at_ms = 0,

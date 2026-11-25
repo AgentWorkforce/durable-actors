@@ -30,6 +30,7 @@ fn customer_pod_enforces_isolation_and_allows_node_scale_down() -> Result<()> {
         Some("http://node-cache:7103"),
         None,
         GKE_RUNTIME_CLASS,
+        &BTreeMap::new(),
     )?;
     assert_eq!(
         pod.metadata
@@ -137,6 +138,7 @@ fn each_pool_spreads_its_spares_across_nodes() -> Result<()> {
         None,
         None,
         GKE_RUNTIME_CLASS,
+        &BTreeMap::new(),
     )?;
     assert_eq!(pool(&small), pool(&spare_under(GKE_RUNTIME_CLASS)));
     assert_ne!(pool(&small), pool(&large));
@@ -557,6 +559,7 @@ async fn reporting_cluster(
             node_cache_url: None,
             sqlite_slot_gib: None,
             runtime_class: GKE_RUNTIME_CLASS.into(),
+            pod_annotations: BTreeMap::new(),
         },
         kills,
     );
@@ -641,6 +644,30 @@ fn spare_pod_manifest_only_uses_fields_kubernetes_knows() {
     assert_eq!(serde_json::to_value(parsed).unwrap(), written);
 }
 
+#[test]
+fn operator_annotations_reach_spares_without_replacing_gvisor_annotations() -> Result<()> {
+    let annotations = BTreeMap::from([
+        ("ad.datadoghq.com/runtime.logs".to_owned(), "[]".to_owned()),
+        (
+            "dev.gvisor.spec.mount.slot.share".to_owned(),
+            "exclusive".to_owned(),
+        ),
+    ]);
+    let pod = spare_pod(
+        &spare_request("actor"),
+        &["us-west4-a".into()],
+        "token",
+        Some("http://node-cache:7103"),
+        Some(8),
+        "gvisor-with-overhead",
+        &annotations,
+    )?;
+    let annotations = pod.metadata.annotations.unwrap();
+    assert_eq!(annotations["ad.datadoghq.com/runtime.logs"], "[]");
+    assert_eq!(annotations["dev.gvisor.spec.mount.slot.share"], "shared");
+    Ok(())
+}
+
 fn spare_json() -> serde_json::Value {
     serde_json::to_value(spare_under(GKE_RUNTIME_CLASS)).unwrap()
 }
@@ -653,6 +680,7 @@ fn spare_under(runtime_class: &str) -> Pod {
         None,
         None,
         runtime_class,
+        &BTreeMap::new(),
     )
     .unwrap()
 }
@@ -666,6 +694,7 @@ fn a_spare_gets_a_sized_database_slot_the_node_cache_can_reach() -> Result<()> {
         Some("http://node-cache:7103"),
         Some(8),
         "gvisor-with-overhead",
+        &BTreeMap::new(),
     )?;
     let annotations = pod.metadata.annotations.unwrap();
     assert_eq!(annotations["dev.gvisor.spec.mount.slot.share"], "shared");

@@ -987,7 +987,7 @@ fn log_invocation_result(
     info!(
             event = "actor_host_invocation",
             request_id = %invocation.request_id,
-
+            project_id = %invocation.actor.project_id,
             actor_name = %invocation.actor.actor_name,
             actor_id = %invocation.actor.actor_id,
             method = %invocation.method,

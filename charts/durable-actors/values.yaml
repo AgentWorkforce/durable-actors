@@ -19,6 +19,7 @@ replicaCount: 1
 actors:
   warm: 0
   tiers: []
+  podAnnotations: {}
   maxStarting: 32
   refillIntervalMs: 1000
   retireConcurrency: 64

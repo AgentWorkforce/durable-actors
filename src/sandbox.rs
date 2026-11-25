@@ -162,6 +162,16 @@ pub(crate) fn slot_of(resource_id: &str) -> Option<&str> {
     resource_id.splitn(3, '/').nth(2)
 }
 
+/// Names a spare pool, one image at one size, as a digest short enough for a label value.
+pub(crate) fn spare_pool_id(image_ref: &str, resources: &ResourceLimits) -> Result<String> {
+    let pool = serde_json::to_vec(&(image_ref, resources))?;
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &pool);
+    Ok(hash.as_ref()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorHostHandle {

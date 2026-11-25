@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{CreateSpareRequest, ResourceLimits, SandboxProvider, SpareHandle, SpareKind};
 use crate::{
@@ -41,6 +41,30 @@ pub(crate) struct PoolTier {
     pub idle: u32,
 }
 
+/// Why an actor's host started without a spare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpareMiss {
+    /// The deployment has no code snapshot, which spares need.
+    NoSnapshot,
+    /// No tier keeps spares of the actor's size.
+    NoTier,
+    /// The actor's tier had no ready spare.
+    Exhausted,
+}
+
+impl SpareMiss {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSnapshot => "no_snapshot",
+            Self::NoTier => "no_tier",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
+/// How often the pool manager logs each pool's size.
+const STATUS_INTERVAL_MS: u64 = 60_000;
+
 pub(crate) struct SparePool {
     store: PoolStore,
     provider: Arc<dyn SandboxProvider>,
@@ -48,6 +72,7 @@ pub(crate) struct SparePool {
     runtime_images: Option<crate::control_plane::RuntimeImages>,
     claims: Arc<dyn PlatformEvents<SandboxClaim>>,
     heartbeat: std::sync::atomic::AtomicU64,
+    status_reported: std::sync::atomic::AtomicU64,
     refills: replenishment::RefillTurns,
 }
 
@@ -82,6 +107,7 @@ impl SparePool {
             runtime_images,
             claims,
             heartbeat: now_ms().into(),
+            status_reported: 0.into(),
             refills: Default::default(),
         })
     }
@@ -95,7 +121,7 @@ impl SparePool {
         node: Option<&str>,
         actor: Option<&ActorKey>,
     ) -> Result<Option<SpareHandle>> {
-        if spec.code_snapshot.is_none() || !self.has_tier(resources) {
+        if self.unclaimable(spec, resources).is_some() {
             return Ok(None);
         }
         let result = self
@@ -125,6 +151,22 @@ impl SparePool {
             resources: resources.clone(),
             at_ms: claimed_at_ms,
         });
+    }
+
+    /// Why `claim` returned no spare for this deployment and size.
+    pub fn miss(&self, spec: &HostLaunchSpec, resources: &ResourceLimits) -> SpareMiss {
+        self.unclaimable(spec, resources)
+            .unwrap_or(SpareMiss::Exhausted)
+    }
+
+    fn unclaimable(&self, spec: &HostLaunchSpec, resources: &ResourceLimits) -> Option<SpareMiss> {
+        if spec.code_snapshot.is_none() {
+            Some(SpareMiss::NoSnapshot)
+        } else if !self.has_tier(resources) {
+            Some(SpareMiss::NoTier)
+        } else {
+            None
+        }
     }
 
     fn has_tier(&self, resources: &ResourceLimits) -> bool {
@@ -305,6 +347,7 @@ impl SparePool {
 
     async fn reconcile(&self, registry: &dyn AdminRegistry) -> Result<Vec<Build>> {
         let targets = self.targets(registry).await?;
+        report(self.report_status(&targets).await);
         let keys: Vec<String> = targets.iter().map(|target| target.key.clone()).collect();
         let enabled = self.config.tiers.iter().any(|tier| tier.idle > 0);
         self.store.retire_unwanted(&keys, enabled).await?;
@@ -343,6 +386,43 @@ impl SparePool {
             }
         }
         Ok(targets)
+    }
+
+    /// Logs each pool's ready and starting spares against its target, at most once a minute.
+    async fn report_status(&self, targets: &[Target]) -> Result<()> {
+        let now = now_ms();
+        let reported = self
+            .status_reported
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(reported) < STATUS_INTERVAL_MS {
+            return Ok(());
+        }
+        self.status_reported
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        let counts = self.store.counts().await?;
+        let count = |key: &str, status: &str| {
+            counts
+                .get(&(key.to_owned(), status.to_owned()))
+                .copied()
+                .unwrap_or(0)
+        };
+        for target in targets {
+            let resources = &target.tier.resources;
+            info!(
+                event = "spare_pool_status",
+                pool = super::spare_pool_id(&target.image, resources)?,
+                region = %target.region,
+                cpu_millis = resources.cpu_millis,
+                cpu_limit_millis = resources.cpu_limit_millis,
+                memory_mib = resources.memory_mib,
+                memory_limit_mib = resources.memory_limit_mib,
+                idle_target = target.tier.idle,
+                ready = count(&target.key, "ready"),
+                starting = count(&target.key, "starting"),
+                "spare pool status"
+            );
+        }
+        Ok(())
     }
 
     fn image<'a>(&'a self, spec: &'a HostLaunchSpec) -> Result<&'a str> {
@@ -536,6 +616,19 @@ impl PoolStore {
         ).await?;
         self.0.execute("DELETE FROM durable_actors_pool_backoffs WHERE kind = $2 AND NOT (pool_key = ANY($1))", &[&keys, &self.1.as_str()]).await?;
         Ok(())
+    }
+
+    async fn counts(&self) -> Result<std::collections::HashMap<(String, String), i64>> {
+        let client = self.0.connection().await?;
+        Ok(client
+            .query(
+                "SELECT pool_key, status, count(*) FROM durable_actors_spares WHERE kind = $1 AND expires_at > clock_timestamp() GROUP BY pool_key, status",
+                &[&self.1.as_str()],
+            )
+            .await?
+            .into_iter()
+            .map(|row| ((row.get(0), row.get(1)), row.get(2)))
+            .collect())
     }
 
     async fn retiring(&self) -> Result<Vec<SpareHandle>> {

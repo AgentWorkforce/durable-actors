@@ -40,6 +40,16 @@ When upgrading from the shared image configuration, replace `image.repository` a
 
 A single controller can interrupt service during replacement; clients must reconnect WebSockets. Increase `replicaCount` for controller redundancy; more than one controller requires Redis (`redis.urlSecretKey`). Increase `actors.warm` to reduce cold starts. The warm count is per image/region and supports 0–256. To also keep spares for larger actors, set `actors.tiers` instead: each tier lists its requests, limits and its own `warm` count, all required, and an actor starts on a spare only when its requests and limits equal a tier. An actor that sets only `memoryMiB: 512` keeps the default CPU and CPU limit, so with the chart defaults its tier is `{cpuMillis: 250, cpuLimitMillis: null, memoryMiB: 512, memoryLimitMiB: 512, warm: 1}`. Tiers share the 256-spare budget. It does not cap active actors. Node autoscaling and quotas must accommodate your active workload.
 
+`actors.podAnnotations` adds annotations to every sandbox pod. For example, with the Datadog Agent collecting container logs, this ships only the platform's JSON logs and leaves out actors' console output:
+
+```yaml
+actors:
+  podAnnotations:
+    ad.datadoghq.com/runtime.logs: '[{"source":"durable-actors","service":"durable-actors","log_processing_rules":[{"type":"include_at_match","name":"platform_logs","pattern":"\"target\":\"(durable_actors|terse_)"}]}]'
+```
+
+The pool manager logs `spare_pool_status` once a minute for each pool, with its unexpired `ready` and `starting` spares against its `idle_target`. Its `pool` field is the same ID as the spare pods' `terse.ai/spare-pool` label, and each `actor_host_provisioning` event that started without a spare says why in `spare_miss`: `no_snapshot`, `no_tier` or `exhausted`.
+
 ## Rapid writes
 
 Add one or two precreated Rapid buckets in distinct supported zones. The Standard bucket continues to store ownership, code, and each actor's bases: whole SQLite files the node cache uploads, with `nodeCache.googleServiceAccount`, as an actor's changes outgrow its last base. The node cache also rebuilds cold actors' databases in their slots, so Rapid requires `nodeCache.enabled` and `nodeCache.sqliteSlots.enabled`. The pool manager deletes changes a base covers after `historySweeper.minAgeHours` (720).

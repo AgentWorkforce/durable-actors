@@ -141,6 +141,10 @@
           "minimum": 0,
           "maximum": 256
         },
+        "podAnnotations": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
         "tiers": {
           "type": "array",
           "items": {

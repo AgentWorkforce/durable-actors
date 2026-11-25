@@ -129,6 +129,52 @@ async fn custom_resources_cannot_claim_default_sized_spares() -> Result<()> {
 }
 
 #[tokio::test]
+async fn misses_say_why_no_spare_was_claimed() -> Result<()> {
+    with_postgres(async |fixture| {
+        let pool = pool(PostgresDatabase::connect(&fixture.url).await?);
+        let packaged: HostLaunchSpec = serde_json::from_value(serde_json::json!({
+            "projectId":"default","organizationId":"org-test","imageRef":"im-runtime","codeSnapshot":crate::sandbox::testing::code_artifact(1),"workingDirectory":"/customer","secretRefs":[]
+        }))?;
+        let unpackaged: HostLaunchSpec = serde_json::from_value(serde_json::json!({
+            "projectId":"default","organizationId":"org-test","imageRef":"im-runtime","workingDirectory":"/customer","secretRefs":[]
+        }))?;
+        let larger = ResourceLimits {cpu_millis:2000, cpu_limit_millis:None, memory_mib:4096, memory_limit_mib:Some(4096)};
+        assert_eq!(pool.miss(&unpackaged, &ResourceLimits::default()), SpareMiss::NoSnapshot);
+        assert_eq!(pool.miss(&packaged, &larger), SpareMiss::NoTier);
+        assert!(pool.claim(&packaged, "region", "host", &ResourceLimits::default(), None, None).await?.is_none());
+        assert_eq!(pool.miss(&packaged, &ResourceLimits::default()), SpareMiss::Exhausted);
+        Ok(())
+    }).await
+}
+
+#[tokio::test]
+async fn pool_status_counts_unexpired_spares_by_status() -> Result<()> {
+    with_postgres(async |fixture| {
+        let pool = pool(PostgresDatabase::connect(&fixture.url).await?);
+        let key = pool.key("im-runtime", "region", &ResourceLimits::default());
+        let spare = |name: String| SpareHandle {
+            node: String::new(),
+            name,
+            resource_id: "sb-test".into(),
+            route: "https://host.test".into(),
+            canonical_region: "region".into(),
+            control_route: String::new(),
+            control_token: String::new(),
+        };
+        let live = reserve(&pool.store, &key, 3).await?.unwrap();
+        let expired = reserve(&pool.store, &key, 3).await?.unwrap();
+        reserve(&pool.store, &key, 3).await?.unwrap();
+        pool.store.publish(&key, &spare(live), 600).await?;
+        pool.store.publish(&key, &spare(expired), 0).await?;
+        let counts = pool.store.counts().await?;
+        assert_eq!(counts[&(key.clone(), "ready".to_owned())], 1);
+        assert_eq!(counts[&(key, "starting".to_owned())], 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn only_live_claims_can_become_routable() -> Result<()> {
     with_postgres(async |fixture| {
         let pool = pool(PostgresDatabase::connect(&fixture.url).await?);
